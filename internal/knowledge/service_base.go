@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
+	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
+	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -18,16 +21,57 @@ var ErrNotFound = errors.New("not found")
 
 // Service is the Knowledge Core facade: bases, documents, lifecycle.
 type Service struct {
-	store   *store
-	raw     *storage.RawFileStore
-	parsers *parser.Registry
-	global  config.Config
-	jobMgr  *jobs.Manager
+	store    *store
+	raw      *storage.RawFileStore
+	parsers  *parser.Registry
+	global   config.Config
+	jobMgr   *jobs.Manager
+	embedder embedding.Provider
+	reranker rerank.Provider
 }
 
 // NewService builds the service over the shared database.
 func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config, jobMgr *jobs.Manager) *Service {
-	return &Service{store: newStore(db), raw: raw, parsers: parser.NewRegistry(), global: global, jobMgr: jobMgr}
+	service := &Service{store: newStore(db), raw: raw, parsers: parser.NewRegistry(), global: global, jobMgr: jobMgr}
+	service.applyConfiguredProviders()
+	return service
+}
+
+// applyConfiguredProviders builds providers from config (tests override via
+// SetProviders).
+func (s *Service) applyConfiguredProviders() {
+	s.embedder = embedding.New(embedding.Config{
+		Provider: s.global.Embedding.Provider,
+		BaseURL:  s.global.Embedding.BaseURL,
+		Model:    s.global.Embedding.Model,
+		APIKey:   s.global.Embedding.APIKey,
+	})
+	if s.global.Rerank.Enabled && s.global.Rerank.Model != "" && s.global.Rerank.BaseURL != "" {
+		s.reranker = rerank.New(rerank.Config{
+			BaseURL: s.global.Rerank.BaseURL,
+			Model:   s.global.Rerank.Model,
+			APIKey:  s.global.Rerank.APIKey,
+			Timeout: time.Duration(s.global.Rerank.TimeoutMS) * time.Millisecond,
+		})
+	}
+}
+
+// SetProviders overrides the model providers (tests, future local helpers).
+func (s *Service) SetProviders(embedder embedding.Provider, reranker rerank.Provider) {
+	if embedder != nil {
+		s.embedder = embedder
+	}
+	if reranker != nil {
+		s.reranker = reranker
+	}
+}
+
+// EmbeddingModelKey reports the active vector-space identity ("" when none).
+func (s *Service) EmbeddingModelKey() string {
+	if s.global.Embedding.Provider == "none" {
+		return ""
+	}
+	return s.embedder.ModelKey()
 }
 
 func now() int64 { return Now().UnixMilli() }
@@ -123,7 +167,34 @@ func (s *Service) ListBases() ([]BaseSummary, error) {
 }
 
 // Stats returns aggregate stats for a base or all bases.
-func (s *Service) Stats(baseID string) (Stats, error) { return s.store.statsFor(baseID) }
+func (s *Service) Stats(baseID string) (Stats, error) {
+	stats, err := s.store.statsFor(baseID)
+	if err != nil {
+		return Stats{}, err
+	}
+	modelKey := s.EmbeddingModelKey()
+	if modelKey == "" {
+		return stats, nil
+	}
+	counts, err := s.store.VectorModelCounts(baseID)
+	if err != nil {
+		return Stats{}, err
+	}
+	embedded := 0
+	stale := 0
+	for model, count := range counts {
+		embedded += count
+		if model != modelKey {
+			stale += count
+		}
+	}
+	stats.Embedded = embedded > 0
+	stats.StaleChunks = stale
+	if dimensions, err := s.store.VectorDimensions(baseID); err == nil {
+		stats.Dimensions = dimensions
+	}
+	return stats, nil
+}
 
 // ListGroups returns the persisted plus implicit group names.
 func (s *Service) ListGroups() ([]string, error) {

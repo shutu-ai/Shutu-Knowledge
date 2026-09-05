@@ -38,6 +38,8 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /api/scope", s.getScope)
 	mux.HandleFunc("PUT /api/scope", s.putScope)
 	mux.HandleFunc("GET /api/stats", s.globalStats)
+	mux.HandleFunc("POST /api/search", s.search)
+	mux.HandleFunc("GET /api/documents/{id}/context", s.documentContext)
 }
 
 func writeErr(w http.ResponseWriter, err error) {
@@ -149,6 +151,53 @@ func (s *Server) globalStats(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeOK(w, stats)
+}
+
+func (s *Server) search(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody[knowledge.SearchRequest](w, r)
+	if !ok {
+		return
+	}
+	result, err := s.app.Knowledge.Search(r.Context(), body)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, result)
+}
+
+func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
+	opts := knowledge.ContextOptions{
+		AnchorChunkID: r.URL.Query().Get("anchorChunkId"),
+		Focus:         r.URL.Query().Get("focus"),
+		CrossHeading:  r.URL.Query().Get("crossHeading") == "1",
+	}
+	if raw := r.URL.Query().Get("anchorIndex"); raw != "" {
+		if index, err := strconv.Atoi(raw); err == nil {
+			opts.AnchorIndex = &index
+		}
+	}
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		if before, err := strconv.Atoi(raw); err == nil {
+			opts.Before = &before
+		}
+	}
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		if after, err := strconv.Atoi(raw); err == nil {
+			opts.After = &after
+		}
+	}
+	if raw := r.URL.Query().Get("maxTokens"); raw != "" {
+		if tokens, err := strconv.Atoi(raw); err == nil {
+			opts.MaxTokens = tokens
+		}
+	}
+	window, err := s.app.Knowledge.GetDocumentContext(r.PathValue("id"), opts)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, window)
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {

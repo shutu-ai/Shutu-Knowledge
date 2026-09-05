@@ -75,25 +75,25 @@ type Config struct {
 	} `yaml:"chunking"`
 
 	Retrieval struct {
-		TopK               int     `yaml:"topK"`
-		Mode               string  `yaml:"mode"` // auto | hybrid | vector | lexical
-		SimilarityMin      float64 `yaml:"similarityMin"`
-		MMR                bool    `yaml:"mmr"`
-		MMRDiversity       float64 `yaml:"mmrDiversity"`
-		RRFVectorWeight    float64 `yaml:"rrfVectorWeight"`
-		SiblingChunks      int     `yaml:"siblingChunks"`
-		ContextTimeoutMS   int     `yaml:"contextTimeoutMs"`
+		TopK             int     `yaml:"topK"`
+		Mode             string  `yaml:"mode"` // auto | hybrid | vector | lexical
+		SimilarityMin    float64 `yaml:"similarityMin"`
+		MMR              bool    `yaml:"mmr"`
+		MMRDiversity     float64 `yaml:"mmrDiversity"`
+		RRFVectorWeight  float64 `yaml:"rrfVectorWeight"`
+		SiblingChunks    int     `yaml:"siblingChunks"`
+		ContextTimeoutMS int     `yaml:"contextTimeoutMs"`
 	} `yaml:"retrieval"`
 
 	Jobs struct {
-		ImportWorkers   int `yaml:"importWorkers"`
+		ImportWorkers   int  `yaml:"importWorkers"`
 		ResumeInterrupt bool `yaml:"resumeInterrupt"`
 	} `yaml:"jobs"`
 
 	Models struct {
-		CacheDir           string `yaml:"cacheDir"`
-		HFEndpoint         string `yaml:"hfEndpoint"`
-		WorkerIdleTimeoutMS int   `yaml:"workerIdleTimeoutMs"`
+		CacheDir            string `yaml:"cacheDir"`
+		HFEndpoint          string `yaml:"hfEndpoint"`
+		WorkerIdleTimeoutMS int    `yaml:"workerIdleTimeoutMs"`
 	} `yaml:"models"`
 
 	OCR struct {

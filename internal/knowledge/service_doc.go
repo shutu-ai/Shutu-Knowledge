@@ -24,23 +24,23 @@ func (e *ConflictError) Error() string {
 
 // ChunkOptions resolves the effective chunking settings for a base.
 type ChunkOptions struct {
-	Smart         bool
-	Separator     string
-	Size          int
-	Overlap       int
-	Semantic      bool
-	TokenLimit    int
+	Smart             bool
+	Separator         string
+	Size              int
+	Overlap           int
+	Semantic          bool
+	TokenLimit        int
 	SemanticThreshold float64
 }
 
 func (s *Service) chunkOptions(cfg BaseConfig) ChunkOptions {
 	opts := ChunkOptions{
-		Smart:         s.global.Chunking.Smart,
-		Separator:     s.global.Chunking.Separator,
-		Size:          s.global.Chunking.Size,
-		Overlap:       s.global.Chunking.Overlap,
-		Semantic:      s.global.Chunking.Semantic,
-		TokenLimit:    s.global.Chunking.TokenLimit,
+		Smart:             s.global.Chunking.Smart,
+		Separator:         s.global.Chunking.Separator,
+		Size:              s.global.Chunking.Size,
+		Overlap:           s.global.Chunking.Overlap,
+		Semantic:          s.global.Chunking.Semantic,
+		TokenLimit:        s.global.Chunking.TokenLimit,
 		SemanticThreshold: s.global.Chunking.SemanticThreshold,
 	}
 	if cfg.SmartChunk != nil {
@@ -521,13 +521,13 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			contextText = strings.TrimSpace(contextText + " " + piece.Heading)
 		}
 		c := Chunk{
-			ID:      fmt.Sprintf("%s:%d", doc.ID, i),
-			DocID:   doc.ID,
-			BaseID:  doc.BaseID,
-			Index:   i,
-			Text:    piece.Text,
-			Heading: piece.Heading,
-			Context: contextText,
+			ID:        fmt.Sprintf("%s:%d", doc.ID, i),
+			DocID:     doc.ID,
+			BaseID:    doc.BaseID,
+			Index:     i,
+			Text:      piece.Text,
+			Heading:   piece.Heading,
+			Context:   contextText,
 			CreatedAt: now(),
 		}
 		c.EmbeddingText = strings.TrimSpace(c.Context + " " + c.Text)
@@ -541,6 +541,40 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		return s.failDocument(doc, ErrParseFailed, err)
 	}
 
+	// Vector phase: with an active embedding provider, chunks are embedded
+	// with library-wide hash reuse; a failure degrades the document to
+	// lexical-only instead of dropping the imported text. Degradation is a
+	// successful import with a recorded error code (reference behavior);
+	// only a cancellation leaves the document resumable.
+	if s.global.Embedding.Provider != "none" {
+		doc.Status = StatusProcessing
+		doc.Phase = PhaseEmbedding
+		doc.Progress = 0
+		doc.UpdatedAt = now()
+		if err := s.store.putDocument(*doc); err != nil {
+			return err
+		}
+		if code, cause := s.embedChunks(ctx, doc, rows); code != "" {
+			if code == ErrInterrupted {
+				// Keep the document resumable for the startup recovery pass.
+				doc.Status = StatusProcessing
+				doc.Phase = PhaseEmbedding
+				doc.Incomplete = true
+			} else {
+				doc.Status = StatusReady
+				doc.Phase = ""
+				doc.ErrorCode = code
+				doc.ErrorMessage = cause.Error()
+				doc.Incomplete = false
+			}
+			doc.UpdatedAt = now()
+			if err := s.store.putDocument(*doc); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
 	doc.ChunkCount = len(rows)
 	doc.Status = StatusReady
 	doc.Phase = ""
@@ -548,6 +582,70 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.Incomplete = false
 	doc.UpdatedAt = now()
 	return s.store.putDocument(*doc)
+}
+
+// embedChunks embeds the stored chunks in batches, reusing stored vectors by
+// embedding-text hash, and persists each landed batch (crash-safe). Returns
+// a stable error code when the document degrades to lexical-only.
+func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk) (string, error) {
+	modelKey := s.embedder.ModelKey()
+	hashes := make([]string, 0, len(rows))
+	textByHash := map[string]string{}
+	for _, row := range rows {
+		hashes = append(hashes, row.EmbeddingHash)
+		textByHash[row.EmbeddingHash] = row.EmbeddingText
+	}
+	reuse := s.store.ListEmbeddingVectorsByHashes(hashes, modelKey)
+	var pendingHashes []string
+	for _, hash := range hashes {
+		if _, ok := reuse[hash]; !ok {
+			pendingHashes = append(pendingHashes, hash)
+		}
+	}
+	dimension := 0
+	batchSize := s.global.Embedding.Batch
+	progressStep := 100 / (len(rows) + 1)
+	landed := 0
+	report := func() {
+		landed++
+		doc.Progress = minInt(99, landed*progressStep)
+		doc.UpdatedAt = now()
+		_ = s.store.putDocument(*doc)
+	}
+	for start := 0; start < len(pendingHashes); start += batchSize {
+		end := minInt(start+batchSize, len(pendingHashes))
+		batch := pendingHashes[start:end]
+		texts := make([]string, 0, len(batch))
+		for _, hash := range batch {
+			texts = append(texts, textByHash[hash])
+		}
+		vectors, err := s.embedder.Embed(ctx, texts)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ErrInterrupted, ctx.Err()
+			}
+			return ErrEmbeddingProvider, err
+		}
+		if len(vectors) != len(batch) {
+			return ErrEmbeddingProvider, fmt.Errorf("provider returned %d vectors for %d inputs", len(vectors), len(batch))
+		}
+		if dimension == 0 {
+			dimension = len(vectors[0])
+		}
+		byHash := map[string][]float64{}
+		for i, vector := range vectors {
+			if len(vector) != dimension {
+				return ErrDimensionMismatch, fmt.Errorf("vector width %d differs from stored %d", len(vector), dimension)
+			}
+			byHash[batch[i]] = vector
+		}
+		if err := s.store.PutChunkVectors(doc.ID, modelKey, byHash); err != nil {
+			return ErrEmbeddingProvider, err
+		}
+		report()
+	}
+	doc.Progress = 100
+	return "", nil
 }
 
 func (s *Service) failDocument(doc *Document, code string, cause error) error {

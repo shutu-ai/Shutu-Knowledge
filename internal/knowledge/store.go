@@ -227,14 +227,32 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Carry over stored vectors whose embedding-text hash survives the
+	// re-chunk: a reindex must not silently destroy reusable vectors.
+	carried := map[string][2]any{}
+	legacy, err := tx.Query(`SELECT embedding_text_hash, embedding, embedding_model FROM chunks WHERE doc_id = ? AND embedding IS NOT NULL`, docID)
+	if err != nil {
+		return err
+	}
+	for legacy.Next() {
+		var hash string
+		var blob []byte
+		var model string
+		if err := legacy.Scan(&hash, &blob, &model); err != nil {
+			_ = legacy.Close()
+			return err
+		}
+		carried[hash] = [2]any{blob, model}
+	}
+	if err := legacy.Err(); err != nil {
+		_ = legacy.Close()
+		return err
+	}
+	_ = legacy.Close()
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE doc_id = ?`, docID); err != nil {
 		return err
 	}
 	for _, c := range chunks {
-		var embedding any
-		if c.HasEmbedding {
-			embedding = encodeEmbedding(c.EmbeddingText) // placeholder until phase 3; never set in phase 2
-		}
 		var heading any
 		if c.Heading != "" {
 			heading = c.Heading
@@ -243,10 +261,15 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 		if c.EmbeddingHash != "" {
 			hash = c.EmbeddingHash
 		}
+		var embedding, model any
+		if carried, ok := carried[c.EmbeddingHash]; ok {
+			embedding = carried[0]
+			model = carried[1]
+		}
 		if _, err := tx.Exec(
 			`INSERT INTO chunks (id, doc_id, base_id, idx, text, heading, context, embedding, embedding_model, embedding_text_hash, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
-			c.ID, c.DocID, c.BaseID, c.Index, c.Text, heading, c.Context, embedding, hash, c.CreatedAt,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			c.ID, c.DocID, c.BaseID, c.Index, c.Text, heading, c.Context, embedding, model, hash, c.CreatedAt,
 		); err != nil {
 			return err
 		}
@@ -315,6 +338,3 @@ func (s *store) statsFor(baseID string) (Stats, error) {
 func searchTextOf(c Chunk) string {
 	return strings.TrimSpace(c.Context + " " + c.Text)
 }
-
-// encodeEmbedding is a phase-3 placeholder; phase 2 never stores embeddings.
-func encodeEmbedding(string) []byte { return nil }

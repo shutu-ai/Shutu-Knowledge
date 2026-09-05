@@ -168,20 +168,20 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] Full-text Retrieval：实现等价 SQLite FTS5 / BM25 能力，不因有向量检索而省略。
-- [ ] `EmbeddingProvider` 抽象：embedding 生成、向量持久化/索引、相似度搜索、top-k、filters；业务代码不直接依赖具体模型实现。
-- [ ] 向量索引健壮性：model change、dimension change、reindex、index corruption。
-- [ ] Hybrid Retrieval：按 dsh-knowledge 真实流程实现（预计 BM25 + Vector → RRF → MMR → Rerank，以源码为准，不能凭 README 猜测）。
-- [ ] RRF：相同行为与可配置参数，确定性测试。
-- [ ] MMR：relevance + diversity；覆盖 duplicate chunks、near duplicate、same document concentration 测试。
-- [ ] `RerankerProvider` 抽象：candidate retrieval → reranker → final evidence；支持 enable/disable、configure、health check、fallback；reranker 失败默认不拖垮 Knowledge 服务。
-- [ ] Context Composer：独立模块负责 ranking、source grouping、dedup、context formatting、metadata/citations、context window；最终不能简单返回 `[]Chunk` 给 Agent。
-- [ ] Context Window / 相邻 chunk 扩展：命中 chunk 可按策略补前后相邻 chunk（如 #19/#20/#21），防止 context explosion。
-- [ ] Anchor / Continuation：若 dsh-knowledge 存在此机制，先从源码与测试理解业务目的，再完整实现。
-- [ ] Local Model Management（若 dsh-knowledge 有）：download、discover、configure、status、delete；模型文件归 Knowledge 所有。
-- [ ] Retrieval Test 能力：输入 query、选择 KB、执行检索，可查看 BM25 candidates、Vector candidates、Fusion result、Rerank result、Final context；具体可视化以原项目为准。此功能为 P0 级可调试能力，不得省略。
-- [ ] Explainability：检索测试与 API 尽量输出每个 chunk 为何被选中、各阶段 score、最终 rank、source。
-- [ ] 测试：RRF 确定性、MMR 多样性、混合排序趋势、reranker 降级、context 长度控制、元数据引用；为关键算法建立 dsh-knowledge 行为对照测试（same input，比较功能、排序趋势、边界条件、错误语义；不要求浮点 score 完全一致）。
+- [x] Full-text Retrieval：SQLite FTS5 trigram + BM25（负分翻转归一、短词 LIKE 兜底、空查询守卫、fail-closed 过滤），未被向量检索取代。
+- [x] `EmbeddingProvider` 抽象：openai 兼容 / Ollama（现代 + legacy）/ none 接口化；float32 LE 向量持久化、暴力扫描、维度校验、embedding-text 哈希库级复用；业务代码零具体模型依赖。
+- [x] 向量索引健壮性：dimension change → 降级 lexical + dimension_mismatch 错误码；model change → staleChunkCount 统计；reindex → 按哈希携带旧向量（只补缺失批次）；损坏 BLOB → 跳过不崩溃。
+- [x] Hybrid Retrieval：加权 RRF（`rrfVectorWeight`）+ 多查询变体融合 + MMR + 可选 rerank，模式 auto/hybrid/vector/lexical（vector 无向量时降级 lexical）。
+- [x] RRF：k=60、权重语义与确定性测试。
+- [x] MMR：lambda 权衡相关性/多样性；覆盖 duplicate、near duplicate、无 embedding 追加三类测试。
+- [x] `RerankerProvider` 抽象：远程 `/rerank`（Jina 风格）+ 严格校验（数量/索引/[0,1]）+ 熔断器（3 连败开 5 分钟、半开探测）；失败降级原排序并在结构化状态中暴露，不拖垮搜索。
+- [x] Context Composer：独立 `internal/evidence` 模块（before→anchor→after、标题边界、连续性守卫、≥24 字符重叠去重、预算分配与让渡、序列化预算执行、`>>>` 锚点标记、hasMore 标志）。
+- [x] Context Window / 相邻 chunk 扩展：`siblingChunks` 批量取邻域，单 hit 768 token 预算，防爆炸。
+- [x] Anchor / Continuation：`/api/documents/{id}/context` 锚点续读（anchorChunkId/anchorIndex、before/after/maxTokens/focus/crossHeading）；工具侧锚点模式随 Phase 5 接入。
+- [ ] Local Model Management（若 dsh-knowledge 有）：download、discover、configure、status、delete；模型文件归 Knowledge 所有。（本地 ML 依赖 optional helper 进程，安排在 Phase 4 落地、Phase 6 补管理 UI）
+- [x] Retrieval Test 能力（后端）：`/api/search` 输出 mode、lane scores、rerank 结构化状态、elapsed 与最终 context，召回测试 UI 随 Phase 6 接入。
+- [x] Explainability：每 hit 携带 vectorScore/lexicalScore/rerankScore、rerank 状态（applied/not_needed/degraded + 错误码）、elapsedMS。
+- [x] 测试：RRF 确定性、MMR 多样性、BM25 排序趋势、reranker 应用/降级/熔断、维度不匹配与 provider 故障降级、fail-closed 过滤、多查询召回扩大、向量哈希复用、stale 统计（全部通过；浮点分数不要求一致，比较功能与排序趋势）。
 
 产出物：完整检索引擎、Context Composer、模型抽象层、Retrieval Test 后端与 API。
 

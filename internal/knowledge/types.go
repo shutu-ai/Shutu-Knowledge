@@ -159,3 +159,11 @@ type Stats struct {
 
 // Now is the clock used for timestamps (overridable in tests).
 var Now = time.Now
+
+// Evidence accessors adapt Chunk to the evidence composer interface.
+func (c Chunk) EvidenceID() string      { return c.ID }
+func (c Chunk) EvidenceDocID() string   { return c.DocID }
+func (c Chunk) EvidenceBaseID() string  { return c.BaseID }
+func (c Chunk) EvidenceIndex() int      { return c.Index }
+func (c Chunk) EvidenceText() string    { return c.Text }
+func (c Chunk) EvidenceHeading() string { return c.Heading }

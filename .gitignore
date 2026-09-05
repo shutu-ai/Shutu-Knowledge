@@ -1,0 +1,22 @@
+# CodeGraph index
+.codegraph/
+
+# Go
+/bin/
+*.exe
+*.test
+*.out
+
+# Node / web build
+node_modules/
+web/dist/
+
+# Local data (never commit user knowledge data)
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and temp
+*.log
+/tmp/

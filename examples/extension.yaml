@@ -1,0 +1,25 @@
+# Discovery manifest for shutu-knowledge (drop into the Agent's extension
+# directory or reference it from extensions.sources). Build the binary first
+# and point transport.command at it, or put it on PATH.
+id: shutu-knowledge
+name: Shutu Knowledge
+version: 0.1.0
+description: Knowledge bases, documents, hybrid retrieval, and model tools for shutu-agent
+extension_api: 1.0
+capabilities:
+  lifecycle: true
+  health: true
+transport:
+  type: stdio
+  command: shutu-knowledge
+  args:
+    - extension
+health:
+  enabled: true
+  timeout_ms: 1000
+lifecycle:
+  enabled: true
+  startup_timeout_ms: 10000
+  shutdown_timeout_ms: 5000
+  restart_policy: on-failure
+  max_restarts: 3

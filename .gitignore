@@ -3,6 +3,8 @@
 
 # Go
 /bin/
+/.gocache/
+/.tmp-home/
 *.exe
 *.test
 *.out

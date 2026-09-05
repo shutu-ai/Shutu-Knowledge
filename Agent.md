@@ -62,7 +62,7 @@
 - [x] 在 `shutu-knowledge` 目录执行并确认：`git status`、`git branch --show-current`、`git remote -v`，确保当前工作目录正确。
 - [x] 定位本地 `shutu-agent` 仓库（若存在），记录基线：`git -C <SHUTU_AGENT_PATH> status --porcelain` 与 `git -C <SHUTU_AGENT_PATH> rev-parse HEAD`。若 Agent 仓库原本有用户未提交改动：不修改、不清理、不 reset，仅记录。（基线记录见 `docs/source_reuse_inventory.md`）
 - [x] 定位本地 `dsh-knowledge` 参考仓库（只读），同样记录基线。（克隆至 `C:\dev-projects\dsh\dsh-knowledge`）
-- [ ] 确认开发环境：Go 版本、Node 版本、SQLite、构建工具链。
+- [x] 确认开发环境：Go 版本、Node 版本、SQLite、构建工具链。（Go 1.26.7 / Node 24 / modernc.org/sqlite 纯 Go 驱动）
 - [x] 通读需求文档全文，确认阶段划分与验收 Gate。
 
 **收尾要求**：每个阶段结束时复查两个参考仓库，证明 HEAD 不变且未产生本任务引入的 tracked modifications；若发现跨仓库污染，判定 ARCHITECTURE VIOLATION，撤销本任务对参考仓库的修改（不得覆盖用户原有改动）。
@@ -122,15 +122,15 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] 初始化 Go module 与推荐目录结构：`cmd/shutu-knowledge`、`internal/{extension,knowledge,ingest,parser,chunk,embedding,rerank,retrieval,index,storage(models→models),jobs,web,config}`、`web/`、`migrations/`、`examples/`、`docs/`、`tests/`。
-- [ ] 实现配置系统：Knowledge 自有配置（database、raw store、chunking、embedding、reranker、retrieval、OCR、models、Web、jobs），不向 Agent config 注入业务字段。
-- [ ] 实现结构化日志与日志安全基线（默认不记录完整敏感文档、完整 retrieval evidence、完整用户问题、credentials；debug 模式明确允许后才放开）。
-- [ ] 实现存储层与数据域 `~/.shutu/knowledge/`（`knowledge.db`、`raw/`、`indexes/`、`models/`、`cache/`、`tmp/`、`logs/`），SQLite 作为初始数据库。
-- [ ] 建立 versioned migrations 机制（禁止长期依赖业务代码中散落的 `CREATE TABLE IF NOT EXISTS`）。
-- [ ] 实现 CLI 骨架：`shutu-knowledge serve`、`shutu-knowledge doctor`、`shutu-knowledge version`。
-- [ ] 实现 Health 基础框架，至少区分：process healthy、database healthy、index subsystem healthy、model availability；可选组件（如 reranker）不可用不应判死整个 Extension（除非配置为 required）。
-- [ ] 实现 Extension Adapter 骨架与 `shutu-agent` 的 Manifest / handshake / capability negotiation 最小集成，能以 managed extension 身份被 Agent 发现并进入 ready。
-- [ ] 建立 CI 基础：build、vet、unit test。
+- [x] 初始化 Go module 与推荐目录结构：`cmd/shutu-knowledge`、`internal/{extension,knowledge,ingest,parser,chunk,embedding,rerank,retrieval,index,storage(models→models),jobs,web,config}`、`web/`、`migrations/`、`examples/`、`docs/`、`tests/`。（目录随实现渐进创建）
+- [x] 实现配置系统：Knowledge 自有配置（database、raw store、chunking、embedding、reranker、retrieval、OCR、models、Web、jobs），不向 Agent config 注入业务字段。
+- [x] 实现结构化日志与日志安全基线（默认不记录完整敏感文档、完整 retrieval evidence、完整用户问题、credentials；debug 模式明确允许后才放开）。
+- [x] 实现存储层与数据域 `~/.shutu/knowledge/`（`knowledge.db`、`raw/`、`indexes/`、`models/`、`cache/`、`tmp/`、`logs/`），SQLite 作为初始数据库。
+- [x] 建立 versioned migrations 机制（禁止长期依赖业务代码中散落的 `CREATE TABLE IF NOT EXISTS`）。
+- [x] 实现 CLI 骨架：`shutu-knowledge serve`、`shutu-knowledge doctor`、`shutu-knowledge version`。
+- [x] 实现 Health 基础框架，至少区分：process healthy、database healthy、index subsystem healthy、model availability；可选组件（如 reranker）不可用不应判死整个 Extension（除非配置为 required）。
+- [x] 实现 Extension Adapter 骨架与 `shutu-agent` 的 Manifest / handshake / capability negotiation 最小集成，能以 managed extension 身份被 Agent 发现并进入 ready。（stdio 握手 + health 已有真实 JSON-RPC 测试；Agent 双进程发现在 Phase 5 集成测试验证）
+- [x] 建立 CI 基础：build、vet、unit test。（含 Gate B：shutu-agent/internal import 检查）
 
 产出物：可构建的二进制、doctor 可运行的诊断、与真实 shutu-agent 的握手 demo/测试、初始 migrations、README 骨架。
 

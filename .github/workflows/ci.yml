@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Architecture gate: no shutu-agent internal imports
+        run: |
+          if grep -RIn --include='*.go' 'shutu-agent/internal' .; then
+            echo '::error::production imports of shutu-agent/internal are forbidden'
+            exit 1
+          fi
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...

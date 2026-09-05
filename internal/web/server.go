@@ -27,6 +27,7 @@ func New(a *app.App) *Server {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("GET /api/version", s.handleVersion)
+	registerKnowledgeAPI(mux, s)
 	return s
 }
 

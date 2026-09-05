@@ -146,17 +146,17 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] KB CRUD：create / list / get / update / delete / stats；字段覆盖 name、description、metadata、created_at、updated_at、document_count、chunk_count、index state；delete 按 destructive operation 处理（进入 Tool Registry 时声明风险）。
-- [ ] 文档生命周期状态机：pending → processing → ready / failed，外加 stale；支持 import、parse、chunk、index、ready、refresh、reindex、delete、error；禁止用一个 bool `indexed` 覆盖全部状态。
-- [ ] Parser Registry 或等价通用结构：Document → MIME/type detection → Parser → Normalized Document → Chunking；避免主流程中 `if pdf else if docx` 无限堆积。
-- [ ] 按 Phase 0 审计结果实现文件格式解析（目标尽量覆盖 PDF、DOCX、PPTX、XLSX、TXT、Markdown、HTML、CSV、EPUB 及 dsh-knowledge 实际其它格式）。
-- [ ] 实现 Chunking 策略（实际名称以 dsh-knowledge 源码为准）：fixed/recursive、heading-aware；每个 chunk 保留 document、position、text、metadata、source reference。
-- [ ] Metadata Preservation：document title、source、URL/path、page、sheet、slide、section、heading、chunk order、timestamp、custom metadata。
-- [ ] Background Jobs：Import / Parse / Embedding / Reindex / Refresh Job，大文件不阻塞 Web 与 Agent；轻量实现即可，不过度设计分布式队列。
-- [ ] Job Recovery：处理 process crash、partial import、embedding interrupted、reindex interrupted；保证数据库不进入不可恢复状态。
-- [ ] Duplicate Handling：same file、same URL、same content hash、same path changed 的去重与更新策略。
-- [ ] Input Sources 基础：local file、text（directory / URL 在 Phase 4 深化）。
-- [ ] 单元与集成测试：状态机迁移、解析器注册与分发、切块正确性、元数据保留、任务恢复、重复处理。
+- [x] KB CRUD：create / list / get / update / delete / stats；字段覆盖 name、description、metadata、created_at、updated_at、document_count、chunk_count、index state；delete 按 destructive operation 处理（进入 Tool Registry 时声明风险）。（Tool 风险声明在 Phase 5 落地）
+- [x] 文档生命周期状态机：pending → processing → ready / failed，外加 stale；支持 import、parse、chunk、index、ready、refresh、reindex、delete、error；禁止用一个 bool `indexed` 覆盖全部状态。
+- [x] Parser Registry 或等价通用结构：Document → MIME/type detection → Parser → Normalized Document → Chunking；避免主流程中 `if pdf else if docx` 无限堆积。
+- [x] 按 Phase 0 审计结果实现文件格式解析（txt/md/mdx/csv/json/log + GB18030 回退、HTML→结构化文本、DOCX、PPTX、XLSX、EPUB、PDF 文本层；legacy .doc/.ppt/.xls 按计划留在 Phase 4 可选 helper）。
+- [x] 实现 Chunking 策略：token 预算 + heading-aware 评分断点 + 代码围栏保护 + delimiter 模式 + Token 上限细分（semantic 留 Phase 4）。
+- [x] Metadata Preservation：document title、source file/hash/path、heading path、chunk order、timestamp、检索 context 与 embedding-hash（page/sheet/slide 与上游一致不作为 chunk 字段）。
+- [x] Background Jobs：轻量 job manager + worker pool，reindex_base 已作为后台任务（embedding/refresh 随后续阶段接入）。
+- [x] Job Recovery：启动时将 pending/running 任务标记失败、按 raw source 恢复/失败中断文档；数据库不进入不可恢复状态。
+- [x] Duplicate Handling：content hash 去重 + 同名冲突 detect/keep/replace/rename 策略（URL/path 变更在 Phase 4 深化）。
+- [x] Input Sources 基础：base64 file、text（directory/URL 在 Phase 4 深化）。
+- [x] 单元与集成测试：状态机迁移、解析器注册与分发、切块正确性、元数据保留、任务恢复、重复处理（`internal/{chunk,parser,knowledge,storage}` 全部通过；Web API 回环测试通过）。
 
 产出物：可导入文件并完成 parse → chunk → 持久化的核心流程；文档与 KB 的持久化模型；基础 Web API 或内部 service 层。
 

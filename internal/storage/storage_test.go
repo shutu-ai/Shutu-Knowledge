@@ -40,7 +40,7 @@ func TestMigrateAppliesAndIsIdempotent(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO chunks (id, doc_id, base_id, idx, text, context, created_at) VALUES ('c1','d1','b1',0,'hello world','t','0')`); err != nil {
 		t.Fatalf("insert chunk: %v", err)
 	}
-	rows, err := db.Query(`SELECT fts_rowid FROM chunk_fts WHERE chunk_fts MATCH 'hello'`)
+	rows, err := db.Query(`SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH 'hello'`)
 	if err != nil {
 		t.Fatalf("fts match: %v", err)
 	}

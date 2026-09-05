@@ -11,6 +11,8 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/health"
+	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
+	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/logging"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
@@ -20,12 +22,14 @@ type Logger = logging.Logger
 
 // App owns the shared runtime components.
 type App struct {
-	Home     string
-	Config   config.Config
-	Logger   *Logger
-	DB       *storage.DB
-	RawStore *storage.RawFileStore
-	Health   *health.Registry
+	Home      string
+	Config    config.Config
+	Logger    *Logger
+	DB        *storage.DB
+	RawStore  *storage.RawFileStore
+	Health    *health.Registry
+	Jobs      *jobs.Manager
+	Knowledge *knowledge.Service
 }
 
 // New resolves config, opens storage, and registers core health checkers.
@@ -55,6 +59,17 @@ func New(ctx context.Context) (*App, error) {
 
 	application := &App{Home: home, Config: cfg, Logger: logger, DB: db, RawStore: raw, Health: health.NewRegistry()}
 	application.registerHealth()
+	application.Jobs = jobs.New(db, cfg.Jobs.ImportWorkers)
+	if err := application.Jobs.Start(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	application.Knowledge = knowledge.NewService(db, raw, cfg, application.Jobs)
+	if resumed, failed, err := application.Knowledge.RecoverInterrupted(ctx); err != nil {
+		logger.Warn("startup recovery incomplete", "error", err)
+	} else if resumed > 0 || failed > 0 {
+		logger.Info("startup recovery", "resumed", resumed, "failed", failed)
+	}
 	return application, nil
 }
 
@@ -97,6 +112,9 @@ func (a *App) registerHealth() {
 
 // Close releases all resources.
 func (a *App) Close() {
+	if a.Jobs != nil {
+		a.Jobs.Stop()
+	}
 	if a.DB != nil {
 		_ = a.DB.Close()
 	}

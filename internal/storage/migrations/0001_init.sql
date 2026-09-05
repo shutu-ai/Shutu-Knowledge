@@ -65,26 +65,29 @@ CREATE INDEX chunks_doc_idx ON chunks(doc_id);
 CREATE INDEX chunks_base_idx ON chunks(base_id);
 CREATE INDEX chunks_hash_idx ON chunks(embedding_text_hash, embedding_model);
 
+-- External-content FTS5 (trigram) over the chunks table, kept in sync by
+-- triggers; queries reconstruct text from chunks via rowid.
 CREATE VIRTUAL TABLE chunk_fts USING fts5(
-    fts_rowid UNINDEXED,
     search_text,
+    content = 'chunks',
+    content_rowid = 'rowid',
     tokenize = 'trigram'
 );
 
 CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunk_fts(fts_rowid, search_text)
+    INSERT INTO chunk_fts(rowid, search_text)
     VALUES (new.rowid, COALESCE(new.context, '') || ' ' || new.text);
 END;
 
 CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunk_fts(chunk_fts, fts_rowid, search_text)
+    INSERT INTO chunk_fts(chunk_fts, rowid, search_text)
     VALUES ('delete', old.rowid, COALESCE(old.context, '') || ' ' || old.text);
 END;
 
 CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
-    INSERT INTO chunk_fts(chunk_fts, fts_rowid, search_text)
+    INSERT INTO chunk_fts(chunk_fts, rowid, search_text)
     VALUES ('delete', old.rowid, COALESCE(old.context, '') || ' ' || old.text);
-    INSERT INTO chunk_fts(fts_rowid, search_text)
+    INSERT INTO chunk_fts(rowid, search_text)
     VALUES (new.rowid, COALESCE(new.context, '') || ' ' || new.text);
 END;
 

@@ -222,6 +222,35 @@ func (a *App) registerOptionalHealth() {
 		})
 	}
 
+	// Keep absent optional integrations visible to doctor and the health
+	// endpoint. An omitted command is a degraded capability, never a ready
+	// runtime, while the core service remains healthy.
+	registerUnavailable := func(name, detail string) {
+		a.Health.Register(health.CheckerFunc{
+			CheckName: name,
+			Level:     health.Optional,
+			Fn:        func(context.Context) error { return fmt.Errorf("%s", detail) },
+		})
+	}
+	if strings.TrimSpace(a.Config.Helpers.LegacyOffice) == "" {
+		registerUnavailable("helper-legacy-office", "legacy office runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+	if strings.TrimSpace(a.Config.Helpers.ContentConverter) == "" {
+		registerUnavailable("helper-content-converter", "PDF content converter is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+	if strings.TrimSpace(a.Config.Helpers.ImageDecoder) == "" {
+		registerUnavailable("helper-image-decoder", "JBIG2/JPX image decoder is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+	if strings.TrimSpace(a.Config.OCR.Helper) == "" && strings.TrimSpace(a.Config.Runtime.OCRHelper) == "" && strings.TrimSpace(a.Config.Runtime.HelperCommand) == "" {
+		registerUnavailable("helper-ocr", "OCR runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+	if strings.TrimSpace(a.Config.OCR.RenderHelper) == "" {
+		registerUnavailable("helper-ocr-render", "full-page PDF renderer is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+	if strings.TrimSpace(a.Config.OCR.FallbackHelper) == "" {
+		registerUnavailable("helper-ocr-fallback", "OCR fallback runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
+	}
+
 	// MinerU is configured per base. Doctor/health reports configuration
 	// problems without making an outbound API call on every snapshot.
 	a.Health.Register(health.CheckerFunc{
@@ -252,7 +281,7 @@ func (a *App) registerOptionalHealth() {
 
 func (a *App) probeRuntime(ctx context.Context, capability string) error {
 	if a.Runtime == nil || !a.Runtime.Configured(capability) {
-		return nil
+		return fmt.Errorf("%s runtime is not configured; install or configure a Knowledge-owned runtime", capability)
 	}
 	_, err := a.Runtime.Probe(ctx, capability)
 	return err
@@ -263,7 +292,7 @@ func (a *App) ocrArtifactPath() (string, bool) {
 		return "", false
 	}
 	model, err := a.Models.OCRStatus()
-	if err != nil || model.Status != "ready" {
+	if err != nil || model.Status != "installed" {
 		return "", false
 	}
 	return filepath.Join(a.Models.Root(), filepath.FromSlash(models.OCRModelID)), true
@@ -419,6 +448,7 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 		if !seen[item.ID] {
 			views = append(views, LocalModelView{Model: models.Model{
 				ID: item.ID, Kind: models.KindRerank, Status: "registered",
+				Lifecycle: models.LifecycleNotInstalled, Runtime: models.LifecycleRuntimeMiss,
 				Artifacts: []string{}, Downloaded: 0,
 			}})
 		}
@@ -434,7 +464,7 @@ func (a *App) SelfTestReranker(ctx context.Context, id string) (knowledge.Rerank
 	if err != nil {
 		return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are not downloaded")
 	}
-	if model.Kind != models.KindRerank || model.Status != "ready" {
+	if model.Kind != models.KindRerank || model.Status != "installed" {
 		return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are incomplete")
 	}
 	if a.Runtime == nil || !a.Runtime.Configured(runtime.CapabilityRerank) {

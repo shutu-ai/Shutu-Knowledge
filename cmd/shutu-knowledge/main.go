@@ -98,7 +98,7 @@ func cmdDoctor(ctx context.Context) error {
 		if err := os.MkdirAll(home, 0o755); err != nil {
 			return err
 		}
-		if err := config.WriteDefault(home+string(os.PathSeparator)+"config.yaml"); err != nil {
+		if err := config.WriteDefault(home + string(os.PathSeparator) + "config.yaml"); err != nil {
 			return err
 		}
 		fmt.Println("wrote default config.yaml")
@@ -125,6 +125,20 @@ func cmdDoctor(ctx context.Context) error {
 	out, _ := json.MarshalIndent(report.Components, "", "  ")
 	fmt.Println("health:", report.Status)
 	fmt.Println(string(out))
+	localModels, err := application.ListLocalModels()
+	if err != nil {
+		return fmt.Errorf("inspect local models: %w", err)
+	}
+	modelOut, _ := json.MarshalIndent(localModels, "", "  ")
+	fmt.Println("local models:")
+	fmt.Println(string(modelOut))
+	ocrModel, err := application.Models.OCRStatus()
+	if err != nil {
+		return fmt.Errorf("inspect OCR model: %w", err)
+	}
+	ocrOut, _ := json.MarshalIndent(ocrModel, "", "  ")
+	fmt.Println("OCR model:")
+	fmt.Println(string(ocrOut))
 	fmt.Println("env:", config.EnvPreview())
 	if !report.Ready {
 		return fmt.Errorf("doctor found failed subsystems")

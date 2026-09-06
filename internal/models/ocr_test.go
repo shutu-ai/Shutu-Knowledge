@@ -52,7 +52,7 @@ func TestOCRBundleLifecycle(t *testing.T) {
 	}
 
 	status, err = manager.OCRStatus()
-	if err != nil || status.Status != "ready" || status.Kind != KindOCR || len(status.Missing) != 0 {
+	if err != nil || status.Status != "installed" || status.Lifecycle != LifecycleInstalled || status.Ready || status.Runtime != LifecycleRuntimeMiss || status.Kind != KindOCR || len(status.Missing) != 0 {
 		t.Fatalf("downloaded OCR status: %+v %v", status, err)
 	}
 	dictionary, err := os.ReadFile(filepath.Join(manager.Root(), "PaddlePaddle", "PP-OCRv5-mobile", "ppocrv5_dict.txt"))

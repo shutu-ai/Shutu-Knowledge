@@ -8,8 +8,9 @@ shutu-knowledge doctor
 ```
 
 Confirm the printed data home is the intended private directory. Doctor
-reports schema version, raw-store accessibility, process/database/index/model
-component state, and non-secret environment overrides.
+reports schema version, raw-store accessibility, process/database/index, model
+lifecycle, configured runtime, and missing optional-runtime component state,
+plus non-secret environment overrides.
 
 ## Database Or Startup Failures
 
@@ -50,7 +51,8 @@ status; use these fields before changing model configuration.
 
 ## Model Runtime Problems
 
-1. Run `GET /api/runtime-status`; unconfigured capabilities are omitted.
+1. Run `shutu-knowledge doctor`; missing runtimes are reported as degraded with
+   a remediation, while `GET /api/runtime-status` shows configured helper probes.
 2. Verify the configured helper starts, completes the line-delimited JSON
    handshake, answers health, and reports the requested capability.
 3. Confirm dimensions match existing vectors and model keys before searching.

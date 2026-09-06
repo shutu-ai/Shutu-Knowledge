@@ -30,6 +30,20 @@ const (
 	KindOCR       = "ocr"
 )
 
+// Lifecycle values describe the complete model lifecycle, not just whether
+// files are present. An artifact directory is never READY without a live
+// runtime and a successful inference smoke test.
+const (
+	LifecycleNotInstalled = "NOT_INSTALLED"
+	LifecycleDownloading  = "DOWNLOADING"
+	LifecycleVerifying    = "VERIFYING"
+	LifecycleInstalled    = "INSTALLED"
+	LifecycleRuntimeMiss  = "RUNTIME_MISSING"
+	LifecycleLoading      = "LOADING"
+	LifecycleReady        = "READY"
+	LifecycleFailed       = "FAILED"
+)
+
 // Default artifact sets. A custom Hugging Face repository can override them.
 var defaultArtifacts = map[string][]string{
 	KindEmbedding: {"config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "model.onnx"},
@@ -38,10 +52,16 @@ var defaultArtifacts = map[string][]string{
 
 // Model is a cached local model directory.
 type Model struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Artifacts  []string `json:"artifacts"`
-	Status     string   `json:"status"` // ready | incomplete
+	ID        string   `json:"id"`
+	Kind      string   `json:"kind"`
+	Artifacts []string `json:"artifacts"`
+	// Status is the artifact/cache status retained for the existing Models UI.
+	// It must not be interpreted as runtime readiness.
+	Status     string   `json:"status"` // installed | incomplete | not-downloaded
+	Lifecycle  string   `json:"lifecycle"`
+	Ready      bool     `json:"ready"`
+	Runtime    string   `json:"runtimeStatus,omitempty"`
+	LastError  string   `json:"lastError,omitempty"`
 	SizeBytes  int64    `json:"sizeBytes"`
 	Downloaded int64    `json:"downloadedAt"`
 	Missing    []string `json:"missing,omitempty"`
@@ -181,9 +201,13 @@ func (m *Manager) inspect(id string) (Model, error) {
 		}
 		model.SizeBytes += info.Size()
 	}
-	model.Status = "ready"
+	model.Status = "installed"
+	model.Lifecycle = LifecycleInstalled
+	model.Runtime = LifecycleRuntimeMiss
 	if len(model.Missing) > 0 {
 		model.Status = "incomplete"
+		model.Lifecycle = LifecycleFailed
+		model.LastError = "one or more model artifacts are missing or empty"
 	}
 	return model, nil
 }

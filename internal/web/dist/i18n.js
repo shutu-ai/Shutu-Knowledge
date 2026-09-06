@@ -206,6 +206,7 @@ const zh = {
   "stale": "已过期",
   "downloading": "下载中",
   "incomplete": "不完整",
+  "installed": "已安装（未加载）",
   "registered": "已注册",
   "not-downloaded": "未下载",
   "not ready": "未就绪",

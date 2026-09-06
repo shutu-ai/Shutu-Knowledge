@@ -436,7 +436,7 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	}
 	model := models[0].(map[string]any)
 	selfTest := model["selfTest"].(map[string]any)
-	if model["status"] != "ready" || selfTest["current"] != true || selfTest["healthy"] != true {
+	if model["status"] != "installed" || model["lifecycle"] != "INSTALLED" || model["ready"] != false || model["runtimeStatus"] != "RUNTIME_MISSING" || selfTest["current"] != true || selfTest["healthy"] != true {
 		t.Fatalf("model/self-test state: %v", model)
 	}
 
@@ -550,7 +550,7 @@ func TestOCRModelAPIStatusAndRemove(t *testing.T) {
 
 	_, payload = call(t, s, "GET", "/api/ocr/model", nil)
 	status = valueMap(t, payload)
-	if status["status"] != "ready" || status["missing"] != nil {
+	if status["status"] != "installed" || status["lifecycle"] != "INSTALLED" || status["ready"] != false || status["runtimeStatus"] != "RUNTIME_MISSING" || status["missing"] != nil {
 		t.Fatalf("downloaded OCR model: %v", status)
 	}
 

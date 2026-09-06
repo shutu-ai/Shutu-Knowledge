@@ -44,7 +44,7 @@ func TestManagerDownloadListAndRemove(t *testing.T) {
 	if err != nil || len(models) != 1 {
 		t.Fatalf("list: %v %+v", err, models)
 	}
-	if models[0].Status != "ready" || models[0].Kind != KindEmbedding || models[0].SizeBytes != 19 {
+	if models[0].Status != "installed" || models[0].Lifecycle != LifecycleInstalled || models[0].Ready || models[0].Runtime != LifecycleRuntimeMiss || models[0].Kind != KindEmbedding || models[0].SizeBytes != 19 {
 		t.Fatalf("ready model: %+v", models[0])
 	}
 	if _, err := os.Stat(filepath.Join(root, "example", "model", "model.onnx")); err != nil {
@@ -129,7 +129,7 @@ func TestManagerMigratesVerifiedModelCache(t *testing.T) {
 		t.Fatalf("copy migration result: %+v root=%s", result, manager.Root())
 	}
 	copied, err := manager.List()
-	if err != nil || len(copied) != 1 || copied[0].Status != "ready" {
+	if err != nil || len(copied) != 1 || copied[0].Status != "installed" || copied[0].Lifecycle != LifecycleInstalled || copied[0].Ready {
 		t.Fatalf("copied cache: %v %+v", err, copied)
 	}
 	if _, err := os.Stat(modelFile); err != nil {

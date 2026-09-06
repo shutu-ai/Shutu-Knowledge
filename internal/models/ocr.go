@@ -64,7 +64,8 @@ func (m *Manager) OCRStatus() (Model, error) {
 	}
 	return Model{
 		ID: OCRModelID, Kind: KindOCR, Artifacts: ocrArtifactNames(),
-		Status: "not-downloaded", Missing: ocrArtifactNames(),
+		Status: "not-downloaded", Lifecycle: LifecycleNotInstalled,
+		Runtime: LifecycleRuntimeMiss, Missing: ocrArtifactNames(),
 	}, nil
 }
 

@@ -101,12 +101,14 @@ grouped by page and CJK horizontal-space artifacts are folded.
 Health uses method `health` with `{"capability":"embedding"}` (or the other
 capability names) and must return `{"ready":true}` plus the loaded model when
 ready. `GET /api/runtime-status` probes every configured helper and reports
-failures; unconfigured helpers are omitted instead of being reported ready.
+failures; unconfigured helpers are omitted from that low-level runtime map,
+while `shutu-knowledge doctor` exposes them as actionable degraded checks.
 
 Knowledge never treats an installed model artifact as ready by itself. The
-runtime must successfully answer the handshake and health probe. No inference
-engine is bundled, so a real helper is required before local model capabilities
-are used.
+model API reports a complete artifact set as `INSTALLED` with `ready: false`.
+`READY` additionally requires a successful runtime load and inference smoke
+test. No inference engine is bundled, so a real helper is required before local
+model capabilities are used.
 
 ## OCR Artifact Lifecycle
 

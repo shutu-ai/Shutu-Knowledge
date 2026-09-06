@@ -12,6 +12,13 @@ release gates, and
 [shutu_knowledge_implementation_report.md](shutu_knowledge_implementation_report.md)
 records the current evidence-backed conclusion.
 
+Out-of-box runtime status: **not ready**. Local embedding, local reranking,
+OCR, full-page PDF rendering, JBIG2/JPX decoding, and legacy Office conversion
+still require manually configured external runtimes. See
+[out_of_box_parity_report.md](out_of_box_parity_report.md) and
+[docs/runtime_dependencies.md](docs/runtime_dependencies.md). V1 release
+readiness and out-of-box runtime parity are intentionally separate statuses.
+
 ## Architecture at a glance
 
 - **One-way dependency**: `shutu-knowledge → shutu-agent public Extension API`. The Agent is a read-only dependency.
@@ -28,6 +35,8 @@ Key documents:
 - [docs/agent_extension_gap_report.md](docs/agent_extension_gap_report.md) — Agent contract gaps and workarounds
 - [docs/security_review.md](docs/security_review.md) — hardening review and residual deployment risks
 - [docs/deployment.md](docs/deployment.md) — standalone and Agent-managed deployment
+- [docs/out_of_box_parity_matrix.md](docs/out_of_box_parity_matrix.md) — strict runtime parity matrix
+- [docs/runtime_dependencies.md](docs/runtime_dependencies.md) — packaged and external runtime boundaries
 
 ## License
 

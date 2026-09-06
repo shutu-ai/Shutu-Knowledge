@@ -68,8 +68,9 @@ the declared route to it.
 
 ## Optional Runtimes
 
-Embedding, reranking, and OCR inference are optional external helper processes
-described in [models.md](models.md). MinerU, legacy office conversion, and PDF
+Embedding, reranking, and OCR inference are currently manually configured
+external helper processes described in [models.md](models.md); this is not an
+out-of-box runtime installation. MinerU, legacy office conversion, and PDF
 content-signature conversion are optional external document services. Configure commands through
 [configuration.md](configuration.md), then verify readiness with:
 
@@ -78,7 +79,9 @@ shutu-knowledge doctor
 ```
 
 The REST endpoint `GET /api/runtime-status` probes configured helper
-capabilities. Missing artifact files alone never make a runtime ready.
+capabilities. `doctor` also lists missing optional runtimes and model lifecycle
+state. Missing artifact files alone never make a runtime ready; an installed
+artifact set is only `INSTALLED` until load and inference smoke succeed.
 
 ## Operational Checks
 

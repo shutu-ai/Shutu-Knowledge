@@ -676,7 +676,7 @@ async function renderModels() {
         h("div", { class: "muted", style: "margin-top:8px" }, ocrRuntime.status.ocr
           ? `Runtime helper: ${ocrRuntime.status.ocr.ready ? "ready" : "not ready"}`
           : "Runtime helper: not configured"),
-        h("div", { class: "muted" }, ocrModel.status === "ready" && ocrRuntime.status.ocr?.ready
+        h("div", { class: "muted" }, ocrModel.status === "installed" && ocrRuntime.status.ocr?.ready
           ? "OCR artifacts and helper are ready"
           : "OCR remains unavailable until both are ready"),
       ]),
@@ -684,7 +684,7 @@ async function renderModels() {
         h("div", { class: "panel list" }, localModels.models.length ? localModels.models.map((model) => h("div", { class: "list-row" }, [
           h("div", {}, [
             h("strong", { class: "truncate" }, model.id),
-            h("div", { class: "muted" }, `${model.kind} · ${number(model.sizeBytes)} bytes · ${model.status}${model.selfTest ? (model.selfTest.current ? " · self-test passed" : model.selfTest.healthy ? " · stale self-test" : " · self-test failed") : model.kind === "rerank" ? " · self-test required" : ""}`),
+            h("div", { class: "muted" }, `${model.kind} · ${number(model.sizeBytes)} bytes · ${model.status} · ${model.lifecycle || "INSTALLED"}${model.runtimeStatus ? ` · ${model.runtimeStatus}` : ""}${model.selfTest ? (model.selfTest.current ? " · self-test passed" : model.selfTest.healthy ? " · stale self-test" : " · self-test failed") : model.kind === "rerank" ? " · self-test required" : ""}`),
           ]),
           h("div", { class: "toolbar" }, [
             model.kind === "rerank" ? h("button", { class: "button small", onclick: () => guard(async () => {

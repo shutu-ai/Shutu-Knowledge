@@ -311,10 +311,10 @@ docs/source_reuse_inventory.md（初始）
 
 当前功能状态：Gate A-J 均已通过；能力矩阵无 `PARTIAL` 行；本项目许可证已确定为 Apache-2.0 并提交 `LICENSE`。`GAP-001` / `GAP-002` 是已记录的非阻断 Contract limitation。
 
-当前发布状态：`github.com/shutu-ai/shutu-agent v0.2.0` 仓库及其公开 Go module 没有明确 `LICENSE`，SDK 文件也没有版权/许可声明。该项是上游 License governance blocker，Knowledge 不得修改 Agent 绕过。当前结论是：
+当前发布状态：`github.com/shutu-ai/shutu-agent v0.2.1` 已作为公开 Go module 发布，并明确采用 Apache-2.0。此前 `v0.2.0` 的上游 License governance blocker 已解决；Knowledge 仍未修改 Agent，也未通过本地替换绕过依赖。当前结论是：
 
 ```text
-SHUTU-KNOWLEDGE V1 FUNCTIONALLY READY BUT NOT RELEASE READY
+SHUTU-KNOWLEDGE V1 RELEASE READY
 ```
 
 ---

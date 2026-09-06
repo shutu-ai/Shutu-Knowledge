@@ -24,7 +24,12 @@ Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this pr
 
 | Repository | Commit | Worktree state at audit |
 |---|---|---|
-| shutu-agent (`C:\dev-projects\Agent\shutu-agent`) | `8701c2adbc00b0af8c5fba5272daaf28a7327e92` | untracked files only: `.codegraph/`, `new-logo-b.png`, `new-logo-w.png`, `web/tmp-native-workspace.png` (pre-existing, user-owned; untouched by this project) |
+| shutu-agent (`C:\dev-projects\Agent\shutu-agent`) | `60730c671d30e30eb910b92a69c621ce9fecfdf0` (`v0.2.1`) | untracked files only: `.codegraph/`, `new-logo-b.png`, `new-logo-w.png`, `web/.npm-cache/`, `web/tmp-native-workspace.png` (pre-existing, user-owned; untouched by this project) |
 | dsh-knowledge (`C:\dev-projects\dsh\dsh-knowledge`) | `95e4a135cca3282b345c6d12a8e09cc4a314402f` | clean |
 
 Both baselines are re-checked at every phase boundary (see `Agent.md` §3).
+
+The release dependency is the public module
+`github.com/shutu-ai/shutu-agent v0.2.1`, whose module distribution includes
+the upstream Apache-2.0 `LICENSE`. No local replacement, workspace injection,
+symlink, or Agent source is used.

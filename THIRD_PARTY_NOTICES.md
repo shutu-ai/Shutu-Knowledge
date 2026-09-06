@@ -7,7 +7,7 @@ This project is released under Apache-2.0; see [LICENSE](LICENSE).
 | Project | License | Usage |
 |---|---|---|
 | [dsh-knowledge](https://github.com/Soren-ABT/dsh-knowledge) v0.3.9 (commit `95e4a135cca3282b345c6d12a8e09cc4a314402f`) | AGPL-3.0 | Functional/behavioral reference only. Audited for capability inventory. No source code copied or distributed by this project. |
-| [shutu-agent](https://github.com/shutu-ai/shutu-agent) | **No repository `LICENSE` found in tag/module `v0.2.0`; license verification required** | Required Go dependency for Extension Protocol v1 and `sdk/extension`. Knowledge links to the published module and does not modify or redistribute the Agent application. Absence of an explicit upstream license is recorded as a release blocker in `docs/release_readiness_report.md`. |
+| [shutu-agent](https://github.com/shutu-ai/shutu-agent/releases/tag/v0.2.1) | Apache-2.0 | v0.2.1 is the required public Go dependency for Extension Protocol v1 and `sdk/extension`. Knowledge links to the published module and does not modify or redistribute the Agent application. |
 
 Because dsh-knowledge is AGPL-3.0 and this project is Apache-2.0, the safe posture mandated by the project requirements remains: **no direct copying of dsh-knowledge source**. All behavior is reimplemented from the capability inventory with original code. If that policy ever changes, AGPL-3.0 obligations (license propagation, corresponding source, attribution) must be satisfied before any distribution.
 
@@ -27,10 +27,9 @@ repositories are read-only inputs and are not distributed by this project.
 
 The modernc.org/libc distribution also carries its own
 `LICENSE-3RD-PARTY.md`; those terms apply to the files it identifies. The Go
-module distribution of shutu-agent `v0.2.0` contains no repository-level
-`LICENSE`, and its SDK files contain no copyright or license headers. Do not
-redistribute Knowledge binaries that embed this dependency until upstream
-governance is resolved.
+module distribution of shutu-agent `v0.2.1` includes its Apache-2.0 `LICENSE`;
+the earlier v0.2.0 licensing gap is retained in the release audit as history,
+but does not apply to the dependency used by this release.
 
 ## Optional models and external components
 

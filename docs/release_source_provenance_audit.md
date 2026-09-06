@@ -43,13 +43,20 @@ the AGPL source remains outside this repository's distribution.
 | Chunking and semantic merge | `chunk.ts` | Original Go scoring/refinement with typed pieces and separator decoding | No | Public scoring behavior may align; protectable expression does not | Go chunk/semantic tests and token-limit tests | PASS |
 | Lexical/vector retrieval and context window | `chunkdb.ts`, `retrieval.ts`, `context.ts` | Original Go SQL retrieval, evidence window composer, and typed excerpt fitting | No | Domain/API-compatible names are not source copying; reviewed functions are independently expressed in Go | Exact long-literal overlap 0; focused review of anchor/budget/overlap code; retrieval/context tests | PASS |
 | Embedding/rerank/local model runtime | embed/rerank/local model modules | Original Go provider adapters plus a generic isolated helper protocol | No | Inference engines, model weights, and third-party model terms are external | Runtime lifecycle, score/vector validation, timeout/restart, and self-test tests | PASS |
-| Agent tools and auto RAG | `src/tool-knowledge/index.ts` | Original Go Extension adapter and policy implementation over public SDK types | No | See the separate shutu-agent upstream license finding below | 14-tool catalog, scope/approval, auto-RAG, and real Agent process tests | PASS |
+| Agent tools and auto RAG | `src/tool-knowledge/index.ts` | Original Go Extension adapter and policy implementation over public SDK types | No | Public `shutu-agent` SDK dependency is Apache-2.0 at v0.2.1; no Agent source is bundled | 14-tool catalog, scope/approval, auto-RAG, and real Agent process tests | PASS |
 | Web management UI | `src/ui/client/*.tsx`, `locales.ts` | Independent dependency-free vanilla JavaScript/CSS UI | No | Shared functional labels/config names are compatibility contracts; component architecture differs | React/TSX versus vanilla JS; UI literal overlap limited to generic contract strings; contract test and Chrome CDP E2E | PASS |
 | Tests and benchmarks | `tests/*.spec.ts`, benchmark data | Original Go unit/integration/benchmark/E2E tests using equivalent fixtures and assertions where needed | No | Test parity is behavioral evidence, not copied test code | Go/race suite, Web contract test, CDP E2E, benchmark smoke, and release gates | PASS |
 
 ## Result
 
 No unrecorded direct or translated AGPL source copy was found. Source
-provenance is **PASS**. This result does not cure the separately recorded
-missing shutu-agent repository license; that is a dependency governance issue in
-`docs/release_readiness_report.md`.
+provenance is **PASS**. This release only changes the public Agent module
+version and release documentation; it introduces no new source reuse.
+
+### Previous License Blocker
+
+Previous blocker: `shutu-agent v0.2.0` had no explicit repository license.
+
+Resolved: `shutu-agent v0.2.1` is publicly published under Apache-2.0 and its
+module distribution includes `LICENSE`. The dependency is consumed through the
+public `sdk/extension` API only.

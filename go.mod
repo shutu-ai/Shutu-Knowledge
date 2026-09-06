@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/ledongthuc/pdf v0.0.0-20260903153007-b3c860c23753
-	github.com/shutu-ai/shutu-agent v0.2.0
+	github.com/shutu-ai/shutu-agent v0.2.1
 	golang.org/x/image v0.45.0
 	golang.org/x/net v0.58.0
 	golang.org/x/text v0.41.0

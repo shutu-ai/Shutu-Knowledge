@@ -2,10 +2,10 @@
 
 An independent knowledge-base system for [shutu-agent](https://github.com/shutu-ai/shutu-agent), implementing capability equivalence with [dsh-knowledge](https://github.com/Soren-ABT/dsh-knowledge) through the frozen shutu-agent Extension Platform v1.
 
-Status: **functionally V1 ready, but not release ready.** Target capability
-coverage is complete except documented non-blocking upstream Extension Contract
-limitations. The remaining release blocker is the missing explicit shutu-agent
-repository license. [Agent.md](Agent.md) tracks the plan,
+Status: **V1 Release Ready.** Target capability coverage is complete except
+documented non-blocking upstream Extension Contract limitations. The Agent
+dependency is the explicitly Apache-2.0 licensed public module
+`github.com/shutu-ai/shutu-agent v0.2.1`. [Agent.md](Agent.md) tracks the plan,
 [docs/gates.md](docs/gates.md) tracks Gate A-J evidence,
 [docs/release_readiness_report.md](docs/release_readiness_report.md) tracks
 release gates, and

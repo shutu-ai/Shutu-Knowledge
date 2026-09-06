@@ -88,11 +88,16 @@ web: npm test
 
 No current automated test failure is known.
 
-## Remaining Blockers To Ready
+## Remaining Blockers To Release
 
-None. The project is released under Apache-2.0 in [LICENSE](LICENSE).
-Agent Contract GAP-001 and GAP-002 remain documented limitations rather than
-readiness blockers; their workarounds and generic improvement requirements are
-recorded in `docs/agent_extension_gap_report.md`.
+The required public Go dependency
+`github.com/shutu-ai/shutu-agent@v0.2.0` has no repository-level `LICENSE` and
+its SDK files contain no copyright/license headers. This is an upstream license
+governance item; Knowledge must not modify or repack the Agent to work around
+it. See [docs/release_readiness_report.md](docs/release_readiness_report.md).
 
-SHUTU-KNOWLEDGE V1 READY
+Agent Contract GAP-001 and GAP-002 remain documented non-blocking limitations;
+their workarounds and generic improvement requirements are recorded in
+`docs/agent_extension_gap_report.md`.
+
+SHUTU-KNOWLEDGE V1 FUNCTIONALLY READY BUT NOT RELEASE READY

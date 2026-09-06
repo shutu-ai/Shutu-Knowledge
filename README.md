@@ -2,8 +2,13 @@
 
 An independent knowledge-base system for [shutu-agent](https://github.com/shutu-ai/shutu-agent), implementing capability equivalence with [dsh-knowledge](https://github.com/Soren-ABT/dsh-knowledge) through the frozen shutu-agent Extension Platform v1.
 
-Status: **SHUTU-KNOWLEDGE V1 READY.** [Agent.md](Agent.md)
-tracks the plan, [docs/gates.md](docs/gates.md) tracks Gate A-J evidence, and
+Status: **functionally V1 ready, but not release ready.** Target capability
+coverage is complete except documented non-blocking upstream Extension Contract
+limitations. The remaining release blocker is the missing explicit shutu-agent
+repository license. [Agent.md](Agent.md) tracks the plan,
+[docs/gates.md](docs/gates.md) tracks Gate A-J evidence,
+[docs/release_readiness_report.md](docs/release_readiness_report.md) tracks
+release gates, and
 [shutu_knowledge_implementation_report.md](shutu_knowledge_implementation_report.md)
 records the current evidence-backed conclusion.
 

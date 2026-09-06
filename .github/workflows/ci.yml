@@ -12,21 +12,46 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: Web build
-        working-directory: web
-        run: npm run build
-      - name: Web test
-        working-directory: web
-        run: npm test
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
-      - name: Architecture gate: no shutu-agent internal imports
+          cache: true
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Download Go modules
+        run: go mod download
+      - name: "Architecture gate: no shutu-agent internal imports"
         run: |
-          if grep -RIn --include='*.go' 'shutu-agent/internal' .; then
+          if grep -RIn --include='*.go' 'shutu-agent/internal' cmd internal; then
             echo '::error::production imports of shutu-agent/internal are forbidden'
             exit 1
           fi
+      - name: "Architecture gate: public SDK imports stay in internal/extension"
+        run: |
+          matches=$(grep -RIl --include='*.go' 'github.com/shutu-ai/shutu-agent/sdk/extension' cmd internal | grep -v '^internal/extension/' || true)
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches"
+            echo '::error::only internal/extension may import shutu-agent/sdk/extension'
+            exit 1
+          fi
+      - name: "Portability gate: no local Agent replacement"
+        run: |
+          if grep -En 'replace[[:space:]]+github\.com/shutu-ai/shutu-agent|(/|[A-Za-z]:\\\\)dev-projects/' go.mod; then
+            echo '::error::go.mod must resolve the public shutu-agent module'
+            exit 1
+          fi
+      - name: Web build
+        working-directory: web
+        run: npm run build
+      - name: Web typecheck
+        working-directory: web
+        run: npm run typecheck
+      - name: Web test
+        working-directory: web
+        run: npm test
       - name: Build
         run: go build ./...
       - name: Vet

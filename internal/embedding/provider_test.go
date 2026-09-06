@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -37,12 +38,16 @@ func TestOpenAIProviderMapsIndexesAndNormalizes(t *testing.T) {
 func TestOpenAIProviderErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte("boom"))
+		_, _ = w.Write([]byte("UPSTREAM-SECRET"))
 	}))
 	defer server.Close()
 	provider := New(Config{Provider: "openai", BaseURL: server.URL, Model: "m", Client: server.Client()})
-	if _, err := provider.Embed(context.Background(), []string{"a"}); err == nil {
+	_, err := provider.Embed(context.Background(), []string{"a"})
+	if err == nil {
 		t.Fatal("expected HTTP error")
+	}
+	if !strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "UPSTREAM-SECRET") {
+		t.Fatalf("provider error must expose status only: %v", err)
 	}
 	mismatch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"index": 0, "embedding": []float64{1}}}})

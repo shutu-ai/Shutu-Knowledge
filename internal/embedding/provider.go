@@ -8,11 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/httpx"
 )
 
 // Provider generates embeddings. ModelKey identifies the producing
@@ -45,7 +46,7 @@ func New(cfg Config) Provider {
 	}
 	client := cfg.Client
 	if client == nil {
-		client = &http.Client{Timeout: cfg.Timeout}
+		client = httpx.NewClient(cfg.Timeout)
 	}
 	switch cfg.Provider {
 	case "openai":
@@ -105,8 +106,7 @@ func (p *openAIProvider) Embed(ctx context.Context, texts []string) ([][]float64
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return nil, fmt.Errorf("embedding request failed: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+		return nil, fmt.Errorf("embedding request failed: HTTP %d", resp.StatusCode)
 	}
 	var payload struct {
 		Data []struct {

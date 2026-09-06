@@ -20,6 +20,9 @@ import (
 type Result struct {
 	Title string
 	Text  string
+	// NeedsOCR marks a technically readable but fragmented/corrupt text
+	// layer. Callers should try OCR while retaining Text as a last resort.
+	NeedsOCR bool
 }
 
 // Parser extracts text from one format family.
@@ -35,8 +38,20 @@ type Registry struct {
 	byExt map[string]Parser
 }
 
+// Option customizes the registry.
+type Option func(*Registry)
+
+// WithLegacyHelper registers the optional external converter for legacy
+// OLE office formats (.doc/.ppt/.xls). Without it those formats surface as
+// unsupported instead of silently mis-parsing.
+func WithLegacyHelper(h HelperRunner) Option {
+	return func(r *Registry) {
+		r.SetLegacyHelper(h)
+	}
+}
+
 // NewRegistry registers the built-in parsers.
-func NewRegistry() *Registry {
+func NewRegistry(opts ...Option) *Registry {
 	r := &Registry{byExt: map[string]Parser{}}
 	textParser := &textParser{}
 	for _, ext := range []string{"txt", "md", "markdown", "mdx", "csv", "json", "log"} {
@@ -53,7 +68,26 @@ func NewRegistry() *Registry {
 	r.byExt["epub"] = office
 	pdf := &pdfParser{}
 	r.byExt["pdf"] = pdf
+	for _, opt := range opts {
+		opt(r)
+	}
 	return r
+}
+
+// SetLegacyHelper atomically installs or removes the optional legacy office
+// converter. An unavailable helper fails closed: .doc/.ppt/.xls remain
+// unsupported instead of producing runtime errors after import starts.
+func (r *Registry) SetLegacyHelper(h HelperRunner) {
+	for _, ext := range []string{"doc", "ppt", "xls"} {
+		delete(r.byExt, ext)
+	}
+	if h == nil || !h.Available() {
+		return
+	}
+	helper := &helperParser{runner: h}
+	for _, ext := range []string{"doc", "ppt", "xls"} {
+		r.byExt[ext] = helper
+	}
 }
 
 // SupportedExtensions lists every registered extension (sorted).

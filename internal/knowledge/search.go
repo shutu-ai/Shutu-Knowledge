@@ -47,6 +47,7 @@ type SearchHit struct {
 	Score         float64          `json:"score"`
 	VectorScore   float64          `json:"vectorScore,omitempty"`
 	LexicalScore  float64          `json:"lexicalScore,omitempty"`
+	FusionScore   float64          `json:"fusionScore,omitempty"`
 	RerankScore   float64          `json:"rerankScore,omitempty"`
 	ContextWindow *evidence.Window `json:"contextWindow,omitempty"`
 }
@@ -190,6 +191,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 
 	variants := queryVariants(query, req.Queries)
 	var variantOrders [][]string
+	fusionScores := map[string]float64{}
 	laneVectors := map[string]float64{}
 	laneLexicals := map[string]float64{}
 	embeddings := map[string][]float32{}
@@ -247,6 +249,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		if mode == "hybrid" {
 			weights := []float64{s.global.Retrieval.RRFVectorWeight, 1}
 			fused := retrieval.ReciprocalRankFusion([][]string{vectorOrder, lexicalOrder}, weights)
+			fusionScores = fused
 			ordered := make([]string, 0, len(fused))
 			for id := range fused {
 				ordered = append(ordered, id)
@@ -264,6 +267,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		globalOrder = variantOrders[0]
 	} else {
 		fused := retrieval.ReciprocalRankFusion(variantOrders, nil)
+		fusionScores = fused
 		for id := range fused {
 			globalOrder = append(globalOrder, id)
 		}
@@ -402,8 +406,8 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		} else if mode == "vector" {
 			hit.Score = laneVectors[c.ID]
 		} else if mode == "hybrid" {
-			// Report the fused relevance as the score summary.
-			hit.Score = laneLexicals[c.ID]
+			hit.Score = fusionScores[c.ID]
+			hit.FusionScore = fusionScores[c.ID]
 		}
 		window := evidence.Compose(neighbors[c.DocID], c, evidence.Options{
 			Before:    &siblings,
@@ -416,6 +420,21 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 	}
 	result.Total = len(result.Hits)
 	result.ElapsedMS = Now().UnixMilli() - startedAt.UnixMilli()
+	s.recordMetric(func(m *MetricsSnapshot) {
+		m.Searches++
+		m.SearchDurationMS += result.ElapsedMS
+		m.CandidateCount += int64(len(ordered))
+		m.ContextCount += int64(len(result.Hits))
+		if result.Rerank != nil {
+			m.RerankDurationMS += result.Rerank.ElapsedMS
+			if result.Rerank.Status == "degraded" {
+				m.ModelErrors++
+			}
+		}
+	})
+	if result.Hits == nil {
+		result.Hits = []SearchHit{}
+	}
 	return result, nil
 }
 
@@ -443,11 +462,11 @@ func (s *Service) resolveMode(requested string, vectorAvailable bool) string {
 // resolveSearchScope intersects the request with the pinned enabled scope.
 // Returns nil for "all bases", or a possibly-empty explicit set.
 func (s *Service) resolveSearchScope(req SearchRequest) ([]string, error) {
-	enabled, pinned, err := s.EnabledScope()
+	state, err := s.EnabledScopeState()
 	if err != nil {
 		return nil, err
 	}
-	if !enabled {
+	if !state.Enabled {
 		return []string{}, nil
 	}
 	var requested []string
@@ -457,11 +476,13 @@ func (s *Service) resolveSearchScope(req SearchRequest) ([]string, error) {
 		requested = req.BaseIDs
 	}
 	switch {
-	case len(pinned) > 0 && requested == nil:
-		return pinned, nil
-	case len(pinned) > 0:
+	case state.Explicit && len(state.BaseIDs) == 0:
+		return []string{}, nil
+	case len(state.BaseIDs) > 0 && requested == nil:
+		return state.BaseIDs, nil
+	case len(state.BaseIDs) > 0:
 		allowed := map[string]bool{}
-		for _, id := range pinned {
+		for _, id := range state.BaseIDs {
 			allowed[id] = true
 		}
 		var intersected []string

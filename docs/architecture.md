@@ -18,7 +18,7 @@ Status: Phase 0 design. Derived from the audited dsh-knowledge behavior (`dsh_kn
 | Schema management | versioned embedded migrations (own runner) | Gate: no scattered `CREATE TABLE IF NOT EXISTS` in business code |
 | Web UI | React + TypeScript + Vite, embedded into the Go binary (`go:embed`) | independent build pipeline, native navigation via web contribution |
 | Local ML (embedding/rerank) | optional helper process (Node + transformers.js, same model families as dsh), health-checked and auto-discovered; remote OpenAI-compatible/Ollama providers work without it | avoids cgo/onnxruntime build burden; optional runtime is explicitly allowed by the requirements |
-| OCR | optional helper (PaddleOCR ONNX / Tesseract) with availability detection and fallback; native text extraction first | OCR failure must not break parseable text |
+| OCR | isolated PaddleOCR/helper runtime as primary, optional deployment-supplied full-page PDF renderer, and optional Tesseract command fallback; native text extraction first | OCR failure must not break parseable text; rendering and inference are never bundled |
 | MinerU | remote HTTP processor (batch/upload/poll/download), fallback to local chain | parity with PRS-12 |
 
 ## 3. Process model
@@ -31,7 +31,7 @@ shutu-knowledge (extension process)
   ├── extension server (initialize/health/context/tool/event/shutdown)
   ├── local HTTP server (web UI + REST API)  ── webBaseUrl reported at initialize
   ├── job manager (ingest/parse/embed/reindex/refresh worker pool)
-  └── optional helper processes (model worker, OCR worker)
+  └── optional helper processes (model worker, OCR worker, PDF renderer)
 ```
 
 Standalone mode: `shutu-knowledge serve` runs the HTTP server without the Agent; `shutu-knowledge doctor` and `shutu-knowledge version` work offline.

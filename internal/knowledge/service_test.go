@@ -2,8 +2,12 @@ package knowledge
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +15,79 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
+
+type concurrencyEmbedder struct {
+	mu      sync.Mutex
+	current int
+	max     int
+	failNth int
+	calls   int
+}
+
+func (e *concurrencyEmbedder) Embed(_ context.Context, texts []string) ([][]float64, error) {
+	e.mu.Lock()
+	e.calls++
+	e.current++
+	if e.current > e.max {
+		e.max = e.current
+	}
+	call := e.calls
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.current--
+		e.mu.Unlock()
+	}()
+	if e.failNth > 0 && call == e.failNth {
+		return nil, fmt.Errorf("provider down")
+	}
+	out := make([][]float64, 0, len(texts))
+	for range texts {
+		out = append(out, []float64{1, 0})
+	}
+	time.Sleep(30 * time.Millisecond)
+	return out, nil
+}
+
+func (e *concurrencyEmbedder) MaxConcurrent() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.max
+}
+
+func (e *concurrencyEmbedder) ModelKey() string { return "fake:concurrent" }
+
+func TestAddFilesUsesBoundedParallelIngestion(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	embedder := &concurrencyEmbedder{}
+	f.service.global.Embedding.Provider = "openai"
+	f.service.SetProviders(embedder, nil)
+
+	items := make([]AddFilesItem, 0, 10)
+	for index := 0; index < 10; index++ {
+		content := fmt.Sprintf("# File %d\n\nunique parallel content %d", index, index)
+		items = append(items, AddFilesItem{
+			FileName:      fmt.Sprintf("file-%d.md", index),
+			ContentBase64: base64.StdEncoding.EncodeToString([]byte(content)),
+		})
+	}
+	result, err := f.service.AddFiles(context.Background(), base.ID, items, "rename", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Accepted) != len(items) {
+		t.Fatalf("accepted count: %+v", result)
+	}
+	for _, accepted := range result.Accepted {
+		if accepted.Skipped || accepted.ID == "" || accepted.Title == "" {
+			t.Fatalf("accepted item: %+v", accepted)
+		}
+	}
+	if observed := embedder.MaxConcurrent(); observed <= 1 || observed > 5 {
+		t.Fatalf("observed concurrency %d, want 2..5", observed)
+	}
+}
 
 type fixture struct {
 	service  *Service
@@ -197,6 +274,77 @@ func TestAddFilesConflictStrategiesAndDedup(t *testing.T) {
 	}
 }
 
+func TestAddFilesUsesResolvedConflictStrategy(t *testing.T) {
+	f := newFixture(t)
+	f.service.global.Workflow.ConflictStrategy = "replace"
+	files := []AddFilesItem{{FileName: "a.md", ContentBase64: "IyBEb2MKCmZyZXNoIGNvbnRlbnQ="}}
+
+	base, err := f.service.CreateBase("Global Strategy", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := f.service.AddTextDocument(ctx, base.ID, "a.md", "existing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.AddFiles(ctx, base.ID, files, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := f.service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 || docs[0].Title != "a.md" {
+		t.Fatalf("global conflict strategy was not applied: %+v", docs)
+	}
+
+	override, err := f.service.CreateBase("Base Strategy", "", "", BaseConfig{ConflictStrategy: "rename"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.AddTextDocument(ctx, override.ID, "a.md", "existing"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.AddFiles(ctx, override.ID, files, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	docs, err = f.service.ListDocuments(override.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 2 || docs[0].Title != "a.md" || docs[1].Title != "a_1.md" {
+		t.Fatalf("base conflict override was not applied: %+v", docs)
+	}
+}
+
+func TestAddFilesBatchLimit(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	ctx := context.Background()
+	items := make([]AddFilesItem, 0, MaxBatchFiles+1)
+	for index := 0; index <= MaxBatchFiles; index++ {
+		content := fmt.Sprintf("# Boundary %d\n\nunique batch limit content %d", index, index)
+		items = append(items, AddFilesItem{
+			FileName:      fmt.Sprintf("batch-%02d.md", index),
+			ContentBase64: base64.StdEncoding.EncodeToString([]byte(content)),
+		})
+	}
+	if _, err := f.service.AddFiles(ctx, base.ID, items[:MaxBatchFiles], "rename", ""); err != nil {
+		t.Fatalf("maximum batch: %v", err)
+	}
+	docs, err := f.service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != MaxBatchFiles {
+		t.Fatalf("maximum batch documents: %d", len(docs))
+	}
+	if _, err := f.service.AddFiles(ctx, base.ID, items, "rename", ""); err == nil ||
+		!strings.Contains(err.Error(), "batch too large") {
+		t.Fatalf("oversized batch error: %v", err)
+	}
+}
+
 func TestGroupsAndScope(t *testing.T) {
 	f := newFixture(t)
 	base := f.createBase(t)
@@ -304,5 +452,36 @@ func TestReindexBaseJob(t *testing.T) {
 	stats, err := f.service.Stats(base.ID)
 	if err != nil || stats.ChunkCount < 2 {
 		t.Fatalf("stats after reindex: %+v %v", stats, err)
+	}
+}
+
+func TestReconcileStorageRemovesOrphansAndFixesCounts(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	doc, err := f.service.AddTextDocument(context.Background(), base.ID, "Reconcile", "alpha\n\nbeta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(f.raw.Root(), base.ID, "orphan.bin")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("orphan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.store.db.Exec(`UPDATE documents SET chunk_count = 99 WHERE id = ?`, doc.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, fixed, err := f.service.ReconcileStorage()
+	if err != nil || removed != 1 || fixed != 1 {
+		t.Fatalf("reconcile: %d %d %v", removed, fixed, err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan still exists: %v", err)
+	}
+	got, _, err := f.service.GetDocument(doc.ID, false)
+	if err != nil || got.ChunkCount < 2 {
+		t.Fatalf("fixed document: %+v %v", got, err)
 	}
 }

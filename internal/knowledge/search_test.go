@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
+	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 )
 
 // fakeEmbedder maps topic keywords to stable vectors; callCount and dim
@@ -131,6 +135,19 @@ func TestSearchFailClosed(t *testing.T) {
 	if err != nil || result.Total != 0 {
 		t.Fatalf("empty scope: %v %+v", err, result)
 	}
+	// A saved empty pinned scope must also fail closed; no scope record is
+	// the only state that searches all bases.
+	empty := []string{}
+	if err := service.SetEnabledScope(boolPtr(true), &empty); err != nil {
+		t.Fatal(err)
+	}
+	if state, err := service.EnabledScopeState(); err != nil || !state.Explicit || len(state.BaseIDs) != 0 {
+		t.Fatalf("explicit empty state: %+v %v", state, err)
+	}
+	result, err = service.Search(ctx, SearchRequest{Query: "database"})
+	if err != nil || result.Total != 0 {
+		t.Fatalf("explicit empty pinned scope: %v %+v", err, result)
+	}
 	// Disabled invocation matches nothing.
 	if err := service.SetEnabledScope(boolPtr(false), nil); err != nil {
 		t.Fatal(err)
@@ -196,6 +213,35 @@ func TestRerankerAppliedAndDegraded(t *testing.T) {
 	}
 	if result.Reranked || result.Rerank.Status != "degraded" || result.Total == 0 {
 		t.Fatalf("degraded rerank: %+v", result)
+	}
+}
+
+func TestRerankerTimeoutDegradesQuickly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(60 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	service, _ := newSearchFixture(t)
+	base, _ := service.CreateBase("B", "", "", BaseConfig{})
+	ctx := context.Background()
+	if _, err := service.AddTextDocument(ctx, base.ID, "Guide", "database intro\n\nbeta details about the database engine internals"); err != nil {
+		t.Fatal(err)
+	}
+	service.SetProviders(nil, rerank.New(rerank.Config{
+		BaseURL: server.URL, Model: "slow", Timeout: 10 * time.Millisecond,
+		FailureThreshold: 1, OpenDuration: time.Second,
+	}))
+	started := time.Now()
+	result, err := service.Search(ctx, SearchRequest{Query: "database", TopK: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 40*time.Millisecond {
+		t.Fatalf("timeout did not bound rerank latency: %s", elapsed)
+	}
+	if result.Reranked || result.Rerank == nil || result.Rerank.Status != "degraded" || result.Total == 0 {
+		t.Fatalf("timeout degradation: %+v", result.Rerank)
 	}
 }
 

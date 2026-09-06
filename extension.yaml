@@ -1,0 +1,48 @@
+id: shutu-knowledge
+name: Shutu Knowledge
+version: 0.1.0
+extension_api: "1.0"
+description: Knowledge bases, documents, hybrid retrieval, and model tools for shutu-agent
+capabilities:
+  tools: true
+  context_provider: true
+  web: true
+  lifecycle: true
+  health: true
+transport:
+  type: stdio
+  command: shutu-knowledge
+  args:
+    - extension
+context_provider:
+  enabled: true
+  strategy: on_user_input_change
+  required: false
+  timeout_ms: 4000
+  max_chars: 8192
+  priority: 80
+  description: Best-effort retrieval evidence for the current user input
+web:
+  enabled: true
+  route: /extensions/shutu-knowledge/
+  title: Knowledge
+  icon: library
+  navigation_enabled: true
+  navigation_group: Tools
+  order: 40
+health:
+  enabled: true
+  timeout_ms: 1000
+lifecycle:
+  enabled: true
+  startup_timeout_ms: 10000
+  shutdown_timeout_ms: 5000
+  restart_policy: on-failure
+  max_restarts: 3
+permissions:
+  - name: session.id
+    reason: Stable provider cadence and request correlation
+  - name: session.turn
+    reason: Turn-scoped retrieval correlation
+  - name: user.input
+    reason: Build the automatic retrieval query

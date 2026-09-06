@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+This project is released under Apache-2.0; see [LICENSE](LICENSE).
+
 ## Reference projects (read-only, not distributed)
 
 | Project | License | Usage |
@@ -7,10 +9,23 @@
 | [dsh-knowledge](https://github.com/Soren-ABT/dsh-knowledge) v0.3.9 (commit `95e4a135cca3282b345c6d12a8e09cc4a314402f`) | AGPL-3.0 | Functional/behavioral reference only. Audited for capability inventory. No source code copied or distributed by this project. |
 | [shutu-agent](https://github.com/shutu-ai/shutu-agent) | per its repository | Agent base. This project links against the public `sdk/extension` package at runtime/build time; the Agent itself is not modified or redistributed here. |
 
-Because dsh-knowledge is AGPL-3.0 and this project has not elected an AGPL-compatible license, the safe posture mandated by the project requirements is: **no direct copying of dsh-knowledge source**. All behavior is reimplemented from the capability inventory with original code. If that policy ever changes, AGPL-3.0 obligations (license propagation, corresponding source, attribution) must be satisfied before any distribution.
+Because dsh-knowledge is AGPL-3.0 and this project is Apache-2.0, the safe posture mandated by the project requirements remains: **no direct copying of dsh-knowledge source**. All behavior is reimplemented from the capability inventory with original code. If that policy ever changes, AGPL-3.0 obligations (license propagation, corresponding source, attribution) must be satisfied before any distribution.
 
 ## Third-party dependencies
 
-To be maintained automatically from `go.mod` / `web/package.json` as dependencies land (Go module notices and npm package licenses). None recorded yet at Phase 0.
+Runtime dependencies are recorded below. The vendored/pinned reference
+repositories are read-only inputs and are not distributed by this project.
+
+| Module | Version / source | License | Used for |
+|---|---|---|---|
+| `github.com/ledongthuc/pdf` | `v0.0.0-20260903153007-b3c860c23753` | BSD 3-Clause (“Go Authors”) | PDF text-layer extraction |
+| `golang.org/x/image` | `v0.45.0` | BSD 3-Clause | Pure-Go CCITT fax raster decoding |
+| `golang.org/x/net`, `golang.org/x/text` | Go.org x repositories | BSD 3-Clause | HTTP/HTML parsing and character encoding |
+| `gopkg.in/yaml.v3` | `v3.0.1` | MIT / Apache-2.0 | Knowledge-owned configuration and manifest serialization |
+| `modernc.org/sqlite` and transitive `modernc.org/*` runtime | `v1.50.0` | BSD 3-Clause | Pure-Go SQLite storage |
+| Web frontend | zero runtime npm dependencies; Node.js build/test scripts only | MIT for Node.js when redistributed with a binary | Independent web build and contract test |
+
+This is maintained from `go.mod` and `web/package.json`. Additions must add a
+row before release; transitive license changes must be re-checked.
 
 Upstream dsh-knowledge dependencies relevant to behavior parity research (not dependencies of this project unless independently adopted): pdf-parse, pdfjs-dist, mupdf (AGPL-3.0), mammoth, word-extractor, @firecrawl/anydoc, jszip, turndown, tesseract.js, ppu-paddle-ocr, ppu-ocv, onnxruntime-node, @huggingface/transformers, undici.

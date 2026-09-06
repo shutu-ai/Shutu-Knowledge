@@ -22,3 +22,4 @@ web/dist/
 # Logs and temp
 *.log
 /tmp/
+.tmp/

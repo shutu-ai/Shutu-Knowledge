@@ -15,7 +15,7 @@ type htmlParser struct{}
 func (htmlParser) Extensions() []string { return []string{"html", "htm"} }
 
 func (htmlParser) Parse(_ string, data []byte) (Result, error) {
-	title, text := HTMLToText(string(data))
+	title, text := HTMLToText(DecodeText(data))
 	if strings.TrimSpace(text) == "" {
 		return Result{}, fmt.Errorf("contains no extractable text")
 	}

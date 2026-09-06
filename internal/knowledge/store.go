@@ -85,17 +85,18 @@ func (s *store) deleteBase(id string) error {
 
 const documentColumns = `id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
 	source_path, content_hash, raw_file_path, raw_text, char_count, token_count, chunk_count,
-	status, phase, progress, incomplete, error_code, error_message, created_at, updated_at`
+	status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked`
 
 func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	var d Document
 	var fileName, mimeType, url, parentDir, sourcePath, contentHash, rawFilePath, rawText sql.NullString
 	var tokenCount, updatedAt sql.NullInt64
 	var phase, errorCode, errorMessage sql.NullString
-	var incomplete int
+	var incomplete, titleLocked int
 	err := row.Scan(&d.ID, &d.BaseID, &d.Title, &d.SourceType, &fileName, &mimeType, &url, &parentDir,
 		&sourcePath, &contentHash, &rawFilePath, &rawText, &d.CharCount, &tokenCount, &d.ChunkCount,
-		&d.Status, &phase, &d.Progress, &incomplete, &errorCode, &errorMessage, &d.CreatedAt, &updatedAt)
+		&d.Status, &phase, &d.Progress, &incomplete, &errorCode, &errorMessage, &d.CreatedAt, &updatedAt,
+		&titleLocked)
 	if err != nil {
 		return Document{}, err
 	}
@@ -111,6 +112,7 @@ func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	d.UpdatedAt = updatedAt.Int64
 	d.Phase = phase.String
 	d.Incomplete = incomplete != 0
+	d.TitleLocked = titleLocked != 0
 	d.ErrorCode = errorCode.String
 	d.ErrorMessage = errorMessage.String
 	return d, nil
@@ -142,11 +144,15 @@ func (s *store) putDocument(d Document) error {
 	if d.Incomplete {
 		incomplete = 1
 	}
+	titleLocked := 0
+	if d.TitleLocked {
+		titleLocked = 1
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO documents (id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
 		   source_path, content_hash, raw_file_path, raw_text, char_count, token_count, chunk_count,
-		   status, phase, progress, incomplete, error_code, error_message, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET title = excluded.title, file_name = excluded.file_name,
 		   mime_type = excluded.mime_type, url = excluded.url, parent_directory_id = excluded.parent_directory_id,
 		   source_path = excluded.source_path, content_hash = excluded.content_hash,
@@ -155,10 +161,10 @@ func (s *store) putDocument(d Document) error {
 		   chunk_count = excluded.chunk_count, status = excluded.status, phase = excluded.phase,
 		   progress = excluded.progress, incomplete = excluded.incomplete,
 		   error_code = excluded.error_code, error_message = excluded.error_message,
-		   updated_at = excluded.updated_at`,
+		   updated_at = excluded.updated_at, title_locked = excluded.title_locked`,
 		d.ID, d.BaseID, d.Title, d.SourceType, d.FileName, d.MimeType, d.URL, d.ParentDirectoryID,
 		d.SourcePath, d.ContentHash, d.RawFilePath, rawText, d.CharCount, tokenCount, d.ChunkCount,
-		d.Status, phase, d.Progress, incomplete, errorCode, errorMessage, d.CreatedAt, updatedAt,
+		d.Status, phase, d.Progress, incomplete, errorCode, errorMessage, d.CreatedAt, updatedAt, titleLocked,
 	)
 	return err
 }
@@ -265,6 +271,10 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 		if carried, ok := carried[c.EmbeddingHash]; ok {
 			embedding = carried[0]
 			model = carried[1]
+		}
+		if c.EmbeddingVec != nil {
+			embedding = encodeEmbedding(c.EmbeddingVec)
+			model = c.EmbeddingModel
 		}
 		if _, err := tx.Exec(
 			`INSERT INTO chunks (id, doc_id, base_id, idx, text, heading, context, embedding, embedding_model, embedding_text_hash, created_at)

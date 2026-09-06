@@ -1,0 +1,12 @@
+{
+  "name": "shutu-knowledge-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/dev-server.mjs",
+    "test": "node scripts/contract-test.mjs",
+    "test:e2e": "node scripts/e2e.mjs"
+  }
+}

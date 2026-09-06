@@ -1,6 +1,6 @@
 # Source Reuse Inventory
 
-Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this project does not copy or translate its source. Reading, running, and describing behavior are permitted; copying requires the AGPL checklist (license propagation, attribution, corresponding source) and a license decision, neither of which has been made.
+Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this project is Apache-2.0 and does not copy or translate its source. Reading, running, and describing behavior are permitted; copying requires the AGPL checklist (license propagation, attribution, corresponding source) and remains prohibited by the current reuse policy.
 
 ## Reused / translated / copied code
 
@@ -17,6 +17,7 @@ Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this pr
 | Context window composition rules | `src/knowledge/context.ts` | rules captured in `architecture.md` §6; original implementation |
 | Auto-RAG gates and budgets | `src/tool-knowledge/index.ts` | constants captured in inventory §15; original implementation |
 | FTS query compilation (trigram terms, LIKE fallback) | `src/knowledge/chunkdb.ts` | behavior parity via golden tests |
+| OCR full-page rendering, embedded-raster fallback, preprocessing, and raster ceilings | `src/knowledge/ocr.ts`, `src/knowledge/ocr-worker.ts` | independent Go PDF/parser implementation plus a deployment-supplied renderer process contract; no upstream source or native renderer bundled |
 | Extension contract usage | shutu-agent `sdk/extension`, `examples/extension` | public API usage per `docs/agent_contract_mapping.md` |
 
 ## Reference baselines (audit evidence)

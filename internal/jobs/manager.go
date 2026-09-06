@@ -45,12 +45,13 @@ type task struct {
 
 // Manager owns the worker pool and the job registry.
 type Manager struct {
-	db      *storage.DB
-	mu      sync.Mutex
-	tasks   map[string]*task
-	queue   chan *task
-	workers int
-	wg      sync.WaitGroup
+	db        *storage.DB
+	mu        sync.Mutex
+	tasks     map[string]*task
+	queue     chan *task
+	workers   int
+	wg        sync.WaitGroup
+	onFailure func(kind string)
 }
 
 // New creates a manager with the given worker count.
@@ -132,14 +133,21 @@ func (m *Manager) worker(ctx context.Context) {
 }
 
 func (m *Manager) runTask(t *task) {
+	m.mu.Lock()
 	t.job.Status = StatusRunning
-	_ = m.persist(t.job)
+	snapshot := t.job
+	m.mu.Unlock()
+	_ = m.persist(snapshot)
 	report := func(progress int) {
+		m.mu.Lock()
 		t.job.Progress = progress
 		t.job.Status = StatusRunning
-		_ = m.persist(t.job)
+		snapshot := t.job
+		m.mu.Unlock()
+		_ = m.persist(snapshot)
 	}
 	err := t.run(context.WithValue(t.ctx, managerKey{}, m), report)
+	m.mu.Lock()
 	switch {
 	case err == nil:
 		t.job.Status = StatusDone
@@ -150,11 +158,20 @@ func (m *Manager) runTask(t *task) {
 		t.job.Status = StatusFailed
 		t.job.Error = err.Error()
 	}
-	_ = m.persist(t.job)
-	m.mu.Lock()
+	snapshot = t.job
 	t.cancel()
 	delete(m.tasks, t.job.ID)
 	m.mu.Unlock()
+	_ = m.persist(snapshot)
+	if m.onFailure != nil {
+		m.onFailure(t.job.Kind)
+	}
+}
+
+// SetFailureObserver attaches a process-local metrics callback before jobs
+// are admitted through the public API.
+func (m *Manager) SetFailureObserver(observer func(kind string)) {
+	m.onFailure = observer
 }
 
 type managerKey struct{}

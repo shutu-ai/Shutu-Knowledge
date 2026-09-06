@@ -18,7 +18,7 @@ type RawFileStore struct {
 
 // NewRawFileStore creates the root directory if needed.
 func NewRawFileStore(root string) (*RawFileStore, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create raw dir: %w", err)
 	}
 	return &RawFileStore{root: root}, nil
@@ -76,10 +76,10 @@ func (s *RawFileStore) writeRel(relativePath string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 		return fmt.Errorf("create raw dir: %w", err)
 	}
-	if err := os.WriteFile(full, data, 0o644); err != nil {
+	if err := os.WriteFile(full, data, 0o600); err != nil {
 		return fmt.Errorf("write raw file: %w", err)
 	}
 	return nil

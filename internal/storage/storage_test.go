@@ -1,10 +1,23 @@
 package storage
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func assertPOSIXMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != want {
+		t.Fatalf("mode %s: %v %v", path, info, err)
+	}
+}
 
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
@@ -63,6 +76,8 @@ func TestRawStoreRoundTripAndGuards(t *testing.T) {
 	if rel != "base1/doc1.pdf" {
 		t.Fatalf("rel path: %s", rel)
 	}
+	assertPOSIXMode(t, filepath.Join(root, "base1", "doc1.pdf"), 0o600)
+	assertPOSIXMode(t, filepath.Join(root, "base1"), 0o700)
 	data, err := store.Read(rel)
 	if err != nil || string(data) != "data" {
 		t.Fatalf("read: %v %q", err, data)
@@ -92,5 +107,32 @@ func TestRawStoreRoundTripAndGuards(t *testing.T) {
 	}
 	if _, err := store.pathOf("../outside"); err == nil || !strings.Contains(err.Error(), "unsafe") {
 		t.Fatalf("pathOf escape guard: %v", err)
+	}
+}
+
+func TestMaintainSQLOptimizesFTSAndThresholdVacuum(t *testing.T) {
+	db := openTestDB(t)
+	assertPOSIXMode(t, db.Path(), 0o600)
+	if _, err := db.Exec(`INSERT INTO chunks (id, doc_id, base_id, idx, text, context, created_at)
+		VALUES ('c1','d1','b1',0,'hello world','maintenance','0')`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.MaintainSQLite(true, true, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.FTSOptimized || result.Vacuumed {
+		t.Fatalf("threshold maintenance: %+v", result)
+	}
+	if result.DatabaseBytes <= 0 || result.DatabaseBytesEnd <= 0 {
+		t.Fatalf("database sizes: %+v", result)
+	}
+
+	forced, err := db.MaintainSQLite(false, true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forced.FTSOptimized || !forced.Vacuumed || forced.DatabaseBytesEnd == 0 {
+		t.Fatalf("forced vacuum: %+v", forced)
 	}
 }

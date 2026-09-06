@@ -9,6 +9,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Web build
+        working-directory: web
+        run: npm run build
+      - name: Web test
+        working-directory: web
+        run: npm test
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
@@ -24,3 +33,12 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      - name: Test race
+        run: go test -race ./...
+      - name: Benchmark smoke
+        run: go test ./internal/knowledge -run '^$' -bench Benchmark -benchtime=1x
+      - name: Browser E2E
+        working-directory: web
+        run: npm run test:e2e
+        env:
+          SHUTU_KNOWLEDGE_BROWSER: google-chrome

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -49,6 +50,18 @@ func TestRemoteRerankValidation(t *testing.T) {
 	provider = New(Config{BaseURL: bad.URL, Model: "m", Client: bad.Client()})
 	if _, err := provider.Rerank(context.Background(), "q", []string{"a"}); err == nil || !containsCode(err.Error(), CodeInvalidResponse) {
 		t.Fatalf("expected invalid_response for range, got %v", err)
+	}
+
+	status := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("UPSTREAM-SECRET"))
+	}))
+	defer status.Close()
+	provider = New(Config{BaseURL: status.URL, Model: "m", Client: status.Client()})
+	_, err = provider.Rerank(context.Background(), "q", []string{"a"})
+	if err == nil || !containsCode(err.Error(), CodeProviderError) ||
+		!strings.Contains(err.Error(), "HTTP 500") || strings.Contains(err.Error(), "UPSTREAM-SECRET") {
+		t.Fatalf("reranker error must expose status only: %v", err)
 	}
 }
 

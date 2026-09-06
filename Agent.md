@@ -149,7 +149,7 @@ docs/source_reuse_inventory.md（初始）
 - [x] KB CRUD：create / list / get / update / delete / stats；字段覆盖 name、description、metadata、created_at、updated_at、document_count、chunk_count、index state；delete 按 destructive operation 处理（进入 Tool Registry 时声明风险）。（Tool 风险声明在 Phase 5 落地）
 - [x] 文档生命周期状态机：pending → processing → ready / failed，外加 stale；支持 import、parse、chunk、index、ready、refresh、reindex、delete、error；禁止用一个 bool `indexed` 覆盖全部状态。
 - [x] Parser Registry 或等价通用结构：Document → MIME/type detection → Parser → Normalized Document → Chunking；避免主流程中 `if pdf else if docx` 无限堆积。
-- [x] 按 Phase 0 审计结果实现文件格式解析（txt/md/mdx/csv/json/log + GB18030 回退、HTML→结构化文本、DOCX、PPTX、XLSX、EPUB、PDF 文本层；legacy .doc/.ppt/.xls 按计划留在 Phase 4 可选 helper）。
+- [x] 按 Phase 0 审计结果实现文件格式解析（txt/md/mdx/csv/json/log + GB18030 回退、HTML→结构化文本、DOCX、PPTX、XLSX、EPUB、PDF 文本层/坐标行重建/content-signature 可选 helper；legacy .doc/.ppt/.xls 按计划留在 Phase 4 可选 helper）。
 - [x] 实现 Chunking 策略：token 预算 + heading-aware 评分断点 + 代码围栏保护 + delimiter 模式 + Token 上限细分（semantic 留 Phase 4）。
 - [x] Metadata Preservation：document title、source file/hash/path、heading path、chunk order、timestamp、检索 context 与 embedding-hash（page/sheet/slide 与上游一致不作为 chunk 字段）。
 - [x] Background Jobs：轻量 job manager + worker pool，reindex_base 已作为后台任务（embedding/refresh 随后续阶段接入）。
@@ -178,7 +178,7 @@ docs/source_reuse_inventory.md（初始）
 - [x] Context Composer：独立 `internal/evidence` 模块（before→anchor→after、标题边界、连续性守卫、≥24 字符重叠去重、预算分配与让渡、序列化预算执行、`>>>` 锚点标记、hasMore 标志）。
 - [x] Context Window / 相邻 chunk 扩展：`siblingChunks` 批量取邻域，单 hit 768 token 预算，防爆炸。
 - [x] Anchor / Continuation：`/api/documents/{id}/context` 锚点续读（anchorChunkId/anchorIndex、before/after/maxTokens/focus/crossHeading）；工具侧锚点模式随 Phase 5 接入。
-- [ ] Local Model Management（若 dsh-knowledge 有）：download、discover、configure、status、delete；模型文件归 Knowledge 所有。（本地 ML 依赖 optional helper 进程，安排在 Phase 4 落地、Phase 6 补管理 UI）
+- [x] Local Model Management（若 dsh-knowledge 有）：download、discover、configure、status、delete；模型文件归 Knowledge 所有。（HF artifact 生命周期、custom reranker registry、`local:` 模型路由、隔离 helper self-test 与缓存迁移已实现；真实推理 helper 由部署提供，不捆绑或伪造 runtime readiness）
 - [x] Retrieval Test 能力（后端）：`/api/search` 输出 mode、lane scores、rerank 结构化状态、elapsed 与最终 context，召回测试 UI 随 Phase 6 接入。
 - [x] Explainability：每 hit 携带 vectorScore/lexicalScore/rerankScore、rerank 状态（applied/not_needed/degraded + 错误码）、elapsedMS。
 - [x] 测试：RRF 确定性、MMR 多样性、BM25 排序趋势、reranker 应用/降级/熔断、维度不匹配与 provider 故障降级、fail-closed 过滤、多查询召回扩大、向量哈希复用、stale 统计（全部通过；浮点分数不要求一致，比较功能与排序趋势）。
@@ -193,14 +193,14 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] OCR（若 dsh-knowledge 支持）：区分 native text extraction、OCR fallback、forced OCR；OCR failure 不破坏已有可解析文本。
-- [ ] MinerU 或类似高级 PDF pipeline（若 dsh-knowledge 支持）：设计 optional provider，包含 health、availability detection、fallback；外部依赖不进入 Agent。
-- [ ] URL ingestion：导入、刷新、错误语义与 dsh-knowledge 对齐。
-- [ ] Directory ingestion：目录扫描、递归导入、刷新。
-- [ ] Incremental Update：changed → update，unchanged → skip，避免每次全量重新 embedding；行为参考 dsh-knowledge。
-- [ ] Semantic Chunking（若 dsh-knowledge 有）：独立策略、配置、测试、benchmark、fallback；不得因复杂而省略。
-- [ ] 高级解析器补齐与外部 runtime 管理：可选安装、自动发现、健康检查、错误提示；不让 Agent Core 依赖。
-- [ ] 测试：OCR 三种模式与失败降级、URL/目录刷新、增量判断、语义切块质量、坏文档容错。
+- [x] OCR（若 dsh-knowledge 支持）：区分 native text extraction、OCR fallback、forced OCR；OCR failure 不破坏已有可解析文本。
+- [x] MinerU 或类似高级 PDF pipeline（若 dsh-knowledge 支持）：设计 optional provider，包含 health、availability detection、fallback；外部依赖不进入 Agent。
+- [x] URL ingestion：导入、刷新、错误语义与 dsh-knowledge 对齐。
+- [x] Directory ingestion：目录扫描、递归导入、刷新。
+- [x] Incremental Update：changed → update，unchanged → skip，避免每次全量重新 embedding；行为参考 dsh-knowledge。
+- [x] Semantic Chunking（若 dsh-knowledge 有）：独立策略、配置、测试、benchmark、fallback；不得因复杂而省略。
+- [x] 高级解析器补齐与外部 runtime 管理：可选安装、自动发现、健康检查、错误提示；不让 Agent Core 依赖。
+- [x] 测试：OCR 三种模式与失败降级、URL/目录刷新、增量判断、语义切块质量、坏文档容错。
 
 产出物：高级摄取子系统、可选依赖管理、增量刷新机制。
 
@@ -212,19 +212,19 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] Native Context Provider：实现 `User Message → Agent Turn → Model Step → Extension Context Provider → shutu-knowledge retrieval → Evidence → ContextContribution → Agent Context Budget → LLM` 链路。
-- [ ] Context Cadence 设计：在 `once_per_turn`、`before_every_model_call`、`on_user_input_change`、`after_tool_result`、`manual` 中按成本与语义选择合适默认，不一开始强制全部 `before_every_model_call`。
-- [ ] `after_tool_result`：直接使用 Agent 提供的真实 `ToolResultBoundary` 与 per-provider at-most-once automatic consumption，不在 Knowledge 内猜 StepID 或维护 ToolResult sequence。
-- [ ] Retrieval Request 权限最小化：只使用 SDK 真实授权的 session/turn/step/workspace/user input，不要求多余权限。
-- [ ] Evidence 输出：`ContextContribution` 尽量包含 content、source、priority、metadata、token hint（字段以 Extension Contract 为准），支持模型解释证据来源。
-- [ ] Token Budget 边界：Knowledge 内部控制 top-k、reranker candidates、context composing 并提供估算；最终 Agent Context Budget 由 Agent 控制。
-- [ ] Knowledge Tools：按 Phase 0 审计结果实现完整 Tool inventory（候选：knowledge_search、knowledge_list_bases、knowledge_create_base、knowledge_delete_base、knowledge_add_document、knowledge_list_documents、knowledge_delete_document、knowledge_import_url、knowledge_refresh_url、knowledge_stats、knowledge_get_document、knowledge_read_document、knowledge_reindex_document、knowledge_reindex_base，以源码审计为准）。
-- [ ] Tool Registry Integration：通过 Extension Tool Contribution / 现有 MCP-Extension 机制进入 Agent 原 Tool Registry。
-- [ ] Tool Risk Metadata：每个 Tool 声明真实风险（search/read → read；create/import/reindex → write；delete → destructive），审批策略交给 Agent，不绕过 approval。
-- [ ] Events：只订阅真正需要的 Agent Events（先审计 turn / tool / context / session.started 是否必要）；Native Context Provider 不通过 Event 模拟；禁止 subscribe all。
-- [ ] Lifecycle：initialize、ready、health、shutdown、restart compatibility，支持作为 managed extension 运行。
-- [ ] Core/Adapter 分层：Knowledge Core 不依赖 Agent-specific DTO；`extension.ContextRequest → KnowledgeQuery → Core` 映射，保证未来 standalone / CLI / Web / extension 多入口复用。
-- [ ] Extension Integration Test：真实启动 `shutu-agent + shutu-knowledge` 两个外部进程（非 mock Contract），验证：发现、握手、health ready、tools 进入 registry、Context Provider 注入 evidence、Tool approval 生效、Events 工作、重启恢复、干净关停。
+- [x] Native Context Provider：实现 `User Message → Agent Turn → Model Step → Extension Context Provider → shutu-knowledge retrieval → Evidence → ContextContribution → Agent Context Budget → LLM` 链路。
+- [x] Context Cadence 设计：在 `once_per_turn`、`before_every_model_call`、`on_user_input_change`、`after_tool_result`、`manual` 中按成本与语义选择合适默认，不一开始强制全部 `before_every_model_call`。
+- [x] `after_tool_result`：直接使用 Agent 提供的真实 `ToolResultBoundary` 与 per-provider at-most-once automatic consumption，不在 Knowledge 内猜 StepID 或维护 ToolResult sequence。
+- [x] Retrieval Request 权限最小化：只使用 SDK 真实授权的 session/turn/step/workspace/user input，不要求多余权限。
+- [x] Evidence 输出：`ContextContribution` 尽量包含 content、source、priority、metadata、token hint（字段以 Extension Contract 为准），支持模型解释证据来源。
+- [x] Token Budget 边界：Knowledge 内部控制 top-k、reranker candidates、context composing 并提供估算；最终 Agent Context Budget 由 Agent 控制。
+- [x] Knowledge Tools：按 Phase 0 审计结果实现完整 Tool inventory（候选：knowledge_search、knowledge_list_bases、knowledge_create_base、knowledge_delete_base、knowledge_add_document、knowledge_list_documents、knowledge_delete_document、knowledge_import_url、knowledge_refresh_url、knowledge_stats、knowledge_get_document、knowledge_read_document、knowledge_reindex_document、knowledge_reindex_base，以源码审计为准）。
+- [x] Tool Registry Integration：通过 Extension Tool Contribution / 现有 MCP-Extension 机制进入 Agent 原 Tool Registry。
+- [x] Tool Risk Metadata：每个 Tool 声明真实风险（search/read → read；create/import/reindex → write；delete → destructive），审批策略交给 Agent，不绕过 approval。
+- [x] Events：只订阅真正需要的 Agent Events（先审计 turn / tool / context / session.started 是否必要）；Native Context Provider 不通过 Event 模拟；禁止 subscribe all。
+- [x] Lifecycle：initialize、ready、health、shutdown、restart compatibility，支持作为 managed extension 运行。
+- [x] Core/Adapter 分层：Knowledge Core 不依赖 Agent-specific DTO；`extension.ContextRequest → KnowledgeQuery → Core` 映射，保证未来 standalone / CLI / Web / extension 多入口复用。
+- [x] Extension Integration Test：真实启动 `shutu-agent + shutu-knowledge` 两个外部进程（非 mock Contract），验证：发现、握手、health ready、tools 进入 registry、Context Provider 注入 evidence、Tool approval 生效、Events 工作、重启恢复、干净关停。（证据见 `docs/agent_integration.md`；Events 采用显式空订阅，lifecycle/context 观测由 Agent extension event log 记录）
 
 产出物：完整 Extension Adapter、Context Provider、Tools + 风险声明、事件订阅、生命周期实现、真实进程集成测试。
 
@@ -236,13 +236,13 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] Knowledge Web UI 独立构建于 `shutu-knowledge/web` 自己的 pipeline，不编译进 `shutu-agent/web`。
-- [ ] Agent 负责 Navigation、Reverse Proxy、Auth shell、Route；Knowledge 只负责业务 UI、Knowledge API、业务状态。
-- [ ] 按 dsh-knowledge 实际能力实现页面（候选结构：Overview、Knowledge Bases、Documents、Import、Retrieval Test、Models、Settings，以审计为准）。
-- [ ] Native Navigation：安装并启用扩展后，Knowledge 通过 Agent `/api/extensions` 等正式机制自动出现，不要求用户手改 Agent 菜单。
-- [ ] Retrieval Test UI：query 输入、KB 选择、执行检索、展示 BM25/Vector/Fusion/Rerank/Final context 与各阶段 score。
-- [ ] Models 与 Settings 管理：模型配置、状态、下载/删除（按审计结果）、各子系统配置。
-- [ ] Web 测试：页面功能、API 契约、构建产物、Agent 内嵌导航与路由。
+- [x] Knowledge Web UI 独立构建于 `shutu-knowledge/web` 自己的 pipeline，不编译进 `shutu-agent/web`。（见 `docs/web.md`）
+- [x] Agent 负责 Navigation、Reverse Proxy、Auth shell、Route；Knowledge 只负责业务 UI、Knowledge API、业务状态。
+- [x] 按 dsh-knowledge 实际能力实现页面（候选结构：Overview、Knowledge Bases、Documents、Import、Retrieval Test、Models、Settings，以审计为准）。
+- [x] Native Navigation：安装并启用扩展后，Knowledge 通过 Agent `/api/extensions` 等正式机制自动出现，不要求用户手改 Agent 菜单。
+- [x] Retrieval Test UI：query 输入、KB 选择、执行检索、展示 BM25/Vector/Fusion/Rerank/Final context 与各阶段 score。
+- [x] Models 与 Settings 管理：模型配置、状态、下载/删除（按审计结果）、各子系统配置。（当前覆盖 HF artifact 下载/取消/就绪/删除、Ollama list/pull/delete、全局 processing/workflow/auto-retrieve 与 MinerU secret、全局+per-base 配置热更新）
+- [x] Web 测试：页面功能、API 契约、构建产物、Agent 内嵌导航与路由。（UI/API/build 与 1440x900、390x844 Playwright 溢出/零 console-error 检查已通过；外部 Agent 导航/代理路由已验证）
 
 产出物：可独立构建的前端、Knowledge API、Agent 内动态菜单验证。
 
@@ -254,11 +254,11 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] 重新完整审计 `dsh-knowledge`（不依赖最初 inventory）：source tree comparison、tool comparison、config comparison、UI comparison、workflow comparison、test comparison。
-- [ ] 逐项更新 `docs/dsh_knowledge_equivalence_matrix.md`，所有目标功能必须 `PASS` 或有明确 `BLOCKED / NOT APPLICABLE` 理由，无未解释遗漏。
-- [ ] 对发现的遗漏排期补齐实现，并补充对应测试与文档。
-- [ ] 复审许可证与源码复用记录，确认 `THIRD_PARTY_NOTICES.md` 与 `docs/source_reuse_inventory.md` 完整。
-- [ ] 复审 Agent Contract Gap Report，确认所有 BLOCKED 项均有通用改进建议且未私自绕路。
+- [x] 重新完整审计 `dsh-knowledge`（不依赖最初 inventory）：source tree comparison、tool comparison、config comparison、UI comparison、workflow comparison、test comparison。（方法与结果见 `docs/phase7_equivalence_audit.md`）
+- [x] 逐项更新 `docs/dsh_knowledge_equivalence_matrix.md`，所有目标功能必须 `PASS` 或有明确 `BLOCKED / NOT APPLICABLE` 理由，无未解释遗漏。（当前 53 行 `PASS`、1 行 `BLOCKED`、1 行 `NOT APPLICABLE`；无 `PARTIAL` 行。）
+- [x] 对发现的遗漏排期补齐实现，并补充对应测试与文档。（已补齐 Separation/DeviceN、soft-mask、CJK OCR 输出清理、JBIG2/JPX optional decoder 契约，以及 deployment-supplied OCR full-page renderer 契约；矩阵无 `PARTIAL` 项。）
+- [x] 复审许可证与源码复用记录，确认 `THIRD_PARTY_NOTICES.md` 与 `docs/source_reuse_inventory.md` 完整。
+- [x] 复审 Agent Contract Gap Report，确认所有 BLOCKED 项均有通用改进建议且未私自绕路。
 
 产出物：更新后的能力清单、等价矩阵、Gap Report、补齐实现与测试。
 
@@ -270,15 +270,19 @@ docs/source_reuse_inventory.md（初始）
 
 任务：
 
-- [ ] 并发与稳定性：race 检测、crash/restart、large documents、bad documents、model unavailable、index corruption、migration、cancellation、resource cleanup。
-- [ ] Failure Isolation 验证：至少覆盖 Knowledge crash、Embedding unavailable、Reranker timeout、Bad document、OCR failure、Web unavailable，均不导致 Agent Core crash。
-- [ ] Removal Test：移除/disable `shutu-knowledge` 后 Agent 正常运行、菜单消失、工具消失、context 注入消失、其它功能不受影响。
-- [ ] Upgrade Independence Test：模拟 Agent version A → B（Protocol v1 兼容范围内）Knowledge 不改代码仍可运行；以及 Knowledge 内部升级（新 parser/reranker/embedding/chunk strategy）Agent 无需修改。
-- [ ] Observability：记录 import duration、parse duration、chunk count、embedding duration、retrieval duration、rerank duration、candidate count、context count、model error、job failure；同时通过 Extension observability 暴露集成层状态。
-- [ ] Benchmark：document ingestion、chunking、embedding、BM25 query、vector query、hybrid retrieval、rerank、end-to-end RAG；不用极小数据集宣称性能优秀。
-- [ ] Retrieval Benchmark Dataset：可重复，覆盖 exact lexical、semantic、multi-document、near duplicate、long document、Chinese、English、mixed language（支持其它语言则加入）。
-- [ ] 安全复查：日志脱敏、凭证处理、路径安全、Web 输入校验、错误信息不泄露敏感内容。
-- [ ] 完善测试层级：Unit、Integration、Extension Integration、Web、E2E、Regression、Benchmark 全部建立并纳入 CI。
+- [x] 并发与稳定性：race 检测、crash/restart、large documents、bad documents、model unavailable、index corruption、migration、cancellation、resource cleanup。（当前证据包括全量 `go test -race ./...`；runtime crash/restart/deadline/storage migration/recovery 测试，以及 `docs/gates.md` Gate H 的故障隔离记录。）
+- [x] Local ML isolation：统一 optional helper-process contract（embedding/rerank/OCR）、initialize/health 握手、启动/请求/空闲超时、崩溃重建、配置热更新、dimension/score/text 校验与 API readiness；不捆绑或伪造推理 runtime。
+- [x] Auto-RAG policy：current-turn-first + short-query history variant、语言/严格 identifier gate、lexical/rerank/vector relevance gate、same-topic throttle、injected chunk/window dedup。
+- [x] Bounded parallel batch ingestion：批量标题/内容去重先原子规划，导入执行最多 5 worker，保持输入顺序、冲突策略与 race 检测。
+- [x] Storage maintenance：启动 FTS5 optimize、可配置阈值 VACUUM、维护结果结构化报告与 storage race/test 验证。
+- [x] Failure Isolation 验证：至少覆盖 Knowledge crash、Embedding unavailable、Reranker timeout、Bad document、OCR failure、Web unavailable，均不导致 Agent Core crash。（证据见 `docs/gates.md` Gate H）
+- [x] Removal Test：移除/disable `shutu-knowledge` 后 Agent 正常运行、菜单消失、工具消失、context 注入消失、其它功能不受影响。（真实外部工具/路由移除门见 `scripts/removal_gate.ps1` 与 `docs/gates.md` Gate I）
+- [x] Upgrade Independence Test：模拟 Agent version A → B（Protocol v1 兼容范围内）Knowledge 不改代码仍可运行；以及 Knowledge 内部升级（新 parser/reranker/embedding/chunk strategy）Agent 无需修改。（证据见 `docs/gates.md` Gate J）
+- [x] Observability：记录 import duration、parse duration、chunk count、embedding duration、retrieval duration、rerank duration、candidate count、context count、model error、job failure；`/api/metrics` 暴露聚合状态。
+- [x] Benchmark：document ingestion、chunking、embedding、BM25 query、vector query、hybrid retrieval、rerank、end-to-end RAG；119-document repeatable corpus，CI 只作 smoke，不作性能优越性声明。
+- [x] Retrieval Benchmark Dataset：可重复，覆盖 exact lexical、semantic、multi-document、near duplicate、long document、Chinese、English、mixed language；Hit@k/Recall@k/MRR/context recall 正确性 gate。
+- [x] 安全复查：日志脱敏、凭证处理、路径安全、Web 输入校验、错误信息不泄露敏感内容。（复查与残余风险记录见 `docs/security_review.md`；已修复 per-base key 回显、存储默认权限和上游错误载荷透传）
+- [x] 完善测试层级：Unit、Integration、Extension Integration、Web、E2E、Regression、Benchmark 全部建立并纳入 CI。（`docs/test_parity.md` 已完成上游 25 个 spec 的一对一等价映射；Chrome/CDP E2E 覆盖核心生命周期、chunk expansion、UI policy、OCR 模型工作流和本地化）
 
 产出物：加固补丁、benchmark 套件与数据集、失败注入测试、可观测指标。
 
@@ -304,6 +308,12 @@ docs/source_reuse_inventory.md（初始）
 | J | Independent Upgrade | Agent 与 Knowledge 均可独立版本升级 |
 
 最终验收结论只允许二选一：`SHUTU-KNOWLEDGE V1 READY` 或 `SHUTU-KNOWLEDGE NOT READY`。若 NOT READY，必须列出 remaining capability gaps、Agent Contract gaps、failed tests、license blockers，不得使用"基本完成"等模糊表述。
+
+当前执行状态：Gate A-J 均已通过；能力矩阵无 `PARTIAL` 行；项目许可证已确定为 Apache-2.0 并提交 `LICENSE`。`GAP-001` / `GAP-002` 是已记录的非阻断 Contract limitation。当前结论是：
+
+```text
+SHUTU-KNOWLEDGE V1 READY
+```
 
 ---
 

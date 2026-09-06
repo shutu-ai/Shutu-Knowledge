@@ -8,13 +8,17 @@ import "time"
 // BaseConfig carries per-base overrides; empty fields inherit the global
 // configuration at resolve time.
 type BaseConfig struct {
-	EmbeddingProvider string `json:"embeddingProvider,omitempty"`
-	EmbeddingBaseURL  string `json:"embeddingBaseUrl,omitempty"`
-	EmbeddingModel    string `json:"embeddingModel,omitempty"`
-	EmbeddingAPIKey   string `json:"embeddingApiKey,omitempty"`
-	RerankModel       string `json:"rerankModel,omitempty"`
-	RerankBaseURL     string `json:"rerankBaseUrl,omitempty"`
-	RerankAPIKey      string `json:"rerankApiKey,omitempty"`
+	EmbeddingProvider    string `json:"embeddingProvider,omitempty"`
+	EmbeddingBaseURL     string `json:"embeddingBaseUrl,omitempty"`
+	EmbeddingModel       string `json:"embeddingModel,omitempty"`
+	EmbeddingAPIKey      string `json:"embeddingApiKey,omitempty"`
+	EmbeddingAPIKeySet   bool   `json:"embeddingApiKeySet,omitempty"`
+	ClearEmbeddingAPIKey bool   `json:"clearEmbeddingApiKey,omitempty"`
+	RerankModel          string `json:"rerankModel,omitempty"`
+	RerankBaseURL        string `json:"rerankBaseUrl,omitempty"`
+	RerankAPIKey         string `json:"rerankApiKey,omitempty"`
+	RerankAPIKeySet      bool   `json:"rerankApiKeySet,omitempty"`
+	ClearRerankAPIKey    bool   `json:"clearRerankApiKey,omitempty"`
 
 	SmartChunk        *bool   `json:"smartChunk,omitempty"`
 	ChunkSeparator    string  `json:"chunkSeparator,omitempty"`
@@ -35,8 +39,31 @@ type BaseConfig struct {
 	ConflictStrategy string `json:"conflictStrategy,omitempty"` // keep | replace | rename
 	URLRefreshHours  int    `json:"urlRefreshHours,omitempty"`
 	AutoRetrieve     *bool  `json:"autoRetrieve,omitempty"`
-	AutoRetrieveMax  int    `json:"autoRetrieveWeight,omitempty"`
-	Processor        string `json:"documentProcessorProvider,omitempty"` // builtin | mineru
+	// AutoRetrieveMax is a pointer so an explicit zero can exclude a base.
+	AutoRetrieveMax   *int   `json:"autoRetrieveWeight,omitempty"`
+	Processor         string `json:"documentProcessorProvider,omitempty"` // builtin | mineru
+	MineruAPIKey      string `json:"mineruApiKey,omitempty"`
+	MineruAPIKeySet   bool   `json:"mineruApiKeySet,omitempty"`
+	ClearMineruAPIKey bool   `json:"clearMineruApiKey,omitempty"`
+	MineruAPIHost     string `json:"mineruApiHost,omitempty"`
+	// OCRMode: auto (native first, OCR fallback) | forced | off; empty
+	// inherits the global mode.
+	OCRMode string `json:"ocrMode,omitempty"`
+}
+
+// Redacted returns an API-safe copy: credentials are removed and only their
+// configured-state flags remain. Clear flags are never echoed.
+func (c BaseConfig) Redacted() BaseConfig {
+	c.EmbeddingAPIKeySet = c.EmbeddingAPIKey != ""
+	c.EmbeddingAPIKey = ""
+	c.ClearEmbeddingAPIKey = false
+	c.RerankAPIKeySet = c.RerankAPIKey != ""
+	c.RerankAPIKey = ""
+	c.ClearRerankAPIKey = false
+	c.MineruAPIKeySet = c.MineruAPIKey != ""
+	c.MineruAPIKey = ""
+	c.ClearMineruAPIKey = false
+	return c
 }
 
 // Base is one knowledge base.
@@ -71,6 +98,7 @@ const (
 	ErrDimensionMismatch = "dimension_mismatch"
 	ErrParseFailed       = "parse_failed"
 	ErrEmbeddingProvider = "embedding_provider"
+	ErrSourceMissing     = "source_missing"
 )
 
 // Document is one imported document inside a base.
@@ -87,17 +115,20 @@ type Document struct {
 	ContentHash       string `json:"contentHash,omitempty"`
 	RawFilePath       string `json:"rawFilePath,omitempty"`
 	RawText           string `json:"-"`
-	CharCount         int    `json:"charCount"`
-	TokenCount        int    `json:"tokenCount,omitempty"`
-	ChunkCount        int    `json:"chunkCount"`
-	Status            string `json:"status"`
-	Phase             string `json:"phase,omitempty"`
-	Progress          int    `json:"progress"`
-	Incomplete        bool   `json:"incomplete,omitempty"`
-	ErrorCode         string `json:"errorCode,omitempty"`
-	ErrorMessage      string `json:"errorMessage,omitempty"`
-	CreatedAt         int64  `json:"createdAt"`
-	UpdatedAt         int64  `json:"updatedAt,omitempty"`
+	// TitleLocked is internal state: user-named titles survive source
+	// refresh, while source-derived titles follow metadata changes.
+	TitleLocked  bool   `json:"-"`
+	CharCount    int    `json:"charCount"`
+	TokenCount   int    `json:"tokenCount,omitempty"`
+	ChunkCount   int    `json:"chunkCount"`
+	Status       string `json:"status"`
+	Phase        string `json:"phase,omitempty"`
+	Progress     int    `json:"progress"`
+	Incomplete   bool   `json:"incomplete,omitempty"`
+	ErrorCode    string `json:"errorCode,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt,omitempty"`
 }
 
 // Chunk is one stored chunk. Phase 2 stores text + metadata; embedding and
@@ -112,28 +143,34 @@ type Chunk struct {
 	Context       string `json:"context,omitempty"`
 	EmbeddingText string `json:"-"`
 	EmbeddingHash string `json:"-"`
-	CreatedAt     int64  `json:"-"`
-	HasEmbedding  bool   `json:"-"`
+	// EmbeddingVec/EmbeddingModel are set on the semantic-chunking insert
+	// path; the regular phase-3 path persists vectors via PutChunkVectors.
+	EmbeddingVec   []float64 `json:"-"`
+	EmbeddingModel string    `json:"-"`
+	CreatedAt      int64     `json:"-"`
+	HasEmbedding   bool      `json:"-"`
 }
 
 // DocumentSummary is the list view of a document.
 type DocumentSummary struct {
-	ID          string `json:"id"`
-	BaseID      string `json:"baseId"`
-	Title       string `json:"title"`
-	SourceType  string `json:"sourceType"`
-	FileName    string `json:"fileName,omitempty"`
-	URL         string `json:"url,omitempty"`
-	ParentDirID string `json:"parentDirectoryId,omitempty"`
-	CharCount   int    `json:"charCount"`
-	TokenCount  int    `json:"tokenCount,omitempty"`
-	ChunkCount  int    `json:"chunkCount"`
-	Status      string `json:"status"`
-	Phase       string `json:"phase,omitempty"`
-	Progress    int    `json:"progress"`
-	ErrorCode   string `json:"errorCode,omitempty"`
-	CreatedAt   int64  `json:"createdAt"`
-	UpdatedAt   int64  `json:"updatedAt,omitempty"`
+	ID           string `json:"id"`
+	BaseID       string `json:"baseId"`
+	Title        string `json:"title"`
+	SourceType   string `json:"sourceType"`
+	FileName     string `json:"fileName,omitempty"`
+	URL          string `json:"url,omitempty"`
+	ParentDirID  string `json:"parentDirectoryId,omitempty"`
+	SourcePath   string `json:"sourcePath,omitempty"`
+	CharCount    int    `json:"charCount"`
+	TokenCount   int    `json:"tokenCount,omitempty"`
+	ChunkCount   int    `json:"chunkCount"`
+	Status       string `json:"status"`
+	Phase        string `json:"phase,omitempty"`
+	Progress     int    `json:"progress"`
+	ErrorCode    string `json:"errorCode,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt,omitempty"`
 }
 
 // BaseSummary is the list view of a base.
@@ -159,6 +196,15 @@ type Stats struct {
 
 // Now is the clock used for timestamps (overridable in tests).
 var Now = time.Now
+
+// EnabledScopeState is the complete invocation switch state. Explicit is
+// false only before the first scope write; a saved empty BaseIDs slice is a
+// fail-closed pinned scope, not "all bases".
+type EnabledScopeState struct {
+	Enabled  bool     `json:"enabled"`
+	BaseIDs  []string `json:"enabledBaseIds"`
+	Explicit bool     `json:"-"`
+}
 
 // Evidence accessors adapt Chunk to the evidence composer interface.
 func (c Chunk) EvidenceID() string      { return c.ID }

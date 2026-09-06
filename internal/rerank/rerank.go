@@ -9,12 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/httpx"
 )
 
 // Error codes surfaced in structured search diagnostics.
@@ -68,7 +69,7 @@ func New(cfg Config) Provider {
 	}
 	client := cfg.Client
 	if client == nil {
-		client = &http.Client{Timeout: cfg.Timeout}
+		client = httpx.NewClient(cfg.Timeout)
 	}
 	remote := &remoteProvider{baseURL: strings.TrimRight(cfg.BaseURL, "/"), model: cfg.Model, apiKey: cfg.APIKey, client: client, timeout: cfg.Timeout}
 	return &breaker{inner: remote, threshold: threshold, openDuration: openDuration}
@@ -123,8 +124,7 @@ func (p *remoteProvider) Rerank(ctx context.Context, query string, texts []strin
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return nil, &Error{Code: CodeProviderError, Message: fmt.Sprintf("HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(snippet))), Retryable: true}
+		return nil, &Error{Code: CodeProviderError, Message: fmt.Sprintf("HTTP %d", resp.StatusCode), Retryable: true}
 	}
 	var payload struct {
 		Results []struct {

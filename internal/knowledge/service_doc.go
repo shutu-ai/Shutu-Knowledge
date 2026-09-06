@@ -5,10 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"mime"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/caption"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
@@ -92,9 +97,11 @@ func summarize(d Document) DocumentSummary {
 	return DocumentSummary{
 		ID: d.ID, BaseID: d.BaseID, Title: d.Title, SourceType: d.SourceType,
 		FileName: d.FileName, URL: d.URL, ParentDirID: d.ParentDirectoryID,
-		CharCount: d.CharCount, TokenCount: d.TokenCount, ChunkCount: d.ChunkCount,
+		SourcePath: d.SourcePath,
+		CharCount:  d.CharCount, TokenCount: d.TokenCount, ChunkCount: d.ChunkCount,
 		Status: d.Status, Phase: d.Phase, Progress: d.Progress,
-		ErrorCode: d.ErrorCode, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		ErrorCode: d.ErrorCode, ErrorMessage: d.ErrorMessage,
+		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
 	}
 }
 
@@ -114,6 +121,68 @@ func (s *Service) GetDocument(id string, includeChunks bool) (Document, []Chunk,
 	return doc, chunks, nil
 }
 
+// RawFile is original source content prepared for HTTP download/preview.
+type RawFile struct {
+	Bytes    []byte
+	FileName string
+	MimeType string
+}
+
+// GetRawFile returns the stored original bytes for a file document.
+func (s *Service) GetRawFile(id string) (*RawFile, error) {
+	doc, err := s.store.getDocument(id)
+	if err != nil {
+		return nil, err
+	}
+	if doc.RawFilePath == "" {
+		return nil, fmt.Errorf("%w: document has no raw source", ErrNotFound)
+	}
+	data, err := s.raw.Read(doc.RawFilePath)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: raw source is missing", ErrNotFound)
+	}
+	fileName := doc.FileName
+	if fileName == "" {
+		fileName = doc.Title
+	}
+	mimeType := doc.MimeType
+	if mimeType == "" {
+		mimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(fileName)))
+	}
+	return &RawFile{Bytes: data, FileName: fileName, MimeType: mimeType}, nil
+}
+
+// IndexingStatus is one currently active import/index job.
+type IndexingStatus struct {
+	DocID    string `json:"docId"`
+	BaseID   string `json:"baseId"`
+	Title    string `json:"title"`
+	Phase    string `json:"phase,omitempty"`
+	Progress int    `json:"progress"`
+}
+
+// IndexingStatus reports active imports across every base.
+func (s *Service) IndexingStatus() ([]IndexingStatus, error) {
+	docs, err := s.store.listAllDocuments()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IndexingStatus, 0)
+	for _, doc := range docs {
+		if doc.Status != StatusPending && doc.Status != StatusProcessing {
+			continue
+		}
+		out = append(out, IndexingStatus{
+			DocID: doc.ID, BaseID: doc.BaseID, Title: doc.Title,
+			Phase: doc.Phase, Progress: doc.Progress,
+		})
+	}
+	return out, nil
+}
+
 // RenameDocument updates the title.
 func (s *Service) RenameDocument(id, title string) (Document, error) {
 	doc, err := s.store.getDocument(id)
@@ -125,6 +194,7 @@ func (s *Service) RenameDocument(id, title string) (Document, error) {
 		return Document{}, fmt.Errorf("document title is required")
 	}
 	doc.Title = title
+	doc.TitleLocked = true
 	doc.UpdatedAt = now()
 	if err := s.store.putDocument(doc); err != nil {
 		return Document{}, err
@@ -137,6 +207,20 @@ func (s *Service) DeleteDocument(id string) error {
 	doc, err := s.store.getDocument(id)
 	if err != nil {
 		return err
+	}
+	if doc.SourceType == "directory" {
+		children, err := s.store.listDocuments(doc.BaseID)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if child.ParentDirectoryID != doc.ID {
+				continue
+			}
+			if err := s.DeleteDocument(child.ID); err != nil && err != ErrNotFound {
+				return err
+			}
+		}
 	}
 	if err := s.store.deleteChunks(doc.ID); err != nil {
 		return err
@@ -231,12 +315,24 @@ type AddFilesResult struct {
 // MaxBatchFiles bounds one batch import.
 const MaxBatchFiles = 20
 
+// plannedFile is one decoded batch member with a title fixed before workers
+// start. Fixing titles and duplicate decisions up front prevents concurrent
+// imports from racing for the same name.
+type plannedFile struct {
+	title     string
+	fileName  string
+	data      []byte
+	hash      string
+	duplicate bool
+}
+
 // AddFiles imports a batch of base64 files with server-side conflict
 // detection: conflict=detect refuses the whole batch when any name collides;
 // rename/replace resolve collisions per file; duplicates by content hash are
-// skipped.
+// skipped. Ingestion runs with at most five workers.
 func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesItem, conflict, parentDirID string) (AddFilesResult, error) {
-	if _, err := s.store.getBase(baseID); err != nil {
+	base, err := s.store.getBase(baseID)
+	if err != nil {
 		return AddFilesResult{}, err
 	}
 	if len(items) == 0 {
@@ -244,6 +340,9 @@ func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesI
 	}
 	if len(items) > MaxBatchFiles {
 		return AddFilesResult{}, fmt.Errorf("batch too large (%d > %d files)", len(items), MaxBatchFiles)
+	}
+	if conflict == "" {
+		conflict = ResolveBaseConfig(s.global, base.Config).ConflictStrategy
 	}
 	if conflict == "" {
 		conflict = "rename"
@@ -254,17 +353,99 @@ func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesI
 		return AddFilesResult{}, fmt.Errorf("invalid conflict strategy %q", conflict)
 	}
 
-	type decoded struct {
+	s.batchMu.Lock()
+	plans, err := s.planFileBatch(ctx, baseID, items, conflict)
+	s.batchMu.Unlock()
+	if err != nil {
+		var conflictErr *ConflictError
+		if errors.As(err, &conflictErr) {
+			return AddFilesResult{Status: "conflicts", Conflicts: conflictErr.Conflicts}, nil
+		}
+		return AddFilesResult{}, err
+	}
+
+	result := AddFilesResult{Status: "added", Accepted: make([]AcceptedFile, len(plans))}
+	completed := make([]bool, len(plans))
+	workerCount := maxBatchWorkers
+	if len(plans) < workerCount {
+		workerCount = len(plans)
+	}
+	jobs := make(chan int)
+	workerErr := make(chan error, workerCount)
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				plan := plans[index]
+				if plan.duplicate {
+					result.Accepted[index] = AcceptedFile{Title: plan.title, Skipped: true}
+					completed[index] = true
+					continue
+				}
+				doc, err := s.AddFileDocument(ctx, baseID, plan.title, plan.data, parentDirID)
+				if err != nil {
+					workerErr <- err
+					return
+				}
+				result.Accepted[index] = AcceptedFile{ID: doc.ID, Title: doc.Title}
+				completed[index] = true
+			}
+		}()
+	}
+	for index := range plans {
+		select {
+		case jobs <- index:
+		case err := <-workerErr:
+			close(jobs)
+			workers.Wait()
+			return result, err
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	select {
+	case err := <-workerErr:
+		return result, err
+	default:
+	}
+	for index := range result.Accepted {
+		if !completed[index] {
+			result.Accepted[index] = AcceptedFile{Title: plans[index].title}
+		}
+	}
+	return result, nil
+}
+
+const maxBatchWorkers = 5
+
+func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddFilesItem, conflict string) ([]plannedFile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type decodedFile struct {
 		name string
 		data []byte
+		hash string
 	}
-	files := make([]decoded, 0, len(items))
+	files := make([]decodedFile, 0, len(items))
+	seenNames := map[string]bool{}
 	for _, item := range items {
 		data, err := base64.StdEncoding.DecodeString(item.ContentBase64)
 		if err != nil {
-			return AddFilesResult{}, fmt.Errorf("file %s: invalid base64 content", item.FileName)
+			return nil, fmt.Errorf("file %s: invalid base64 content", item.FileName)
 		}
-		files = append(files, decoded{name: item.FileName, data: data})
+		name := strings.TrimSpace(item.FileName)
+		if name == "" {
+			return nil, fmt.Errorf("file name is required")
+		}
+		if seenNames[name] {
+			return nil, fmt.Errorf("file %s appears more than once in the batch", name)
+		}
+		seenNames[name] = true
+		sum := sha256.Sum256(data)
+		files = append(files, decodedFile{name: name, data: data, hash: hex.EncodeToString(sum[:])})
 	}
 
 	if conflict == "detect" {
@@ -273,17 +454,29 @@ func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesI
 			names = append(names, f.name)
 		}
 		if conflicts := s.DetectConflicts(baseID, names); len(conflicts) > 0 {
-			return AddFilesResult{Status: "conflicts", Conflicts: conflicts}, nil
+			return nil, &ConflictError{Conflicts: conflicts}
 		}
 	}
 
-	result := AddFilesResult{Status: "added", Accepted: make([]AcceptedFile, 0, len(files))}
+	// Existing hashes must remain visible to planning. Hashes created by the
+	// workers are serialized by SQLite; a race with another import can create
+	// a legitimate duplicate and will be reconciled by later operations.
+	existingHashes := map[string]bool{}
+	docs, err := s.store.listDocuments(baseID)
+	if err != nil {
+		return nil, err
+	}
+	for _, doc := range docs {
+		existingHashes[doc.ContentHash] = true
+	}
+	plans := make([]plannedFile, 0, len(files))
+	usedTitles := map[string]bool{}
 	for _, f := range files {
 		title := f.name
 		if conflict == "replace" {
 			if existing, err := s.store.findDocumentByTitle(baseID, title); err == nil {
 				if err := s.DeleteDocument(existing.ID); err != nil {
-					return result, err
+					return nil, err
 				}
 			}
 		} else if conflict == "rename" {
@@ -291,21 +484,17 @@ func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesI
 				title = s.RenameAvailable(baseID, title)
 			}
 		}
-		// Content-hash duplicate detection: identical bytes already stored
-		// in this base are skipped regardless of strategy.
-		sum := sha256.Sum256(f.data)
-		hash := hex.EncodeToString(sum[:])
-		if s.hasContentHash(baseID, hash) {
-			result.Accepted = append(result.Accepted, AcceptedFile{Title: title, Skipped: true})
-			continue
+		duplicate := existingHashes[f.hash]
+		existingHashes[f.hash] = true
+		if usedTitles[title] {
+			title = s.RenameAvailable(baseID, title)
 		}
-		doc, err := s.AddFileDocument(ctx, baseID, title, f.data, parentDirID)
-		if err != nil {
-			return result, err
-		}
-		result.Accepted = append(result.Accepted, AcceptedFile{ID: doc.ID, Title: doc.Title})
+		usedTitles[title] = true
+		plans = append(plans, plannedFile{
+			title: title, fileName: f.name, data: f.data, hash: f.hash, duplicate: duplicate,
+		})
 	}
-	return result, nil
+	return plans, nil
 }
 
 func (s *Service) hasContentHash(baseID, hash string) bool {
@@ -462,6 +651,13 @@ func (s *Service) newDocument(baseID, title, sourceType string) Document {
 // are persisted to the raw store first ("import means copy"); a failure in
 // later steps leaves the raw copy for recovery.
 func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fileBytes []byte) error {
+	importStarted := Now()
+	defer func() {
+		s.recordMetric(func(m *MetricsSnapshot) {
+			m.Imports++
+			m.ImportDurationMS += durationMS(importStarted)
+		})
+	}()
 	doc.Status = StatusProcessing
 	doc.Phase = PhaseParsing
 	doc.Progress = 0
@@ -485,14 +681,16 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 
 	text := doc.RawText
 	if doc.SourceType == "file" {
-		parsed, err := s.parsers.Parse(doc.FileName, fileBytes)
+		parseStarted := Now()
+		parsedText, parsedTitle, err := s.parseFileContent(ctx, doc, cfg, fileBytes)
+		s.recordMetric(func(m *MetricsSnapshot) { m.ParseDurationMS += durationMS(parseStarted) })
 		if err != nil {
 			return s.failDocument(doc, ErrParseFailed, err)
 		}
-		if parsed.Title != "" && doc.Title == doc.FileName {
-			doc.Title = parsed.Title
+		if parsedTitle != "" && !doc.TitleLocked {
+			doc.Title = parsedTitle
 		}
-		text = parsed.Text
+		text = s.appendImageCaptions(ctx, doc, fileBytes, parsedText)
 	}
 
 	text = chunk.Normalize(text)
@@ -504,13 +702,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.TokenCount = chunk.EstimateTokens(text)
 
 	opts := s.chunkOptions(cfg)
-	var pieces []chunk.Piece
-	if opts.Semantic {
-		pieces = chunk.SemanticSegments(text, opts.Separator)
-	} else {
-		pieces = chunk.Chunk(text, opts.Size, opts.Overlap, chunk.Options{Smart: &opts.Smart, Separator: opts.Separator})
-	}
-	pieces = chunk.RefineByTokenLimit(pieces, opts.TokenLimit, nil)
+	embeddingStarted := Now()
+	pieces, inlineVectors := s.buildPieces(ctx, text, doc, opts)
+	s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += durationMS(embeddingStarted) })
 
 	// Build chunks with retrieval context (title + heading path) and the
 	// embedding-text hash the vector phase will reuse.
@@ -532,6 +726,12 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		}
 		c.EmbeddingText = strings.TrimSpace(c.Context + " " + c.Text)
 		c.EmbeddingHash = hashText(c.EmbeddingText)
+		if inlineVectors != nil {
+			if vector, ok := inlineVectors[i]; ok {
+				c.EmbeddingVec = vector
+				c.EmbeddingModel = s.EmbeddingModelKey()
+			}
+		}
 		rows = append(rows, c)
 	}
 	if len(rows) == 0 {
@@ -540,6 +740,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if err := s.store.putChunksReplace(rows); err != nil {
 		return s.failDocument(doc, ErrParseFailed, err)
 	}
+	s.recordMetric(func(m *MetricsSnapshot) { m.ChunkCount += int64(len(rows)) })
 
 	// Vector phase: with an active embedding provider, chunks are embedded
 	// with library-wide hash reuse; a failure degrades the document to
@@ -554,7 +755,12 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		if err := s.store.putDocument(*doc); err != nil {
 			return err
 		}
-		if code, cause := s.embedChunks(ctx, doc, rows); code != "" {
+		embeddingStarted = Now()
+		code, cause := s.embedChunks(ctx, doc, rows)
+		embeddingElapsed := durationMS(embeddingStarted)
+		s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += embeddingElapsed })
+		if code != "" {
+			s.recordMetric(func(m *MetricsSnapshot) { m.ModelErrors++ })
 			if code == ErrInterrupted {
 				// Keep the document resumable for the startup recovery pass.
 				doc.Status = StatusProcessing
@@ -582,6 +788,290 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.Incomplete = false
 	doc.UpdatedAt = now()
 	return s.store.putDocument(*doc)
+}
+
+// parseFileContent runs the format-specific extraction chain for file
+// sources: optional MinerU remote processing (PDF, per-base), the local
+// parser registry, and the OCR modes (native first, OCR fallback, forced
+// OCR). OCR failure never destroys already-extracted text.
+func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseConfig, data []byte) (string, string, error) {
+	cfg = ResolveBaseConfig(s.global, cfg)
+	isPDF := strings.EqualFold(parser.ExtensionOf(doc.FileName), "pdf")
+
+	// MinerU remote processing first when configured; any failure falls
+	// back to the local chain.
+	if isPDF && cfg.Processor == "mineru" && strings.TrimSpace(cfg.MineruAPIKey) != "" {
+		markdown, err := parser.ExtractPDFWithMineru(ctx, doc.FileName, data, parser.MineruSettings{
+			APIKey:  cfg.MineruAPIKey,
+			APIHost: cfg.MineruAPIHost,
+		})
+		if err == nil && strings.TrimSpace(markdown) != "" {
+			return markdown, "", nil
+		}
+	}
+
+	parsed, parseErr := s.parsers.Parse(doc.FileName, data)
+	nativeAvailable := parseErr == nil && strings.TrimSpace(parsed.Text) != ""
+	// The parser may still provide fragmented native text while requesting a
+	// healthier OCR pass (upstream's text-layer health behavior).
+	nativeOK := nativeAvailable && !parsed.NeedsOCR
+
+	mode := s.resolveOCRMode(cfg)
+	ocrUsable := isPDF && s.ocr != nil && s.ocr.Available()
+	contentUsable := isPDF && s.content != nil && s.content.Available()
+	runOCR := func() (string, bool) {
+		if !ocrUsable {
+			return "", false
+		}
+		if renderedText, ok := s.runRenderedPageOCR(ctx, data); ok {
+			return renderedText, true
+		}
+		text, err := s.ocr.Run(ctx, "pdf", data)
+		trimmed := strings.TrimSpace(text)
+		if err == nil && trimmed != "" {
+			return postprocessOCRText(trimmed), true
+		}
+		if err != nil || trimmed == "" {
+			// Scanned PDFs commonly carry page images even when the primary
+			// helper cannot rasterize the PDF envelope itself. Try those
+			// bounded embedded rasters before giving up; each image is passed
+			// with an explicit PNG format hint.
+			if rasterText, rasterErr := s.runEmbeddedRasterOCR(ctx, data); rasterErr == nil && strings.TrimSpace(rasterText) != "" {
+				return rasterText, true
+			}
+			return "", false
+		}
+		return text, true
+	}
+	runContentConverter := func() (string, bool) {
+		if !contentUsable {
+			return "", false
+		}
+		markdown, err := s.content.Run(ctx, "pdf", data)
+		if err != nil || strings.TrimSpace(markdown) == "" {
+			return "", false
+		}
+		return markdown, true
+	}
+
+	if mode == "forced" {
+		if text, ok := runOCR(); ok {
+			return text, parsed.Title, nil
+		}
+		if text, ok := runContentConverter(); ok {
+			return text, parsed.Title, nil
+		}
+		if nativeAvailable {
+			return parsed.Text, parsed.Title, nil
+		}
+		// Forced OCR failed without any native text: surface the failure.
+		return "", "", fmt.Errorf("forced OCR failed")
+	}
+	if nativeOK {
+		return parsed.Text, parsed.Title, nil
+	}
+	if !nativeAvailable {
+		// Upstream asks the content-signature reader first when the primary
+		// PDF parser produced no text at all; OCR is its next fallback.
+		if text, ok := runContentConverter(); ok {
+			return text, parsed.Title, nil
+		}
+		if text, ok := runOCR(); ok {
+			return text, parsed.Title, nil
+		}
+	} else {
+		// A fragmented layer is still native evidence, so try OCR before
+		// replacing it with a converter's reconstruction.
+		if text, ok := runOCR(); ok {
+			return text, parsed.Title, nil
+		}
+		if text, ok := runContentConverter(); ok {
+			return text, parsed.Title, nil
+		}
+	}
+	if nativeAvailable {
+		return parsed.Text, parsed.Title, nil
+	}
+	if parseErr != nil {
+		return "", "", parseErr
+	}
+	return parsed.Text, parsed.Title, fmt.Errorf("contains no extractable text")
+}
+
+func (s *Service) runEmbeddedRasterOCR(ctx context.Context, data []byte) (string, error) {
+	images, err := parser.ExtractPDFImages(data, s.pdfImageOptions(ctx)...)
+	if err != nil {
+		return "", err
+	}
+	pageTexts := make(map[int][]string)
+	for _, image := range images {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if len(image.PNG) == 0 {
+			continue
+		}
+		prepared, err := prepareOCRImage(image.PNG)
+		if err != nil {
+			continue
+		}
+		text, err := s.ocr.Run(ctx, "png", prepared)
+		if err != nil {
+			continue
+		}
+		if processed := postprocessOCRText(strings.TrimSpace(text)); processed != "" {
+			pageTexts[image.Page] = append(pageTexts[image.Page], processed)
+		}
+	}
+	if len(pageTexts) == 0 {
+		return "", fmt.Errorf("embedded raster OCR produced no text")
+	}
+	pages := make([]int, 0, len(pageTexts))
+	for page := range pageTexts {
+		pages = append(pages, page)
+	}
+	sort.Ints(pages)
+	pageParts := make([]string, 0, len(pages))
+	for _, page := range pages {
+		pageParts = append(pageParts, strings.Join(pageTexts[page], "\n"))
+	}
+	return strings.Join(pageParts, "\n\n"), nil
+}
+
+// runRenderedPageOCR asks the optional deployment-provided rasterizer for
+// complete PDF pages first. Renderer, validation, and per-page OCR failures
+// are isolated so ingestion can continue through the older PDF-envelope and
+// embedded-raster fallbacks.
+func (s *Service) runRenderedPageOCR(ctx context.Context, data []byte) (string, bool) {
+	if !s.ocrRendererAvailable() {
+		return "", false
+	}
+	output, err := s.ocrRenderer.DecodeLimit(ctx, "pdf", data, parser.MaxOCRRenderOutputBytes)
+	if err != nil {
+		return "", false
+	}
+	pages, err := parser.ParseRenderedPDFPages(output)
+	if err != nil {
+		return "", false
+	}
+	pageTexts := make(map[int]string, len(pages))
+	orderedPages := make([]int, 0, len(pages))
+	for _, page := range pages {
+		if err := ctx.Err(); err != nil {
+			return "", false
+		}
+		text, err := s.ocr.Run(ctx, "png", page.PNG)
+		if err != nil {
+			continue
+		}
+		processed := postprocessOCRText(strings.TrimSpace(text))
+		if processed == "" {
+			continue
+		}
+		pageTexts[page.Page] = processed
+		orderedPages = append(orderedPages, page.Page)
+	}
+	if len(orderedPages) == 0 {
+		return "", false
+	}
+	pageParts := make([]string, 0, len(orderedPages))
+	for _, page := range orderedPages {
+		pageParts = append(pageParts, pageTexts[page])
+	}
+	return strings.Join(pageParts, "\n\n"), true
+}
+
+// appendImageCaptions enriches searchable text with best-effort vision model
+// descriptions. Caption failures intentionally leave parsed text untouched.
+func (s *Service) appendImageCaptions(ctx context.Context, doc *Document, data []byte, text string) string {
+	if !strings.EqualFold(parser.ExtensionOf(doc.FileName), "pdf") {
+		return text
+	}
+	captionCfg := caption.Config{
+		Provider:         s.global.Captioning.Provider,
+		Model:            s.global.Captioning.Model,
+		BaseURL:          s.global.Captioning.BaseURL,
+		APIKey:           s.global.Captioning.APIKey,
+		EmbeddingBaseURL: s.global.Embedding.BaseURL,
+	}
+	if captionCfg.Provider == "off" || strings.TrimSpace(captionCfg.Model) == "" {
+		return text
+	}
+	captionOptions := s.captionOptionsOrEmpty()
+	if captionOptions.ExtractImages == nil {
+		captionOptions.ExtractImages = func(source []byte) ([]parser.PDFImage, error) {
+			return parser.ExtractPDFImages(source, s.pdfImageOptions(ctx)...)
+		}
+	}
+	result := caption.PDFImages(ctx, data, captionCfg, captionOptions)
+	if result.Failures > 0 {
+		s.recordMetric(func(m *MetricsSnapshot) { m.ModelErrors++ })
+	}
+	if result.Text == "" {
+		return text
+	}
+	return text + result.Text
+}
+
+func (s *Service) captionOptionsOrEmpty() caption.Options {
+	if s.captionOptions != nil {
+		return *s.captionOptions
+	}
+	return caption.Options{}
+}
+
+// resolveOCRMode: per-base override, else the global mode (default auto).
+func (s *Service) resolveOCRMode(cfg BaseConfig) string {
+	mode := strings.TrimSpace(cfg.OCRMode)
+	if mode == "" {
+		mode = strings.TrimSpace(s.global.OCR.Mode)
+	}
+	switch mode {
+	case "forced", "off":
+		return mode
+	default:
+		return "auto"
+	}
+}
+
+// buildPieces chunks the text; the semantic path merges adjacent embedded
+// segments and returns per-piece mean vectors. Any provider failure falls
+// back to the structural chunker (semantic chunking must never block import).
+func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, opts ChunkOptions) ([]chunk.Piece, map[int][]float64) {
+	if !opts.Semantic || s.global.Embedding.Provider == "none" {
+		return s.structuralPieces(text, opts), nil
+	}
+	segments := chunk.SemanticSegments(text, opts.Separator)
+	if len(segments) == 0 {
+		return nil, nil
+	}
+	texts := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		contextText := strings.TrimSpace(doc.Title)
+		if segment.Heading != "" {
+			contextText = strings.TrimSpace(contextText + " " + segment.Heading)
+		}
+		texts = append(texts, strings.TrimSpace(contextText+" "+segment.Text))
+	}
+	vectors, err := s.embedder.Embed(ctx, texts)
+	if err != nil || len(vectors) != len(segments) {
+		return s.structuralPieces(text, opts), nil
+	}
+	merged := chunk.MergeSemanticSegments(segments, vectors, opts.Size, opts.SemanticThreshold)
+	pieces := make([]chunk.Piece, 0, len(merged))
+	inline := map[int][]float64{}
+	for i, segment := range merged {
+		pieces = append(pieces, segment.Piece)
+		if segment.Vector != nil {
+			inline[i] = segment.Vector
+		}
+	}
+	return pieces, inline
+}
+
+func (s *Service) structuralPieces(text string, opts ChunkOptions) []chunk.Piece {
+	pieces := chunk.Chunk(text, opts.Size, opts.Overlap, chunk.Options{Smart: &opts.Smart, Separator: opts.Separator})
+	return chunk.RefineByTokenLimit(pieces, opts.TokenLimit, nil)
 }
 
 // embedChunks embeds the stored chunks in batches, reusing stored vectors by

@@ -126,7 +126,7 @@ try {
         $response = Invoke-JsonRequest "POST" "$baseURL/api/bases/$baseID/files" @{ conflict = "rename"; files = @(@{ fileName = [IO.Path]::GetFileName($fixture.Path); contentBase64 = $data }) }
         $accepted = @($response.value.accepted)
         if ($accepted.Count -ne 1) { throw "package $($fixture.Kind) import was not accepted" }
-        $document = Invoke-JsonRequest "GET" "$baseURL/api/documents/$($accepted[0].id)"
+        $document = Invoke-JsonRequest "GET" "$baseURL/api/documents/$($accepted[0].id)?includeChunks=false"
         if ($document.value.status -ne "ready" -or $document.value.chunkCount -lt 1) {
             throw "package $($fixture.Kind) import was not ready: status=$($document.value.status) chunks=$($document.value.chunkCount)"
         }

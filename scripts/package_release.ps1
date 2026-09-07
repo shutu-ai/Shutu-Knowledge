@@ -45,6 +45,11 @@ if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force 
 if (Test-Path -LiteralPath $verifyRoot) { Remove-Item -LiteralPath $verifyRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $stage "bin") | Out-Null
 
+function Get-PackageRelativePath([string] $BasePath, [string] $FullPath) {
+    $prefix = $BasePath.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    return $FullPath.Substring($prefix.Length).Replace("\", "/")
+}
+
 $binaryPath = Join-Path $stage "bin\$binaryName"
 $previousGOOS = $env:GOOS
 $previousGOARCH = $env:GOARCH
@@ -98,7 +103,7 @@ $metadata = [ordered]@{
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage "BUILD-METADATA.json") -Encoding UTF8
 
 $checksumLines = foreach ($file in @(Get-ChildItem -LiteralPath $stage -File -Recurse | Sort-Object FullName)) {
-    $relative = [IO.Path]::GetRelativePath($stage, $file.FullName).Replace("\", "/")
+    $relative = Get-PackageRelativePath $stage $file.FullName
     $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $relative"
 }
@@ -138,5 +143,5 @@ $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLow
     GitSHA = $commit
     Binary = $binaryName
     BinarySHA256 = $binaryHash
-    Inventory = (Get-ChildItem -LiteralPath $verifiedRoot -File -Recurse | ForEach-Object { [IO.Path]::GetRelativePath($verifiedRoot, $_.FullName).Replace("\", "/") }) -join ","
+    Inventory = (Get-ChildItem -LiteralPath $verifiedRoot -File -Recurse | ForEach-Object { Get-PackageRelativePath $verifiedRoot $_.FullName }) -join ","
 } | Format-List

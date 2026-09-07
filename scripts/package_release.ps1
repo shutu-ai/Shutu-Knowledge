@@ -21,7 +21,7 @@ $commit = (& git -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
     throw "could not determine candidate commit"
 }
-$dirtyFiles = @(& git -C $RepoRoot status --porcelain)
+$dirtyFiles = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
 if ($dirtyFiles.Count -gt 0) {
     throw "formal packaging requires a clean candidate checkout; uncommitted files: $($dirtyFiles -join '; ')"
 }

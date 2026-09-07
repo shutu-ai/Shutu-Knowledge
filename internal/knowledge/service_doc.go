@@ -1098,9 +1098,19 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk) 
 	}
 	reuse := s.store.ListEmbeddingVectorsByHashes(hashes, modelKey)
 	var pendingHashes []string
+	reusedForDocument := map[string][]float64{}
 	for _, hash := range hashes {
-		if _, ok := reuse[hash]; !ok {
+		if vector, ok := reuse[hash]; ok {
+			// Hash reuse is library-wide, but the vector still has to be
+			// materialized on this document before vector search can see it.
+			reusedForDocument[hash] = vector
+		} else {
 			pendingHashes = append(pendingHashes, hash)
+		}
+	}
+	if len(reusedForDocument) > 0 {
+		if err := s.store.PutChunkVectors(doc.ID, modelKey, reusedForDocument); err != nil {
+			return ErrEmbeddingProvider, err
 		}
 	}
 	dimension := 0

@@ -141,6 +141,10 @@ try {
         $imported += $accepted[0].id
     }
 
+    $packageStats = Invoke-JsonRequest "GET" "$baseURL/api/bases/$baseID/stats"
+    if (-not $packageStats.value.embedded -or $packageStats.value.embeddingDimensions -lt 1) {
+        throw "package imports did not materialize embedding vectors: $($packageStats.value | ConvertTo-Json -Compress)"
+    }
     $semantic = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "What invoice and approval are needed for expense reimbursement?"; mode = "vector"; topK = 3; baseIds = @($baseID) }
     if (@($semantic.value.hits).Count -lt 1 -or $semantic.value.hits[0].documentTitle -ne "expense-reimbursement.md") {
         throw "package semantic retrieval returned the wrong result"

@@ -300,6 +300,28 @@ func TestVectorHashReuseOnReindex(t *testing.T) {
 	}
 }
 
+func TestVectorHashReuseAcrossDocumentsMaterializesVectors(t *testing.T) {
+	service, embedder := newSearchFixture(t)
+	ctx := context.Background()
+	firstBase, _ := service.CreateBase("First", "", "", BaseConfig{})
+	secondBase, _ := service.CreateBase("Second", "", "", BaseConfig{})
+	if _, err := service.AddTextDocument(ctx, firstBase.ID, "Guide", "database content"); err != nil {
+		t.Fatal(err)
+	}
+	before := embedder.embeds
+	second, err := service.AddTextDocument(ctx, secondBase.ID, "Guide", "database content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if embedder.embeds != before {
+		t.Fatalf("expected cross-document hash reuse, embeds went %d -> %d", before, embedder.embeds)
+	}
+	result, err := service.Search(ctx, SearchRequest{Query: "database", Mode: "vector", BaseIDs: []string{secondBase.ID}})
+	if err != nil || result.Total == 0 || result.Hits[0].DocID != second.ID {
+		t.Fatalf("reused vector was not searchable in destination document: err=%v result=%+v", err, result)
+	}
+}
+
 func TestMultiQueryFusionBroadensRecall(t *testing.T) {
 	service, _ := newSearchFixture(t)
 	base, _ := service.CreateBase("B", "", "", BaseConfig{})

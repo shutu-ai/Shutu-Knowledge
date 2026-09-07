@@ -12,6 +12,8 @@ release gates, and
 [shutu_knowledge_implementation_report.md](shutu_knowledge_implementation_report.md)
 records the current evidence-backed conclusion.
 
+Release version: **0.1.1**.
+
 Out-of-box runtime status: **ready**. Knowledge automatically manages local ML,
 OCR, PDF rendering, and Office conversion without user-authored helpers. See
 [out_of_box_parity_report.md](out_of_box_parity_report.md) and

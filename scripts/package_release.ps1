@@ -7,9 +7,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
+if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
+    throw "repository root does not exist: $RepoRoot"
+}
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $RepoRoot ".tmp\formal-release"
 }
+$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 
 $versionSource = Get-Content -LiteralPath (Join-Path $RepoRoot "internal\version\version.go") -Raw
 $versionMatch = [regex]::Match($versionSource, 'Version\s*=\s*"([^"]+)"')

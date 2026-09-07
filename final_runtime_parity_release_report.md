@@ -39,10 +39,13 @@ resolved to `369c3436045165198e8360edb36693f01c0201da`.
 - Linux fresh-clone `go test ./...`: PASS, including extension, Knowledge,
   runtime, and web packages.
 
-## Formal package and package-only Runtime E2E
+## Superseded 0.1.0 package audit
 
-The formal package was built by `scripts/package_release.ps1` inside the fresh
-GitHub clone from the final runtime candidate:
+The supplied `0.1.0` package matched the recorded size and archive SHA-256,
+and its secret scan passed. However, its package-internal `checksums.sha256`
+entries referenced a truncated temporary-clone path rather than package-root
+relative paths. The entries could not be verified after extraction, so this
+artifact is rejected and is not a GitHub Release asset.
 
 ```text
 Package: shutu-knowledge-0.1.0-windows-amd64.zip
@@ -52,7 +55,12 @@ Binary SHA256: ae55db20a2815d5fecf5cd26a3e646dff95bb24103537773410306c4ce3897ca
 Metadata GitSHA: 369c3436045165198e8360edb36693f01c0201da
 ```
 
-Package inspection passed: required binary, license, notices, manifest,
+The corrected package metadata implementation resolves the repository and
+output roots before generating checksums. A new `0.1.1` package will be built
+and independently verified for the immutable `v0.1.1` release; no `v0.1.0`
+tag will be moved or overwritten.
+
+The rejected package otherwise contained the required binary, license, notices, manifest,
 checksums, deployment/runtime documentation, and extension metadata were
 present; source checkout files, `.git`, `node_modules`, model caches, runtime
 caches, npm caches, temporary homes, and absolute development paths were not

@@ -40,6 +40,9 @@ type App struct {
 	Models    *models.Manager
 	Ollama    *models.Ollama
 	Runtime   runtime.Controller
+	// ManagedRuntime reports whether Knowledge prepared its own pinned runtime
+	// rather than using an explicitly configured deployment helper.
+	ManagedRuntime bool
 }
 
 // New resolves config, opens storage, and registers core health checkers.
@@ -80,7 +83,16 @@ func New(ctx context.Context) (*App, error) {
 	application.Ollama = models.NewOllama("http://127.0.0.1:11434", nil)
 	application.Runtime = application.newRuntimeManager()
 	application.Knowledge.SetRuntime(application.Runtime)
-	application.Knowledge.SetOCRArtifactProvider(application.ocrArtifactPath)
+	if strings.TrimSpace(cfg.Helpers.LegacyOffice) == "" {
+		application.Knowledge.SetLegacyOfficeRunner(nil)
+	}
+	// The managed runtime owns Tesseract.js language data in its private
+	// runtime cache; it must not be gated on the legacy PaddleOCR artifact
+	// bundle exposed by the Models page. Explicit helper deployments retain
+	// the artifact callback so their helper can receive modelPath.
+	if !application.ManagedRuntime {
+		application.Knowledge.SetOCRArtifactProvider(application.ocrArtifactPath)
+	}
 	application.registerOptionalHealth()
 	if resumed, failed, err := application.Knowledge.RecoverInterrupted(ctx); err != nil {
 		logger.Warn("startup recovery incomplete", "error", err)
@@ -106,27 +118,36 @@ func New(ctx context.Context) (*App, error) {
 }
 
 func (a *App) registerOptionalHealth() {
-	a.Health.Register(health.CheckerFunc{
-		CheckName: "runtime-embedding",
-		Level:     health.Optional,
-		Fn: func(ctx context.Context) error {
-			return a.probeRuntime(ctx, runtime.CapabilityEmbedding)
-		},
-	})
-	a.Health.Register(health.CheckerFunc{
-		CheckName: "runtime-rerank",
-		Level:     health.Optional,
-		Fn: func(ctx context.Context) error {
-			return a.probeRuntime(ctx, runtime.CapabilityRerank)
-		},
-	})
-	a.Health.Register(health.CheckerFunc{
-		CheckName: "runtime-ocr",
-		Level:     health.Optional,
-		Fn: func(ctx context.Context) error {
-			return a.probeRuntime(ctx, runtime.CapabilityOCR)
-		},
-	})
+	if !a.ManagedRuntime {
+		a.Health.Register(health.CheckerFunc{
+			CheckName: "runtime-embedding",
+			Level:     health.Optional,
+			Fn: func(ctx context.Context) error {
+				return a.probeRuntime(ctx, runtime.CapabilityEmbedding)
+			},
+		})
+		a.Health.Register(health.CheckerFunc{
+			CheckName: "runtime-rerank",
+			Level:     health.Optional,
+			Fn: func(ctx context.Context) error {
+				return a.probeRuntime(ctx, runtime.CapabilityRerank)
+			},
+		})
+		a.Health.Register(health.CheckerFunc{
+			CheckName: "runtime-ocr",
+			Level:     health.Optional,
+			Fn: func(ctx context.Context) error {
+				return a.probeRuntime(ctx, runtime.CapabilityOCR)
+			},
+		})
+		a.Health.Register(health.CheckerFunc{
+			CheckName: "runtime-pdf-render",
+			Level:     health.Optional,
+			Fn: func(ctx context.Context) error {
+				return a.probeRuntime(ctx, runtime.CapabilityPDFRender)
+			},
+		})
+	}
 	if a.Config.Helpers.LegacyOffice != "" {
 		helper := parser.ExecHelper{
 			Template: a.Config.Helpers.LegacyOffice,
@@ -233,21 +254,34 @@ func (a *App) registerOptionalHealth() {
 		})
 	}
 	if strings.TrimSpace(a.Config.Helpers.LegacyOffice) == "" {
-		registerUnavailable("helper-legacy-office", "legacy office runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
+		if !a.ManagedRuntime {
+			office := parser.NewLibreOfficeHelper()
+			a.Health.Register(health.CheckerFunc{
+				CheckName: "helper-legacy-office",
+				Level:     health.Optional,
+				Fn: func(context.Context) error {
+					if !office.Available() {
+						return fmt.Errorf("LibreOffice is not detected (AUTO_MANAGED_EXTERNAL_RUNTIME); install LibreOffice and rerun doctor")
+					}
+					return nil
+				},
+			})
+		}
 	}
 	if strings.TrimSpace(a.Config.Helpers.ContentConverter) == "" {
 		registerUnavailable("helper-content-converter", "PDF content converter is not configured (MANUAL_EXTERNAL_RUNTIME)")
 	}
-	if strings.TrimSpace(a.Config.Helpers.ImageDecoder) == "" {
+	if strings.TrimSpace(a.Config.Helpers.ImageDecoder) == "" && !a.ManagedRuntime {
 		registerUnavailable("helper-image-decoder", "JBIG2/JPX image decoder is not configured (MANUAL_EXTERNAL_RUNTIME)")
 	}
-	if strings.TrimSpace(a.Config.OCR.Helper) == "" && strings.TrimSpace(a.Config.Runtime.OCRHelper) == "" && strings.TrimSpace(a.Config.Runtime.HelperCommand) == "" {
+	if strings.TrimSpace(a.Config.OCR.Helper) == "" && strings.TrimSpace(a.Config.Runtime.OCRHelper) == "" && strings.TrimSpace(a.Config.Runtime.HelperCommand) == "" &&
+		(a.Runtime == nil || !a.Runtime.Configured(runtime.CapabilityOCR)) {
 		registerUnavailable("helper-ocr", "OCR runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
 	}
-	if strings.TrimSpace(a.Config.OCR.RenderHelper) == "" {
+	if strings.TrimSpace(a.Config.OCR.RenderHelper) == "" && (a.Runtime == nil || !a.Runtime.Configured(runtime.CapabilityPDFRender)) {
 		registerUnavailable("helper-ocr-render", "full-page PDF renderer is not configured (MANUAL_EXTERNAL_RUNTIME)")
 	}
-	if strings.TrimSpace(a.Config.OCR.FallbackHelper) == "" {
+	if strings.TrimSpace(a.Config.OCR.FallbackHelper) == "" && (a.Runtime == nil || !a.Runtime.Configured(runtime.CapabilityOCR)) {
 		registerUnavailable("helper-ocr-fallback", "OCR fallback runtime is not configured (MANUAL_EXTERNAL_RUNTIME)")
 	}
 
@@ -305,14 +339,45 @@ func (a *App) newRuntimeManager() *runtime.Manager {
 		}
 		return time.Duration(ms) * time.Millisecond
 	}
+	command := strings.TrimSpace(a.Config.Runtime.HelperCommand)
+	a.ManagedRuntime = false
+	if command == "" && os.Getenv("SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME") != "1" && strings.TrimSpace(a.Config.Runtime.EmbeddingHelper) == "" &&
+		strings.TrimSpace(a.Config.Runtime.RerankHelper) == "" && strings.TrimSpace(a.Config.Runtime.OCRHelper) == "" {
+		managed, err := runtime.PrepareManagedRuntime(context.Background(), a.Home, a.modelCacheDir())
+		if err != nil {
+			a.Logger.Warn("managed runtime unavailable", "error", err)
+		} else {
+			command = managed
+			a.ManagedRuntime = true
+			if a.Config.Runtime.Offline {
+				command += " --offline"
+			}
+		}
+	}
+	startupTimeout := duration(a.Config.Runtime.StartupTimeoutMS, 10000)
+	// The first managed request may perform npm ci into the private data home.
+	// Do not let the normal helper handshake budget kill that installation.
+	if a.ManagedRuntime && startupTimeout < 120*time.Second {
+		startupTimeout = 120 * time.Second
+	}
 	return runtime.NewManager(runtime.Options{
-		Command:          a.Config.Runtime.HelperCommand,
+		Command:          command,
 		EmbeddingCommand: a.Config.Runtime.EmbeddingHelper,
 		RerankCommand:    a.Config.Runtime.RerankHelper,
 		OCRCommand:       a.Config.Runtime.OCRHelper,
-		StartupTimeout:   duration(a.Config.Runtime.StartupTimeoutMS, 10000),
+		StartupTimeout:   startupTimeout,
 		RequestTimeout:   duration(a.Config.Runtime.RequestTimeoutMS, 60000),
-		IdleTimeout:      duration(a.Config.Runtime.IdleTimeoutMS, 300000),
+		ModelLoadTimeout: func() time.Duration {
+			// A first install may download over a gigabyte of model weights;
+			// keep normal inference timeouts short while giving model lifecycle
+			// operations an explicit, cancellable budget.
+			configured := duration(a.Config.Runtime.RequestTimeoutMS, 60000)
+			if configured < 30*time.Minute {
+				return 30 * time.Minute
+			}
+			return configured
+		}(),
+		IdleTimeout: duration(a.Config.Runtime.IdleTimeoutMS, 300000),
 	})
 }
 
@@ -451,6 +516,47 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 				Lifecycle: models.LifecycleNotInstalled, Runtime: models.LifecycleRuntimeMiss,
 				Artifacts: []string{}, Downloaded: 0,
 			}})
+		}
+	}
+	if a.Runtime != nil {
+		runtimeStatus := a.Runtime.Status(context.Background())
+		addManaged := func(id, kind, capability string) {
+			if strings.TrimSpace(id) == "" || !a.ManagedRuntime || seen[id] {
+				return
+			}
+			health := runtimeStatus[capability]
+			lifecycle := models.LifecycleNotInstalled
+			if health.Lifecycle != "" {
+				lifecycle = health.Lifecycle
+			} else if health.Details != nil && health.Details["lifecycle"] != "" {
+				lifecycle = health.Details["lifecycle"]
+			}
+			lastError := ""
+			runtimePath := health.Path
+			remediation := health.Remediation
+			lastError = health.LastError
+			if health.Details != nil {
+				if lastError == "" {
+					lastError = health.Details["error"]
+				}
+			}
+			status := "not-downloaded"
+			if health.Ready {
+				status = "installed"
+				lifecycle = models.LifecycleReady
+			}
+			views = append(views, LocalModelView{Model: models.Model{
+				ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
+				Ready: health.Ready, Runtime: health.Version, RuntimePath: runtimePath,
+				LastError: lastError, Remediation: remediation,
+			}})
+			seen[id] = true
+		}
+		if a.Config.Embedding.Provider == "local" {
+			addManaged(a.Config.Embedding.Model, models.KindEmbedding, runtime.CapabilityEmbedding)
+		}
+		if a.Config.Rerank.Enabled {
+			addManaged(strings.TrimPrefix(a.Config.Rerank.Model, "local:"), models.KindRerank, runtime.CapabilityRerank)
 		}
 	}
 	return views, nil

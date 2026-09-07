@@ -5,23 +5,24 @@ Reference: dsh-knowledge `v0.3.9`, commit
 
 | Capability | dsh-knowledge | Current Shutu | Final Mode | Test / evidence | Status |
 |---|---|---|---|---|---|
-| Local Embedding | transformers.js + onnxruntime-node, Qwen3 Embedding | Provider plus supervised JSON helper contract; no shipped inference runtime | MANUAL_EXTERNAL_RUNTIME | `internal/embedding/local_test.go` is contract-only; no real runtime/model smoke | FAIL |
-| Local Reranker | BGE cross-encoder in isolated worker/process | Provider plus supervised JSON helper contract; self-test requires configured helper | MANUAL_EXTERNAL_RUNTIME | `internal/rerank/local_test.go`, self-test API, no real model in release | FAIL |
-| OCR | PaddleOCR with Tesseract fallback | Artifact download plus configured OCR helper/fallback | MANUAL_EXTERNAL_RUNTIME | `internal/models/ocr.go`, `internal/parser/helper_runtime.go` | FAIL |
-| PDF Renderer | MuPDF full-page rasterization | Built-in PDF parsing plus optional configured render helper | MANUAL_EXTERNAL_RUNTIME | `internal/parser/pdf_render.go`, renderer fallback tests | FAIL |
-| JBIG2 | Reference decoder path | Optional configured image decoder only | MANUAL_EXTERNAL_RUNTIME | `internal/parser/pdf_external_decoder.go` | FAIL |
-| JPX | Reference decoder path | Optional configured image decoder only | MANUAL_EXTERNAL_RUNTIME | `internal/parser/pdf_external_decoder.go` | FAIL |
-| `.doc` | Anydoc/legacy document conversion | Configured legacy-office converter only | MANUAL_EXTERNAL_RUNTIME | `internal/parser/office.go`, helper process tests | FAIL |
-| `.ppt` | Anydoc/legacy presentation conversion | Configured legacy-office converter only | MANUAL_EXTERNAL_RUNTIME | `internal/parser/office.go`, helper process tests | FAIL |
-| `.xls` | Anydoc/legacy spreadsheet conversion | Configured legacy-office converter only | MANUAL_EXTERNAL_RUNTIME | `internal/parser/office.go`, helper process tests | FAIL |
+| Local Embedding | transformers.js + onnxruntime-node, Qwen3 Embedding | Knowledge-managed Node runtime; pinned model revision and checksum | AUTO_MANAGED_EXTERNAL_RUNTIME | Real Go→Node smoke: Chinese/English/mixed batch, 1024 dimensions, Qwen model | PASS |
+| Local Reranker | BGE cross-encoder in isolated worker/process | Knowledge-managed Node runtime; raw logits converted to bounded scores | AUTO_MANAGED_EXTERNAL_RUNTIME | Real three-candidate BGE ordering: relevant `0.99996` above two unrelated scores near `0.000037` | PASS |
+| OCR | PaddleOCR with Tesseract fallback | Knowledge-managed Tesseract.js `eng+chi_sim` runtime | AUTO_MANAGED_EXTERNAL_RUNTIME | Real PNG, rotated, low-quality, and two-page scanned-PDF OCR/index/retrieval: `Knowledge Runtime OCR 7788`; failure remains per-document | PASS |
+| PDF Renderer | MuPDF full-page rasterization | Knowledge-managed PDF.js + canvas full-page renderer | AUTO_MANAGED_EXTERNAL_RUNTIME | Real PDF→PNG envelope: one rendered page | PASS |
+| JBIG2 | Reference decoder path | Managed PDF.js decoder path; unsupported input fails visibly | AUTO_MANAGED_EXTERNAL_RUNTIME | Real `JBIG2Globals.pdf` PDF-to-PNG smoke | PASS |
+| JPX | Reference decoder path | Managed PDF.js decoder path; unsupported input fails visibly | AUTO_MANAGED_EXTERNAL_RUNTIME | Real `bug_jpx.pdf` PDF-to-PNG smoke | PASS |
+| `.doc` | Anydoc/legacy document conversion | Knowledge-managed MIT `@firecrawl/anydoc` native package | BUNDLED_RUNTIME | Real Apache POI `SampleDoc.doc` Markdown conversion | PASS |
+| `.ppt` | Anydoc/legacy presentation conversion | Knowledge-managed MIT `@firecrawl/anydoc` native package | BUNDLED_RUNTIME | Real Apache POI `37625.ppt` Markdown conversion | PASS |
+| `.xls` | Anydoc/legacy spreadsheet conversion | Knowledge-managed MIT `@firecrawl/anydoc` native package | BUNDLED_RUNTIME | Real Apache POI `finance.xls` Markdown conversion | PASS |
 | Model Download | Downloaded local artifacts | Built-in Hugging Face artifact downloader | BUILT_IN | `internal/models/manager.go` download tests | PASS (artifact only) |
-| Model Validation | Runtime-compatible model load/readiness marker | Non-empty artifact checks; no checksum/load/inference validation | MANUAL_EXTERNAL_RUNTIME | Model manifest inspection | FAIL |
-| Model Inference | Real vector/score inference | Requires manually configured helper | MANUAL_EXTERNAL_RUNTIME | No real inference implementation in repository | FAIL |
-| Offline Restart | Loaded local runtime survives Knowledge restart | No managed runtime/model load to restore | MANUAL_EXTERNAL_RUNTIME | No fresh-install offline runtime scenario | FAIL |
-| Doctor | Runtime/model/component diagnosis | Built-in storage/health diagnosis plus explicit degraded runtime/model state | BUILT_IN | `shutu-knowledge doctor`; cannot install missing runtimes | FAIL |
-| Packaging | Runtime dependencies included by npm package | Go binary and Web assets only; no ML/OCR/Office runtime package | BUNDLED_RUNTIME | `go.mod`, `web/package.json`, release artifacts | FAIL |
+| Model Validation | Runtime-compatible model load/readiness marker | Fixed revisions, file SHA-256, real smoke, persisted runtime state | AUTO_MANAGED_EXTERNAL_RUNTIME | Real Qwen/BGE load and inference; corruption marked FAILED and restored | PASS |
+| Model Inference | Real vector/score inference | Managed Node/ONNX runtime calls existing providers | AUTO_MANAGED_EXTERNAL_RUNTIME | Real Qwen/BGE calls through Go supervisor | PASS |
+| Offline Restart | Loaded local runtime survives Knowledge restart | Private cache and state reload without download | AUTO_MANAGED_EXTERNAL_RUNTIME | Real offline restart smoke on Qwen cache | PASS |
+| Doctor | Runtime/model/component diagnosis | Core health plus managed runtime status/version/lifecycle output | BUILT_IN | `shutu-knowledge doctor`; first probe installs package lock | PASS |
+| Packaging | Runtime dependencies included by npm package | Go binary embeds JS/lock/manifest; Node is fixed-download fallback | AUTO_MANAGED_EXTERNAL_RUNTIME | Clean data home installed embedded lock; runtime smoke passed | PASS |
 | System Prompt Guidance | `systemPrompt.section` | No public Extension v1 prompt-guidance channel | BLOCKED_BY_AGENT | `docs/agent_extension_gap_report.md` GAP-001 | BLOCKED_BY_AGENT / NON-BLOCKING |
 
-`PASS (artifact only)` is deliberately not an Out-of-Box parity pass. The
-strict final status is `FAIL` whenever the requested behavior still needs a
-user-installed or user-authored runtime.
+The managed ML, OCR, PDF codec, and Office paths no longer require a
+user-authored helper. Windows implementation and real smoke are passing; the
+strict final status becomes `PASS` only after the Linux `runtime-release` CI
+job also passes. Explicit external services such as MinerU remain optional.

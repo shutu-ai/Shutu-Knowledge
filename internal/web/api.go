@@ -908,7 +908,19 @@ func (s *Server) runtimeStatus(w http.ResponseWriter, r *http.Request) {
 		writeOK(w, map[string]any{"status": map[string]runtime.Health{}})
 		return
 	}
-	writeOK(w, map[string]any{"status": s.app.Runtime.Status(r.Context())})
+	// Keep the Web contract scoped to capabilities that have an actual
+	// configured provider. Manager.Status also carries explicit
+	// NOT_CONFIGURED entries for Doctor and other diagnostics, but exposing
+	// those as live runtimes makes a disabled/default deployment look as if it
+	// had phantom helpers.
+	all := s.app.Runtime.Status(r.Context())
+	configured := make(map[string]runtime.Health, len(all))
+	for capability, health := range all {
+		if s.app.Runtime.Configured(capability) {
+			configured[capability] = health
+		}
+	}
+	writeOK(w, map[string]any{"status": configured})
 }
 
 type localModelDownloadRequest struct {
@@ -923,6 +935,18 @@ func (s *Server) downloadLocalModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID, err := s.app.Jobs.Submit("download-model", body.ID, 100, func(ctx context.Context, report func(progress int)) error {
+		if s.app.ManagedRuntime && (body.Kind == models.KindEmbedding || body.Kind == models.KindRerank) {
+			managed, ok := s.app.Runtime.(runtime.ManagedModelController)
+			if !ok {
+				return errors.New("managed runtime model control is unavailable")
+			}
+			report(5)
+			if _, err := managed.LoadModel(ctx, body.Kind, body.ID); err != nil {
+				return err
+			}
+			report(100)
+			return nil
+		}
 		return s.app.Models.Download(ctx, models.DownloadRequest(body), report)
 	})
 	if err != nil {
@@ -947,6 +971,27 @@ func (s *Server) removeLocalModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		normalizedID := strings.TrimPrefix(body.ID, "local:")
+		if s.app.ManagedRuntime {
+			for _, candidate := range []struct{ id, capability string }{
+				{id: s.app.Config.Embedding.Model, capability: runtime.CapabilityEmbedding},
+				{id: strings.TrimPrefix(s.app.Config.Rerank.Model, "local:"), capability: runtime.CapabilityRerank},
+			} {
+				if candidate.id == normalizedID {
+					managed, managedOK := s.app.Runtime.(runtime.ManagedModelController)
+					if !managedOK {
+						writeErr(w, errors.New("managed runtime model control is unavailable"))
+						return
+					}
+					if removeErr := managed.RemoveModel(r.Context(), candidate.capability, normalizedID); removeErr != nil {
+						writeErr(w, removeErr)
+						return
+					}
+					writeOK(w, map[string]bool{"removed": true})
+					return
+				}
+			}
+		}
 		if customErr := s.app.Knowledge.DeleteCustomReranker(body.ID); customErr != nil {
 			writeErr(w, errors.Join(err, customErr))
 			return

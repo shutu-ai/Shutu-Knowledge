@@ -41,6 +41,16 @@ but does not apply to the dependency used by this release.
 | MinerU | Optional remote processing service | Service/upstream terms apply; the AGPL-capable mupdf path observed in the reference is not a Knowledge dependency. |
 | Tesseract or another OCR command | Optional deployment-provided executable | The operator-selected binary and version govern its terms; not bundled. |
 
+## Managed runtime additions
+
+The default Knowledge runtime installs the pinned JavaScript packages and
+language/model artifacts listed in
+[`docs/runtime_license_inventory.md`](docs/runtime_license_inventory.md) into a
+private data directory on first use. They are not copied from the dsh reference
+repository. The inventory records package versions, licenses, source URLs, and
+the separate model/language-data terms required for redistribution or offline
+deployment.
+
 This is maintained from `go.mod` and `web/package.json`. Additions must add a
 row before release; transitive license changes must be re-checked.
 

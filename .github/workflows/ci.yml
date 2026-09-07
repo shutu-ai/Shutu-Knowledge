@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -67,3 +68,23 @@ jobs:
         run: npm run test:e2e
         env:
           SHUTU_KNOWLEDGE_BROWSER: google-chrome
+
+  # The ordinary build job is intentionally hermetic and does not download
+  # multi-gigabyte model weights. Release tags and an explicit manual run
+  # execute the real managed-runtime contract on Linux as well.
+  runtime-release:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Download Go modules
+        run: go mod download
+      - name: Real managed runtime smoke
+        run: go run ./scripts/runtime_smoke.go -home "$RUNNER_TEMP/shutu-runtime-home" -model-cache "$RUNNER_TEMP/shutu-runtime-model-cache"
+      - name: Offline managed runtime restart smoke
+        run: go run ./scripts/runtime_smoke.go -home "$RUNNER_TEMP/shutu-runtime-home" -model-cache "$RUNNER_TEMP/shutu-runtime-model-cache" -offline-restart

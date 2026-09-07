@@ -13,11 +13,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/extension"
+	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 	"github.com/shutu-ai/shutu-knowledge/internal/version"
 	"github.com/shutu-ai/shutu-knowledge/internal/web"
@@ -125,6 +127,27 @@ func cmdDoctor(ctx context.Context) error {
 	out, _ := json.MarshalIndent(report.Components, "", "  ")
 	fmt.Println("health:", report.Status)
 	fmt.Println(string(out))
+	var doctorRuntimeStatus map[string]runtime.Health
+	if application.Runtime != nil {
+		runtimeStatus := application.Runtime.Status(ctx)
+		doctorRuntimeStatus = runtimeStatus
+		runtimeOut, _ := json.MarshalIndent(runtimeStatus, "", "  ")
+		fmt.Println("runtime status:")
+		fmt.Println(string(runtimeOut))
+		for _, capability := range []string{
+			"embedding", "rerank", "ocr", "pdf_render", "office",
+		} {
+			health := runtimeStatus[capability]
+			status := "WARN"
+			if health.Ready {
+				status = "PASS"
+			} else if health.Status == "failed" || health.Lifecycle == "FAILED" {
+				status = "FAIL"
+			}
+			fmt.Printf("runtime %-10s %-4s version=%q path=%q ready=%t lifecycle=%q error=%q remediation=%q\n",
+				capability, status, health.Version, health.Path, health.Ready, health.Lifecycle, health.LastError, health.Remediation)
+		}
+	}
 	localModels, err := application.ListLocalModels()
 	if err != nil {
 		return fmt.Errorf("inspect local models: %w", err)
@@ -142,6 +165,19 @@ func cmdDoctor(ctx context.Context) error {
 	fmt.Println("env:", config.EnvPreview())
 	if !report.Ready {
 		return fmt.Errorf("doctor found failed subsystems")
+	}
+	if doctorRuntimeStatus != nil {
+		for capability, health := range doctorRuntimeStatus {
+			if health.Status == "failed" || health.Lifecycle == "FAILED" {
+				return fmt.Errorf("doctor found failed runtime %s: %s", capability, strings.TrimSpace(health.LastError))
+			}
+			if capability == "embedding" && application.Config.Embedding.Provider == "local" && !health.Ready {
+				return fmt.Errorf("doctor found unavailable local embedding runtime: %s", health.Remediation)
+			}
+			if capability == "rerank" && application.Config.Rerank.Enabled && strings.HasPrefix(application.Config.Rerank.Model, "local:") && !health.Ready {
+				return fmt.Errorf("doctor found unavailable local reranker runtime: %s", health.Remediation)
+			}
+		}
 	}
 	return nil
 }

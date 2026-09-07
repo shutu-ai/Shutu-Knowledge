@@ -17,8 +17,8 @@ Status: Phase 0 design. Derived from the audited dsh-knowledge behavior (`dsh_kn
 | Database | SQLite via `modernc.org/sqlite` (pure Go) with FTS5 | parity with dsh `node:sqlite` + FTS5 trigram; no cgo, portable builds |
 | Schema management | versioned embedded migrations (own runner) | Gate: no scattered `CREATE TABLE IF NOT EXISTS` in business code |
 | Web UI | React + TypeScript + Vite, embedded into the Go binary (`go:embed`) | independent build pipeline, native navigation via web contribution |
-| Local ML (embedding/rerank) | optional helper process (Node + transformers.js, same model families as dsh), health-checked and auto-discovered; remote OpenAI-compatible/Ollama providers work without it | avoids cgo/onnxruntime build burden; optional runtime is explicitly allowed by the requirements |
-| OCR | isolated PaddleOCR/helper runtime as primary, optional deployment-supplied full-page PDF renderer, and optional Tesseract command fallback; native text extraction first | OCR failure must not break parseable text; rendering and inference are never bundled |
+| Local ML (embedding/rerank) | Knowledge-managed Node + transformers.js + ONNX Runtime, with pinned model revisions, checksums, and supervised lifecycle; remote OpenAI-compatible/Ollama providers remain available | runtime package and lockfile are embedded; model weights stay in the Knowledge data domain |
+| OCR | managed Tesseract.js runtime plus managed PDF.js full-page renderer; native text extraction first and OCR fallback/forced modes retained | OCR failure must not break parseable text; all runtime state remains in Knowledge |
 | MinerU | remote HTTP processor (batch/upload/poll/download), fallback to local chain | parity with PRS-12 |
 
 ## 3. Process model

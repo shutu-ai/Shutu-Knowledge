@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "runtime": {
+    "node": {
+      "version": "22.14.0",
+      "platforms": {
+        "windows-amd64": {
+          "source": "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip",
+          "sha256": "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217"
+        },
+        "linux-amd64": {
+          "source": "https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz",
+          "sha256": "69b09dba5c8dcb05c4e4273a4340db1005abeafe3927efda2bc5b249e80437ec"
+        }
+      },
+      "license": "Node.js license; official bundled notices"
+    },
+    "npm": {
+      "packageLock": "internal/runtime/assets/package-lock.json",
+      "installMode": "Knowledge data home, npm ci --ignore-scripts"
+    },
+    "models": [
+      {
+        "component": "embedding",
+        "model": "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+        "revision": "c25a394dd583836952667c12f008335071b3f43d",
+        "runtime": "transformers.js/onnxruntime-node",
+        "dimension": 1024,
+        "license": "upstream model terms",
+        "files": {
+          "config.json": "66a10929782f3c9a3cd5dec90e2a95c60e05736134a63cd54479eeae80bed175",
+          "tokenizer_config.json": "977648852447cb6587327ff3205b0a84cf2fc9f05621d6c8e88a497caafab2e1",
+          "tokenizer.json": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
+          "onnx/model_q4.onnx": "8be554b37368134c3f38613c6f6ad0b7bb5f3a6465ab87574dbc0dcf24daa428"
+        }
+      },
+      {
+        "component": "rerank",
+        "model": "Xenova/bge-reranker-base",
+        "revision": "280bcc27a84e0b898c251e06fddb25171bd9b101",
+        "runtime": "transformers.js/onnxruntime-node",
+        "license": "upstream model terms",
+        "files": {
+          "config.json": "b6575b9d5be20d6747417c8e20c5a0db1636356e0b6d422d7244c628423c4d4c",
+          "tokenizer_config.json": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+          "tokenizer.json": "48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c",
+          "onnx/model.onnx": "15b9a8c3da82eddf263df571281166e00e9308fe19d077084b642ebfcaf06d2b"
+        }
+      }
+    ],
+    "ocr": {
+      "component": "tesseract.js",
+      "version": "7.0.0",
+      "languages": {
+        "eng": {
+          "source": "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz",
+          "compressedSha256": "45b4cb346724ac1774f1c36f42f182b887bcdb28ebe63e6fff90ac41f3fcff91",
+          "sha256": "5dc5d8d640a212c9d6184921ba103b186f50e0fed9ee716c53e6b312b400d747"
+        },
+        "chi_sim": {
+          "source": "https://cdn.jsdelivr.net/npm/@tesseract.js-data/chi_sim/4.0.0_best_int/chi_sim.traineddata.gz",
+          "compressedSha256": "b8a23f10c7de500891eb458a8adc9cc58ab7f242f08b7d149f5e9aea4ad5db7c",
+          "sha256": "9784f7c917c546424b690fcde708ce1f604a4393d08bb51ddab146d7d7c794e6"
+        }
+      },
+      "license": "Apache-2.0 and Tesseract language-data terms"
+    },
+    "pdf": {
+      "component": "pdfjs-dist",
+      "version": "6.3.289",
+      "license": "Apache-2.0"
+    },
+    "office": {
+      "component": "@firecrawl/anydoc",
+      "version": "0.2.4",
+      "formats": ["doc", "ppt", "xls"],
+      "license": "MIT"
+    }
+  }
+}

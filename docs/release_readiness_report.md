@@ -23,7 +23,7 @@ Audit date: 2026-09-06
 | 6 | Architecture | PASS | CI rejects Agent internal imports; SDK imports are confined to `internal/extension`; the local Agent baseline remains unchanged. |
 | 7 | One-way dependency | PASS | Only `internal/extension` imports `github.com/shutu-ai/shutu-agent/sdk/extension`; Agent does not depend on Knowledge. |
 | 8 | License | PASS | Shutu-Knowledge is Apache-2.0; dsh-knowledge remains an AGPL-3.0 behavioral reference only; `shutu-agent v0.2.1` is explicitly Apache-2.0 licensed and includes `LICENSE`. |
-| 9 | Source provenance | PASS | `docs/release_source_provenance_audit.md` records manual and mechanical review. The dependency-only release cleanup introduces no new source reuse. |
+| 9 | Source provenance | PASS | `docs/release_source_provenance_audit.md` records manual and mechanical review. The independently authored managed runtime adds only inventoried third-party packages and model artifacts; no dsh source is reused. |
 | 10 | Capability status | PASS | Core Go, race, Web contract, E2E, real-process lifecycle/removal, and benchmark suites remain passing. GAP-001 and GAP-002 remain documented non-blocking upstream contract limitations. |
 
 ## Dependency And License Findings

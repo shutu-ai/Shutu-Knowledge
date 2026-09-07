@@ -735,6 +735,9 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 }
 
 func TestRuntimeStatusExposesOnlyConfiguredHelpers(t *testing.T) {
+	// Keep this API contract test hermetic. Managed runtime behavior is covered
+	// by internal/runtime tests and the explicit real-runtime smoke suite.
+	t.Setenv("SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME", "1")
 	s := newTestServer(t)
 	code, payload := call(t, s, "GET", "/api/runtime-status", nil)
 	if code != http.StatusOK {

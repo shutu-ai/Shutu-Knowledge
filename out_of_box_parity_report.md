@@ -14,35 +14,36 @@ status. See [the audit](docs/out_of_box_parity_audit.md),
 
 ### A — Local Embedding
 
-**NO.** Knowledge validates and supervises a configured helper, but the release
-does not contain or automatically install a real embedding inference runtime.
+**YES (managed).** The default path embeds a pinned Node runtime bootstrap,
+installs Transformers.js/ONNX dependencies privately, verifies the Qwen model,
+and performs real vector inference through the Knowledge supervisor.
 
 ### B — Local Reranker
 
-**NO.** The provider and self-test are real integration surfaces, but inference
-still requires a manually configured helper and model.
+**YES (managed).** The default path loads the pinned BGE cross-encoder and
+returns bounded raw-logit scores through the same supervised runtime.
 
 ### C — OCR without a user-developed helper
 
-**NO.** The PaddleOCR artifact workflow does not include the recognizer runtime;
-OCR remains dependent on a deployment-supplied helper or fallback command.
+**YES (managed).** Tesseract.js with `eng+chi_sim` is installed and invoked by
+the managed runtime; per-document failure handling remains intact.
 
 ### D — PDF rasterization
 
-**NO.** Supported embedded image codecs are built in, but full-page rendering
-for vector-only/scanned workflows requires a manually configured renderer.
-JBIG2 and JPX require a manually configured decoder.
+**YES (managed).** PDF.js and canvas render full pages without a user helper;
+real JBIG2 and JPX PDF fixtures both rendered to validated PNG pages.
 
 ### E — Legacy Office
 
-**NO.** `.doc`, `.ppt`, and `.xls` dispatch to a configured converter; no
-automatic discovery, installation, or bundled converter is shipped.
+**YES (managed).** The default path uses the managed MIT Anydoc package, with
+LibreOffice discovery as fallback. Real `.doc`, `.ppt`, and non-empty `.xls`
+fixtures converted to Markdown successfully.
 
 ### F — Model lifecycle
 
-**NO.** Artifact download works, but download → validated load → inference →
-restart is not a complete product-managed loop. The API now reports a complete
-artifact set as `INSTALLED`, not `READY`.
+**YES (managed).** Fixed revisions and file checksums feed a real load/inference
+smoke test; corruption becomes `FAILED`, restoration reloads successfully, and
+an offline restart passes with remote model/OCR access disabled.
 
 ### G — Agent modification
 
@@ -66,24 +67,25 @@ diagnostics.
 
 | Gate | Result | Reason |
 |---|---|---|
-| A Local Embedding | FAIL | Manual external inference runtime required |
-| B Local Reranker | FAIL | Manual external inference runtime required |
-| C OCR | FAIL | Manual external OCR runtime required |
-| D PDF Renderer | FAIL | Manual external renderer required |
-| E Legacy Office | FAIL | Manual external converter required |
-| F Model Lifecycle | FAIL | No runtime load/inference readiness loop |
+| A Local Embedding | PASS | Managed Node/Transformers.js/ONNX runtime and real smoke |
+| B Local Reranker | PASS | Managed BGE load and score ordering smoke |
+| C OCR | PASS | Managed Tesseract.js OCR smoke |
+| D PDF Renderer | PASS | Full-page, JBIG2, and JPX PDF→PNG smokes pass |
+| E Legacy Office | PASS | Real `.doc/.ppt/.xls` conversions pass |
+| F Model Lifecycle | PASS | Checksums, real inference, corruption recovery, offline restart |
 | G No Agent Modification | PASS | Agent remains unchanged |
 | H No Agent Internal Import | PASS | Production imports remain public SDK only |
-| I License | PASS for current package; parity runtimes not selected | No new runtime is redistributed |
-| J Fresh Install | FAIL | Fresh install cannot complete local Embedding/OCR/Office/Reranker paths |
-| K Regression | PASS | Current Go build/vet/test/race, Web typecheck/contract/build/Chrome E2E, and Extension integration suites pass after the lifecycle-state correction |
+| I License | PASS | Managed package and model terms are inventoried |
+| J Fresh Install | PASS | Clean data home installed embedded lock and ran managed smoke |
+| K Regression | PASS | Go packages, runtime adapters, Web tests, and managed smoke pass |
 
 ## Final result
 
-The repository is V1 Release Ready, but the requested Out-of-Box runtime parity
-is not complete because the local ML, OCR, PDF-rendering, and legacy Office
-paths still require manual external runtime configuration.
+The requested runtime implementation is present and its Windows real-runtime
+evidence passes. Final Out-of-Box parity certification remains gated on the
+Linux `runtime-release` CI job; optional MinerU and Agent prompt-channel gaps
+remain outside this runtime implementation.
 
 ```text
-SHUTU-KNOWLEDGE OUT-OF-BOX PARITY NOT READY
+SHUTU-KNOWLEDGE OUT-OF-BOX PARITY READY (AFTER runtime-release CI PASS)
 ```

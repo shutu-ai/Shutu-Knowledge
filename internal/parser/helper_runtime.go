@@ -15,6 +15,14 @@ type RuntimeHelper struct {
 	artifacts func() (path string, ready bool)
 }
 
+// OCRConfidenceRunner is an optional richer OCR surface. The managed
+// Tesseract runtime exposes confidence so Knowledge can retry rotated pages
+// and select the best orientation without changing the legacy HelperRunner
+// contract used by external deployments.
+type OCRConfidenceRunner interface {
+	RunWithConfidence(ctx context.Context, format string, input []byte) (text string, confidence float64, err error)
+}
+
 // NewRuntimeHelper adapts the shared runtime manager to the parser helper
 // contract. It returns nil when no OCR runtime is configured.
 func NewRuntimeHelper(manager runtime.Caller) *RuntimeHelper {
@@ -47,8 +55,15 @@ func (h *RuntimeHelper) Available() bool {
 }
 
 func (h *RuntimeHelper) Run(ctx context.Context, format string, input []byte) (string, error) {
+	text, _, err := h.RunWithConfidence(ctx, format, input)
+	return text, err
+}
+
+// RunWithConfidence returns the recognized text and the runtime-reported
+// confidence when the underlying OCR engine provides it.
+func (h *RuntimeHelper) RunWithConfidence(ctx context.Context, format string, input []byte) (string, float64, error) {
 	if !h.Available() {
-		return "", fmt.Errorf("OCR runtime is not configured")
+		return "", 0, fmt.Errorf("OCR runtime is not configured")
 	}
 	params := map[string]any{
 		"format": format,
@@ -60,11 +75,12 @@ func (h *RuntimeHelper) Run(ctx context.Context, format string, input []byte) (s
 		}
 	}
 	var payload struct {
-		Text string `json:"text"`
+		Text       string  `json:"text"`
+		Confidence float64 `json:"confidence"`
 	}
 	err := h.manager.Call(ctx, runtime.CapabilityOCR, params, &payload)
 	if err != nil {
-		return "", fmt.Errorf("OCR runtime: %w", err)
+		return "", 0, fmt.Errorf("OCR runtime: %w", err)
 	}
-	return payload.Text, nil
+	return payload.Text, payload.Confidence, nil
 }

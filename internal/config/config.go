@@ -136,6 +136,10 @@ type Config struct {
 		// HelperCommand is the default optional ML helper. It speaks the
 		// line-delimited JSON contract implemented by internal/runtime.
 		HelperCommand string `yaml:"helperCommand" json:"helperCommand"`
+		// Offline prevents the managed runtime from reaching remote model or
+		// language-data sources. It is intended for an already-installed
+		// runtime cache and makes offline restart an explicit product mode.
+		Offline bool `yaml:"offline" json:"offline"`
 		// Capability commands override HelperCommand when deployments split
 		// model runtimes. All commands are optional.
 		EmbeddingHelper  string `yaml:"embeddingHelper" json:"embeddingHelper"`
@@ -288,6 +292,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("SHUTU_KNOWLEDGE_RUNTIME_HELPER"); v != "" {
 		cfg.Runtime.HelperCommand = v
+	}
+	if v := os.Getenv("SHUTU_KNOWLEDGE_OFFLINE"); v != "" {
+		cfg.Runtime.Offline = strings.EqualFold(strings.TrimSpace(v), "1") || strings.EqualFold(strings.TrimSpace(v), "true") || strings.EqualFold(strings.TrimSpace(v), "yes")
 	}
 	if v := os.Getenv("SHUTU_KNOWLEDGE_EMBEDDING_HELPER"); v != "" {
 		cfg.Runtime.EmbeddingHelper = v

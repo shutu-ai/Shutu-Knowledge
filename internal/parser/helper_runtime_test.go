@@ -27,9 +27,11 @@ func (f *fakeOCRRuntime) Call(_ context.Context, capability string, rawParams an
 	f.data = params["data"].(string)
 	f.modelPath, _ = params["modelPath"].(string)
 	target := out.(*struct {
-		Text string `json:"text"`
+		Text       string  `json:"text"`
+		Confidence float64 `json:"confidence"`
 	})
 	target.Text = "scanned"
+	target.Confidence = 95
 	return nil
 }
 

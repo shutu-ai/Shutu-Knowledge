@@ -29,7 +29,7 @@ type Service struct {
 	raw          *storage.RawFileStore
 	parsers      *parser.Registry
 	ocr          parser.HelperRunner
-	ocrRenderer  parser.ExecHelper
+	ocrRenderer  parser.PageRenderer
 	content      parser.HelperRunner
 	imageDecoder parser.ExecHelper
 	global       config.Config
@@ -85,11 +85,11 @@ func (s *Service) setOCRRenderer(helper parser.ExecHelper) {
 		s.ocrRenderer = helper
 		return
 	}
-	s.ocrRenderer = parser.ExecHelper{}
+	s.ocrRenderer = nil
 }
 
 func (s *Service) ocrRendererAvailable() bool {
-	return strings.TrimSpace(s.global.OCR.RenderHelper) != "" && s.ocrRenderer.Available()
+	return s.ocrRenderer != nil && s.ocrRenderer.Available()
 }
 
 // SetRuntime attaches the optional isolated ML process manager. It is called
@@ -97,6 +97,9 @@ func (s *Service) ocrRendererAvailable() bool {
 func (s *Service) SetRuntime(manager runtime.Caller) {
 	s.runtime = manager
 	s.applyConfiguredProviders()
+	if strings.TrimSpace(s.global.OCR.RenderHelper) == "" {
+		s.ocrRenderer = parser.NewRuntimeRenderer(manager)
+	}
 	s.selectOCR()
 }
 
@@ -105,6 +108,19 @@ func (s *Service) SetRuntime(manager runtime.Caller) {
 func (s *Service) SetOCRArtifactProvider(provider func() (string, bool)) {
 	s.ocrArtifacts = provider
 	s.selectOCR()
+}
+
+// SetLegacyOfficeRunner installs the built-in LibreOffice adapter or removes
+// the legacy parser when the runtime is unavailable. The parser registry is
+// the single source of truth for both API capability reporting and ingestion.
+func (s *Service) SetLegacyOfficeRunner(runner parser.HelperRunner) {
+	if runner == nil {
+		runner = parser.NewRuntimeOfficeHelper(s.runtime)
+		if runner == nil {
+			runner = parser.NewLibreOfficeHelper()
+		}
+	}
+	s.parsers.SetLegacyHelper(runner)
 }
 
 func (s *Service) selectOCR() {
@@ -186,7 +202,7 @@ func (s *Service) SetGlobalConfig(cfg config.Config) {
 			TimeoutMS: 120_000,
 		})
 	} else {
-		s.parsers.SetLegacyHelper(nil)
+		s.SetLegacyOfficeRunner(nil)
 	}
 	if strings.TrimSpace(s.global.Helpers.ContentConverter) != "" {
 		s.content = parser.ExecHelper{
@@ -208,6 +224,9 @@ func (s *Service) SetGlobalConfig(cfg config.Config) {
 		Template:  s.global.OCR.RenderHelper,
 		TimeoutMS: s.global.OCR.RenderTimeoutMS,
 	})
+	if strings.TrimSpace(s.global.OCR.RenderHelper) == "" {
+		s.ocrRenderer = parser.NewRuntimeRenderer(s.runtime)
+	}
 	s.selectOCR()
 }
 

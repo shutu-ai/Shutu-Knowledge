@@ -68,10 +68,12 @@ the declared route to it.
 
 ## Optional Runtimes
 
-Embedding, reranking, and OCR inference are currently manually configured
-external helper processes described in [models.md](models.md); this is not an
-out-of-box runtime installation. MinerU, legacy office conversion, and PDF
-content-signature conversion are optional external document services. Configure commands through
+Embedding, reranking, OCR inference, PDF full-page rendering, and legacy Office
+conversion use a Knowledge-managed runtime by default, described in
+[models.md](models.md). The runtime package is installed into the Knowledge data
+domain on first use. Explicit helper commands remain supported as deployment
+overrides. MinerU and PDF content-signature conversion are optional external
+document services. Configure commands through
 [configuration.md](configuration.md), then verify readiness with:
 
 ```sh

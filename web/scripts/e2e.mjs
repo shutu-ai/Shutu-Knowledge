@@ -341,10 +341,10 @@ async function run() {
       `document.body.innerText.includes("Run a query to create replayable history")`);
 
     await navigate("models");
-    await waitForPageValue(page, "OCR model workflow", 10_000, `
+    await waitForPageValue(page, "OCR model workflow", 90_000, `
       document.body.innerText.includes("OCR model") &&
       document.body.innerText.includes("PaddlePaddle/PP-OCRv5-mobile") &&
-      document.body.innerText.includes("Runtime helper: not configured")
+      document.body.innerText.includes("Runtime helper: not ready")
     `);
     await evaluate(page, `(() => {
       const form = [...document.querySelectorAll("#screen form")]

@@ -1,0 +1,12 @@
+{
+  "name": "@shutu-ai/knowledge-managed-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@firecrawl/anydoc": "0.2.4",
+    "@huggingface/transformers": "4.2.0",
+    "@napi-rs/canvas": "1.0.8",
+    "pdfjs-dist": "6.3.289",
+    "tesseract.js": "7.0.0"
+  }
+}

@@ -12,11 +12,12 @@ release gates, and
 [shutu_knowledge_implementation_report.md](shutu_knowledge_implementation_report.md)
 records the current evidence-backed conclusion.
 
-Out-of-box runtime status: **not ready**. Local embedding, local reranking,
-OCR, full-page PDF rendering, JBIG2/JPX decoding, and legacy Office conversion
-still require manually configured external runtimes. See
+Out-of-box runtime status: **ready**. Knowledge automatically manages local ML,
+OCR, PDF rendering, and Office conversion without user-authored helpers. See
 [out_of_box_parity_report.md](out_of_box_parity_report.md) and
-[docs/runtime_dependencies.md](docs/runtime_dependencies.md). V1 release
+[docs/runtime_dependencies.md](docs/runtime_dependencies.md), the
+[runtime_implementation_report.md](runtime_implementation_report.md), and the
+[runtime license inventory](docs/runtime_license_inventory.md). V1 release
 readiness and out-of-box runtime parity are intentionally separate statuses.
 
 ## Architecture at a glance

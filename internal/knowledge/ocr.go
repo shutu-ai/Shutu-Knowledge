@@ -2,11 +2,14 @@ package knowledge
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
+	_ "image/jpeg"
 	"image/png"
 	"math"
+	"strings"
 )
 
 var ocrSharpenKernel = [9]float64{
@@ -19,7 +22,7 @@ var ocrSharpenKernel = [9]float64{
 // rasters are doubled, then converted to grayscale, contrast-stretched, and
 // mildly sharpened before the deployment-supplied recognizer sees them.
 func prepareOCRImage(pngData []byte) ([]byte, error) {
-	source, err := png.Decode(bytes.NewReader(pngData))
+	source, _, err := image.Decode(bytes.NewReader(pngData))
 	if err != nil {
 		return nil, fmt.Errorf("decode OCR raster: %w", err)
 	}
@@ -106,6 +109,120 @@ func prepareOCRImage(pngData []byte) ([]byte, error) {
 		return nil, fmt.Errorf("encode prepared OCR raster: %w", err)
 	}
 	return encoded.Bytes(), nil
+}
+
+// rotateOCRImage creates an orientation candidate for scanned pages. PDF
+// renderers preserve page rotation in the resulting bitmap, while Tesseract
+// does not reliably auto-orient every mixed CJK/Latin page. The managed OCR
+// path uses the engine confidence to select among these bounded candidates.
+func rotateOCRImage(data []byte, degrees int) ([]byte, error) {
+	source, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode OCR rotation candidate: %w", err)
+	}
+	bounds := source.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("OCR rotation raster has no pixels")
+	}
+	degrees = ((degrees % 360) + 360) % 360
+	if degrees == 0 {
+		return data, nil
+	}
+	rotatedWidth, rotatedHeight := width, height
+	if degrees == 90 || degrees == 270 {
+		rotatedWidth, rotatedHeight = height, width
+	}
+	rotated := image.NewRGBA(image.Rect(0, 0, rotatedWidth, rotatedHeight))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			destinationX, destinationY := x, y
+			switch degrees {
+			case 90:
+				destinationX, destinationY = height-1-y, x
+			case 180:
+				destinationX, destinationY = width-1-x, height-1-y
+			case 270:
+				destinationX, destinationY = y, width-1-x
+			}
+			rotated.Set(destinationX, destinationY, source.At(bounds.Min.X+x, bounds.Min.Y+y))
+		}
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, rotated); err != nil {
+		return nil, fmt.Errorf("encode OCR rotation candidate: %w", err)
+	}
+	return encoded.Bytes(), nil
+}
+
+// runOCRImage recognizes a raster after bounded orientation candidates. The
+// richer managed helper reports Tesseract confidence; external helpers keep
+// the old single-call behavior because they may have their own orientation
+// handling and do not expose comparable confidence.
+func (s *Service) runOCRImage(ctx context.Context, data []byte) (string, bool) {
+	if s == nil || s.ocr == nil || !s.ocr.Available() {
+		return "", false
+	}
+	confidenceRunner, hasConfidence := s.ocr.(interface {
+		RunWithConfidence(context.Context, string, []byte) (string, float64, error)
+	})
+	angles := []int{0}
+	if hasConfidence {
+		angles = []int{0, 90, 180, 270}
+	}
+	bestText := ""
+	bestConfidence := -1.0
+	bestQuality := -1.0
+	for _, angle := range angles {
+		candidate, err := rotateOCRImage(data, angle)
+		if err != nil {
+			continue
+		}
+		prepared, err := prepareOCRImage(candidate)
+		if err != nil {
+			continue
+		}
+		var text string
+		confidence := -1.0
+		if confidenceRunner != nil {
+			text, confidence, err = confidenceRunner.RunWithConfidence(ctx, "png", prepared)
+		} else {
+			text, err = s.ocr.Run(ctx, "png", prepared)
+		}
+		text = strings.TrimSpace(text)
+		if err != nil || text == "" {
+			continue
+		}
+		quality := ocrTextQuality(text)
+		if angle == 0 && confidence >= 80 {
+			return postprocessOCRText(text), true
+		}
+		if confidence > bestConfidence || (confidence == bestConfidence && quality > bestQuality) {
+			bestText, bestConfidence, bestQuality = text, confidence, quality
+		}
+	}
+	if bestText == "" {
+		return "", false
+	}
+	return postprocessOCRText(bestText), true
+}
+
+func ocrTextQuality(text string) float64 {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+	var useful, total int
+	for _, value := range text {
+		total++
+		if (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+			(value >= '0' && value <= '9') || isCJKRune(value) {
+			useful++
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return float64(useful) / float64(total)
 }
 
 func isCJKRune(value rune) bool {

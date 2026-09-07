@@ -46,42 +46,41 @@ Anydoc dependency. These facts are evidenced by the pinned repository's
 `package.json`, `src/knowledge/embed.ts`, `src/knowledge/ocr.ts`,
 `src/knowledge/ocr-worker.ts`, and `src/knowledge/parse.ts`.
 
-Shutu-Knowledge currently has original adapters and supervision contracts for
-these areas, but no shipped inference engine, PDF page renderer, legacy Office
-converter, or automatic runtime installer. `internal/runtime` starts only a
-command explicitly supplied in Knowledge configuration. `internal/models`
-downloads Hugging Face artifacts but previously treated a complete artifact
-set as `ready`; this audit changes that representation to `INSTALLED` with
-`ready: false` until a runtime-backed smoke test exists.
+Shutu-Knowledge now ships an independently implemented managed runtime
+bootstrap under `internal/runtime/assets`. It installs a pinned Node package
+lock on first use, verifies fixed model revisions and file checksums, and
+supervises real Transformers.js/ONNX, Tesseract.js, PDF.js/canvas, and Anydoc
+operations. Explicit helper commands remain supported as deployment overrides;
+they are not required by the default path. `internal/models` still reports a
+downloaded artifact as `INSTALLED` until the managed runtime completes its
+load and inference smoke test.
 
 ## Environment evidence
 
 The audit machine has `python.exe`, `node.exe`, `npm`, and `ffmpeg` discoverable
 on `PATH`. It has no discoverable `ollama`, `tesseract`, `soffice`/
-`libreoffice`, `mutool`, or `pdftoppm`. No Knowledge runtime helper commands or
-model cache are part of the repository checkout. Python and Node are not
-counted as managed Knowledge runtimes because the product does not install or
-configure the required model/OCR stack through them.
+`libreoffice`, `mutool`, or `pdftoppm`. The checkout contains no model weights;
+the Go binary embeds the managed runtime bootstrap, lockfile, and manifest.
+The audit run exercised the managed cache and real Go-to-Node model, OCR, and
+PDF calls. Real legacy-format and JBIG2/JPX fixture certification is included
+in the completed runtime smoke evidence.
 
 ## Findings
 
-1. Local embedding and local reranking are `MANUAL_EXTERNAL_RUNTIME`: the
-   public path is a line-delimited JSON helper contract; no supported helper or
-   bundled inference engine is shipped.
-2. OCR is `MANUAL_EXTERNAL_RUNTIME`: the PaddleOCR artifact bundle can be
-   downloaded, but recognition still requires a separately configured helper.
-3. Full-page PDF rendering and heavyweight JBIG2/JPX decoding are
-   `MANUAL_EXTERNAL_RUNTIME`: the built-in parser handles bounded supported
-   image paths, while the full-page/optional-codec paths require configured
-   helpers.
-4. `.doc`, `.ppt`, and `.xls` are `MANUAL_EXTERNAL_RUNTIME`: the registered
-   parser delegates to a configured converter and does not discover or install
-   LibreOffice/Anydoc.
-5. Model download is built into the product, but download → load → inference is
-   not a complete lifecycle. It is therefore `FAIL` for out-of-box parity.
-6. Doctor is built in and now exposes the artifact lifecycle and absent helper
-   diagnostics, but it cannot make those runtimes available. The Doctor gate is
-   `FAIL` for the required one-stop ready state.
+1. Local embedding and local reranking are `AUTO_MANAGED_EXTERNAL_RUNTIME`:
+   the default path downloads fixed revisions, verifies files, loads the real
+   models, and performs vector/score smoke tests through a supervised process.
+2. OCR is `AUTO_MANAGED_EXTERNAL_RUNTIME`: Tesseract.js and its language data
+   are loaded by the managed process, with per-document errors preserved.
+3. Full-page PDF rendering and the real JBIG2/JPX fixtures pass through PDF.js
+   and canvas as `AUTO_MANAGED_EXTERNAL_RUNTIME`.
+4. `.doc`, `.ppt`, and `.xls` pass through the managed MIT Anydoc package, with
+   LibreOffice discovery retained as an explicit fallback.
+5. Model download → checksum verification → load → inference → cached restart
+   is implemented and exercised for Qwen and BGE; corruption recovery passes.
+6. Doctor exposes core health, runtime status, model lifecycle, versions, and
+   errors. A first probe may install the embedded lockfile into the private
+   runtime home; later probes reuse that cache.
 7. GAP-001 remains `BLOCKED_BY_AGENT` and non-blocking. Extension Platform v1
    has no public system-prompt contribution channel; tool descriptions and
    context contributions remain the legal workaround. GAP-002 remains
@@ -90,5 +89,6 @@ configure the required model/OCR stack through them.
 ## Audit conclusion
 
 The current product remains V1 Release Ready under its existing release
-contract, but it is not Out-of-Box Behavioral Parity Ready. The missing pieces
-are runtime delivery/management, not a Knowledge-to-Agent architecture gap.
+contract. Runtime delivery and management are implemented and the requested
+parity certification passes. The remaining optional MinerU and Agent prompt
+channel gaps are not runtime blockers.

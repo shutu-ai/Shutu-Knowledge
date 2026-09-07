@@ -39,6 +39,6 @@ finished.
 - Windows does not implement POSIX mode bits identically. The permission tests
   assert the requested modes on POSIX; Windows deployment should use a private
   user profile/service account directory.
-- ZIP expansion is bounded, but PDF/helper processors still depend on the
-  configured external runtimes. Those runtimes remain optional and isolated and
-  are never bundled or promoted to readiness merely because artifacts exist.
+- ZIP expansion is bounded, and PDF/helper processors remain isolated. Managed
+  runtimes are promoted to readiness only after checksum, load, and inference
+  smoke; explicit external overrides remain optional.

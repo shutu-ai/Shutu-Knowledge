@@ -68,6 +68,10 @@ func NewRegistry(opts ...Option) *Registry {
 	r.byExt["epub"] = office
 	pdf := &pdfParser{}
 	r.byExt["pdf"] = pdf
+	imageParser := &imageParser{}
+	for _, ext := range imageParser.Extensions() {
+		r.byExt[ext] = imageParser
+	}
 	for _, opt := range opts {
 		opt(r)
 	}

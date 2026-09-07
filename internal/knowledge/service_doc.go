@@ -797,6 +797,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseConfig, data []byte) (string, string, error) {
 	cfg = ResolveBaseConfig(s.global, cfg)
 	isPDF := strings.EqualFold(parser.ExtensionOf(doc.FileName), "pdf")
+	isImage := isOCRImageExtension(parser.ExtensionOf(doc.FileName))
 
 	// MinerU remote processing first when configured; any failure falls
 	// back to the local chain.
@@ -817,16 +818,24 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	nativeOK := nativeAvailable && !parsed.NeedsOCR
 
 	mode := s.resolveOCRMode(cfg)
-	ocrUsable := isPDF && s.ocr != nil && s.ocr.Available()
+	ocrUsable := (isPDF || isImage) && s.ocr != nil && s.ocr.Available()
 	contentUsable := isPDF && s.content != nil && s.content.Available()
 	runOCR := func() (string, bool) {
 		if !ocrUsable {
 			return "", false
 		}
-		if renderedText, ok := s.runRenderedPageOCR(ctx, data); ok {
-			return renderedText, true
+		if isPDF {
+			if renderedText, ok := s.runRenderedPageOCR(ctx, data); ok {
+				return renderedText, true
+			}
+		} else if text, ok := s.runOCRImage(ctx, data); ok {
+			return text, true
 		}
-		text, err := s.ocr.Run(ctx, "pdf", data)
+		format := parser.ExtensionOf(doc.FileName)
+		if format == "" {
+			format = "pdf"
+		}
+		text, err := s.ocr.Run(ctx, format, data)
 		trimmed := strings.TrimSpace(text)
 		if err == nil && trimmed != "" {
 			return postprocessOCRText(trimmed), true
@@ -898,6 +907,15 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	return parsed.Text, parsed.Title, fmt.Errorf("contains no extractable text")
 }
 
+func isOCRImageExtension(extension string) bool {
+	switch strings.ToLower(strings.TrimSpace(extension)) {
+	case "png", "jpg", "jpeg":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Service) runEmbeddedRasterOCR(ctx context.Context, data []byte) (string, error) {
 	images, err := parser.ExtractPDFImages(data, s.pdfImageOptions(ctx)...)
 	if err != nil {
@@ -911,12 +929,8 @@ func (s *Service) runEmbeddedRasterOCR(ctx context.Context, data []byte) (string
 		if len(image.PNG) == 0 {
 			continue
 		}
-		prepared, err := prepareOCRImage(image.PNG)
-		if err != nil {
-			continue
-		}
-		text, err := s.ocr.Run(ctx, "png", prepared)
-		if err != nil {
+		text, ok := s.runOCRImage(ctx, image.PNG)
+		if !ok {
 			continue
 		}
 		if processed := postprocessOCRText(strings.TrimSpace(text)); processed != "" {
@@ -960,14 +974,11 @@ func (s *Service) runRenderedPageOCR(ctx context.Context, data []byte) (string, 
 		if err := ctx.Err(); err != nil {
 			return "", false
 		}
-		text, err := s.ocr.Run(ctx, "png", page.PNG)
-		if err != nil {
+		text, ok := s.runOCRImage(ctx, page.PNG)
+		if !ok {
 			continue
 		}
 		processed := postprocessOCRText(strings.TrimSpace(text))
-		if processed == "" {
-			continue
-		}
 		pageTexts[page.Page] = processed
 		orderedPages = append(orderedPages, page.Page)
 	}

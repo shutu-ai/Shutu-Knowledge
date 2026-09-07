@@ -39,10 +39,11 @@ the AGPL source remains outside this repository's distribution.
 | Knowledge bases, documents, jobs | `src/knowledge/index.ts`, `domain.ts`, `store.ts` | Original Go service/store layer over Knowledge-owned SQLite and raw files | No | Clean behavioral reference only | Separate Go types/storage APIs; service and storage tests exercise required behavior without TS/Node architecture | PASS |
 | Text/HTML parsers and ingestion | `src/knowledge/parse.ts` | Go parsers, encoding handling, URL/directory ingestion, and bounded job workflows | No | No AGPL text enters distribution | Parser tests, directory/URL lifecycle tests, and race suite pass | PASS |
 | PDF parsing / caption rasters | `parse.ts`, `caption.ts` | Original Go PDF filter/color/tint/raster implementation; optional deployment decoder contract | No | No AGPL implementation or mupdf dependency bundled | Dedicated parser image/tint/soft-mask/optional-codec tests; optional external process tests | PASS |
-| OCR and full-page rendering | `ocr.ts`, `ocr-worker.ts` | Original Go orchestration and bounded preprocessing; inference and rendering are external deployment processes | No | Inference, renderer binaries, and model weights remain external and separately licensed | Real child-process, fallback, timeout, health, and page-contract tests | PASS |
+| OCR and full-page rendering | `ocr.ts`, `ocr-worker.ts` | Original Go orchestration plus independently authored managed Node adapters for Tesseract.js, PDF.js, and canvas | No | Third-party runtime/package and language-data terms are inventoried separately; no dsh implementation is copied | Real managed OCR/page probes plus child-process, fallback, timeout, health, and page-contract tests | PASS |
 | Chunking and semantic merge | `chunk.ts` | Original Go scoring/refinement with typed pieces and separator decoding | No | Public scoring behavior may align; protectable expression does not | Go chunk/semantic tests and token-limit tests | PASS |
 | Lexical/vector retrieval and context window | `chunkdb.ts`, `retrieval.ts`, `context.ts` | Original Go SQL retrieval, evidence window composer, and typed excerpt fitting | No | Domain/API-compatible names are not source copying; reviewed functions are independently expressed in Go | Exact long-literal overlap 0; focused review of anchor/budget/overlap code; retrieval/context tests | PASS |
-| Embedding/rerank/local model runtime | embed/rerank/local model modules | Original Go provider adapters plus a generic isolated helper protocol | No | Inference engines, model weights, and third-party model terms are external | Runtime lifecycle, score/vector validation, timeout/restart, and self-test tests | PASS |
+| Embedding/rerank/local model runtime | embed/rerank/local model modules | Original Go provider adapters plus independently authored managed Node/Transformers.js adapters and pinned runtime manifest | No | Transformers.js/ONNX packages and model terms are inventoried separately; no dsh implementation is copied | Real Go-to-Node vector/score probes, checksum validation, cached restart, lifecycle API tests | PASS |
+| Legacy Office runtime | `parse.ts` Office dispatch | Independently authored Go bridge to MIT `@firecrawl/anydoc`, with LibreOffice fallback discovery | No | MIT package and optional Office-suite terms are inventoried separately; no dsh converter source is copied | Managed protocol tests and real `.doc/.ppt/.xls` fixture conversions | PASS |
 | Agent tools and auto RAG | `src/tool-knowledge/index.ts` | Original Go Extension adapter and policy implementation over public SDK types | No | Public `shutu-agent` SDK dependency is Apache-2.0 at v0.2.1; no Agent source is bundled | 14-tool catalog, scope/approval, auto-RAG, and real Agent process tests | PASS |
 | Web management UI | `src/ui/client/*.tsx`, `locales.ts` | Independent dependency-free vanilla JavaScript/CSS UI | No | Shared functional labels/config names are compatibility contracts; component architecture differs | React/TSX versus vanilla JS; UI literal overlap limited to generic contract strings; contract test and Chrome CDP E2E | PASS |
 | Tests and benchmarks | `tests/*.spec.ts`, benchmark data | Original Go unit/integration/benchmark/E2E tests using equivalent fixtures and assertions where needed | No | Test parity is behavioral evidence, not copied test code | Go/race suite, Web contract test, CDP E2E, benchmark smoke, and release gates | PASS |
@@ -50,8 +51,9 @@ the AGPL source remains outside this repository's distribution.
 ## Result
 
 No unrecorded direct or translated AGPL source copy was found. Source
-provenance is **PASS**. This release only changes the public Agent module
-version and release documentation; it introduces no new source reuse.
+provenance is **PASS**. The managed runtime is independently authored and uses
+documented third-party packages and model artifacts; its package/license
+inventory is maintained in `docs/runtime_license_inventory.md`.
 
 ### Previous License Blocker
 

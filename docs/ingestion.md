@@ -27,23 +27,25 @@ Two optional dependencies extend this path:
 
 - **MinerU** can process PDFs when selected on a base and supplied an API key
   and host. A MinerU failure falls back to the local parsing/OCR chain.
-- **OCR** runs in an optional helper process, with an optional
+- **OCR** runs in the Knowledge-managed Tesseract.js process by default, with an optional
   deployment-supplied secondary command such as Tesseract. Modes are `auto`
   (healthy native text first, OCR fallback), `forced`, and `off`. When a
-  deployment supplies `ocr.renderHelper`, Knowledge prefers bounded full-page
+  managed PDF.js renderer (or an explicit `ocr.renderHelper` override), Knowledge prefers bounded full-page
   PNG rendering before the OCR runtime. If that renderer or its response is
   unavailable, malformed, or produces no recognized text, Knowledge retries the
   PDF envelope and then bounded embedded page rasters as PNG inputs. Rasters
   are bounded to 100 pages, 200 images, and 512 MB of decoded pixels, then
   prepared with 2x low-resolution upscale, grayscale conversion, contrast
   stretch, and sharpening. Results are grouped by page and horizontal CJK
-  spacing is folded without joining lines. The renderer is deployment-supplied;
+  spacing is folded without joining lines. The default renderer is
+  Knowledge-managed;
   OCR failure never destroys text already recovered from the native parser,
   including a fragmented layer.
 
-Legacy `.doc`, `.ppt`, and `.xls` require an explicitly configured external
-converter; Knowledge does not bundle one. Without it they are reported as
-unsupported rather than silently imported as empty content.
+Legacy `.doc`, `.ppt`, and `.xls` use the Knowledge-managed Anydoc runtime by
+default, with an explicitly configured converter still available as an
+override. Conversion failures are reported rather than silently imported as
+empty content.
 
 PDFs also accept an optional content-signature converter. For empty primary
 text it runs before OCR; for fragmented native text it runs after OCR. This is
@@ -57,8 +59,8 @@ chains, predictors, Indexed palettes, CCITT Group4 and Group3 1D fax streams
 with explicit EOL, 1/2/4/8-bit samples, Separation/DeviceN with sampled,
 stitching, exponential, and calculator tint transforms, and matching soft-mask
 alpha composition, before sending PNG data to the provider. Specialized JPEG
-2000 and JBIG2 images are decoded only when the optional deployment-supplied
-image decoder is configured; without it they are best-effort skips. PDF Pattern
+2000 and JBIG2 images are decoded by the managed PDF.js renderer by default;
+an optional deployment-supplied image decoder remains an override. PDF Pattern
 is a painting color space, not an image XObject sample codec. Decoding and
 captioning are
 best-effort: unsupported rasters or provider failures never prevent import.

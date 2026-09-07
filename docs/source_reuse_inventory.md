@@ -17,7 +17,9 @@ Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this pr
 | Context window composition rules | `src/knowledge/context.ts` | rules captured in `architecture.md` §6; original implementation |
 | Auto-RAG gates and budgets | `src/tool-knowledge/index.ts` | constants captured in inventory §15; original implementation |
 | FTS query compilation (trigram terms, LIKE fallback) | `src/knowledge/chunkdb.ts` | behavior parity via golden tests |
-| OCR full-page rendering, embedded-raster fallback, preprocessing, and raster ceilings | `src/knowledge/ocr.ts`, `src/knowledge/ocr-worker.ts` | independent Go PDF/parser implementation plus a deployment-supplied renderer process contract; no upstream source or native renderer bundled |
+| OCR full-page rendering, embedded-raster fallback, preprocessing, and raster ceilings | `src/knowledge/ocr.ts`, `src/knowledge/ocr-worker.ts` | independent Go PDF/parser implementation plus Knowledge-managed PDF.js/Tesseract runtime; no upstream source copied |
+| Local embedding and reranking | `src/knowledge/embed.ts`, `src/knowledge/rerank-adapter.ts` | independent managed Transformers.js/ONNX runtime using pinned public model artifacts; no dsh runtime source copied |
+| Legacy Office parsing | `src/knowledge/parse.ts` and dsh anydoc dependency behavior | independent integration with the MIT `@firecrawl/anydoc` package; no AGPL source copied |
 | Extension contract usage | shutu-agent `sdk/extension`, `examples/extension` | public API usage per `docs/agent_contract_mapping.md` |
 
 ## Reference baselines (audit evidence)

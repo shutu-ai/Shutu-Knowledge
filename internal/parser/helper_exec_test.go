@@ -8,12 +8,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestHelperProcessLegacy is executed as a child process by ExecHelper tests.
 // It is a no-op in the parent test process.
 func TestHelperProcessLegacy(t *testing.T) {
 	if os.Getenv("SHUTU_PARSER_HELPER_PROCESS") != "1" {
+		return
+	}
+	if os.Getenv("SHUTU_PARSER_HELPER_SLEEP") == "1" {
+		time.Sleep(2 * time.Second)
 		return
 	}
 	fmt.Fprintf(os.Stdout, "converted:%s", os.Getenv("SHUTU_PARSER_HELPER_FORMAT"))

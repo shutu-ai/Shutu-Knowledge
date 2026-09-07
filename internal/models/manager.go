@@ -57,14 +57,16 @@ type Model struct {
 	Artifacts []string `json:"artifacts"`
 	// Status is the artifact/cache status retained for the existing Models UI.
 	// It must not be interpreted as runtime readiness.
-	Status     string   `json:"status"` // installed | incomplete | not-downloaded
-	Lifecycle  string   `json:"lifecycle"`
-	Ready      bool     `json:"ready"`
-	Runtime    string   `json:"runtimeStatus,omitempty"`
-	LastError  string   `json:"lastError,omitempty"`
-	SizeBytes  int64    `json:"sizeBytes"`
-	Downloaded int64    `json:"downloadedAt"`
-	Missing    []string `json:"missing,omitempty"`
+	Status      string   `json:"status"` // installed | incomplete | not-downloaded
+	Lifecycle   string   `json:"lifecycle"`
+	Ready       bool     `json:"ready"`
+	Runtime     string   `json:"runtimeStatus,omitempty"`
+	RuntimePath string   `json:"runtimePath,omitempty"`
+	LastError   string   `json:"lastError,omitempty"`
+	Remediation string   `json:"remediation,omitempty"`
+	SizeBytes   int64    `json:"sizeBytes"`
+	Downloaded  int64    `json:"downloadedAt"`
+	Missing     []string `json:"missing,omitempty"`
 }
 
 // DownloadRequest is one model download.

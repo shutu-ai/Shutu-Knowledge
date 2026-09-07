@@ -4,12 +4,13 @@ Knowledge owns its model cache and model runtime configuration inside the
 Knowledge data domain. The Agent never stores model state or launches model
 processes.
 
-## Local ML helper
+## Local ML runtime
 
-Embedding, reranking, and OCR can run in optional helper processes. The
-Knowledge process supervises lifecycle, readiness, requests, timeouts, and
-restarts; inference itself stays outside the binary. A deployment can use one
-command for all capabilities or split them by capability.
+By default, Knowledge prepares a private managed Node.js runtime with
+Transformers.js and ONNX Runtime. It supervises lifecycle, readiness, requests,
+timeouts, and restarts; model weights are downloaded into the Knowledge data
+domain and validated before real inference. A deployment can still override
+the managed process with explicit capability helper commands.
 
 Configuration is under `runtime`:
 
@@ -24,7 +25,8 @@ runtime:
   idleTimeoutMs: 300000
 ```
 
-The capability-specific fields override `helperCommand`. The environment
+The capability-specific fields override `helperCommand`; when all are empty,
+Knowledge uses the embedded managed runtime automatically. The environment
 variables `SHUTU_KNOWLEDGE_EMBEDDING_HELPER`,
 `SHUTU_KNOWLEDGE_RERANK_HELPER`, and `SHUTU_KNOWLEDGE_OCR_HELPER` can override
 the typed config for container deployments.
@@ -36,15 +38,13 @@ endpoint is ignored for this form. Custom Hugging Face IDs are validated as an
 
 OCR can have a second, independent command through `ocr.fallbackHelper` (or
 `SHUTU_KNOWLEDGE_OCR_FALLBACK_HELPER`). The primary path is the isolated OCR
-runtime/helper above; the secondary command, commonly a deployment-provided
-Tesseract wrapper, runs only after that primary path fails. Knowledge does not
-bundle either inference implementation.
+runtime/helper above; the secondary command runs only after that primary path
+fails. The managed primary uses Tesseract.js and `eng+chi_sim` language data.
 
 OCR can also prefer a separate `ocr.renderHelper` (or
 `SHUTU_KNOWLEDGE_OCR_RENDER_HELPER`) full-page PDF renderer before calling the
-inference runtime. The renderer is deployment-supplied, bounded, health-checked,
-and fail-closed; it is not an inference engine, and Knowledge bundles neither
-rendering nor recognition.
+inference runtime. When it is empty, the managed PDF.js renderer is used. Both
+paths are bounded, health-checked, and fail-closed.
 
 ## Wire contract
 
@@ -106,9 +106,9 @@ while `shutu-knowledge doctor` exposes them as actionable degraded checks.
 
 Knowledge never treats an installed model artifact as ready by itself. The
 model API reports a complete artifact set as `INSTALLED` with `ready: false`.
-`READY` additionally requires a successful runtime load and inference smoke
-test. No inference engine is bundled, so a real helper is required before local
-model capabilities are used.
+`READY` additionally requires a successful managed-runtime load and inference
+smoke test. Explicit helper commands remain supported as deployment overrides,
+but are not required by the default local model path.
 
 ## OCR Artifact Lifecycle
 
@@ -129,9 +129,9 @@ can remain self-contained and is not required to use the shared bundle.
 An additional `ocr.fallbackHelper` command can cover helper-runtime failures,
 but it is likewise supplied by the deployment rather than bundled with
 Knowledge.
-An `ocr.renderHelper` command may rasterize vector-only PDFs before inference,
-but it is optional, deployment-supplied, and never changes artifact presence
-into OCR readiness.
+The managed PDF.js renderer rasterizes vector-only PDFs before inference by
+default. An `ocr.renderHelper` command remains an optional override and never
+changes artifact presence into OCR readiness.
 
 ## Custom Reranker Registration And Self-Test
 

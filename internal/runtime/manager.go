@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,8 @@ const (
 	CapabilityEmbedding = "embedding"
 	CapabilityRerank    = "rerank"
 	CapabilityOCR       = "ocr"
+	CapabilityPDFRender = "pdf_render"
+	CapabilityOffice    = "office"
 )
 
 // Error is a structured helper failure. Code is stable enough for callers
@@ -75,9 +78,14 @@ type healthParams struct {
 // Health is a readiness report from a live helper process.
 type Health struct {
 	Ready        bool              `json:"ready"`
+	Status       string            `json:"status,omitempty"` // ready | loading | not_installed | failed | unavailable
 	Version      string            `json:"version,omitempty"`
+	Path         string            `json:"path,omitempty"`
 	Model        string            `json:"model,omitempty"`
 	Capability   string            `json:"capability"`
+	Lifecycle    string            `json:"lifecycle,omitempty"`
+	LastError    string            `json:"lastError,omitempty"`
+	Remediation  string            `json:"remediation,omitempty"`
 	LastLoaded   time.Time         `json:"lastLoaded,omitempty"`
 	Details      map[string]string `json:"details,omitempty"`
 	Capabilities []string          `json:"capabilities,omitempty"`
@@ -103,6 +111,16 @@ type Controller interface {
 
 var _ Controller = (*Manager)(nil)
 
+// ManagedModelController exposes model lifecycle operations owned by the
+// Knowledge-managed runtime. It is intentionally separate from Caller so
+// ordinary helper implementations cannot claim model installation semantics.
+type ManagedModelController interface {
+	LoadModel(ctx context.Context, capability, model string) (Health, error)
+	RemoveModel(ctx context.Context, capability, model string) error
+}
+
+var _ ManagedModelController = (*Manager)(nil)
+
 // Options configures process supervision.
 type Options struct {
 	// Command is a non-shell command template. The first field must be an
@@ -112,6 +130,10 @@ type Options struct {
 	StartupTimeout time.Duration
 	// RequestTimeout bounds each capability call (default 60s).
 	RequestTimeout time.Duration
+	// ModelLoadTimeout bounds first-install/reinstall model downloads. It is
+	// separate because a multi-gigabyte model may take much longer than a
+	// normal inference request (default: RequestTimeout).
+	ModelLoadTimeout time.Duration
 	// IdleTimeout stops an unused process; zero keeps it until Close.
 	IdleTimeout time.Duration
 	// Now is injectable for tests.
@@ -131,8 +153,53 @@ type helperProcess struct {
 	scanner   *bufio.Scanner
 	wait      chan struct{}
 	lastUsed  time.Time
+	stderr    captureBuffer
+	lastError string
+	stop      func()
+	stopMu    sync.RWMutex
 	closeOnce sync.Once
 	mu        sync.Mutex
+}
+
+// captureBuffer is safe for a helper process to write while the supervisor
+// is synchronously reading stdout. Keeping stderr bounded preserves the
+// actionable cause of a failure without allowing a noisy child to consume
+// unbounded memory.
+type captureBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *captureBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	const maxBytes = 256 * 1024
+	if len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+	}
+	if b.buf.Len()+len(data) > maxBytes {
+		old := b.buf.Bytes()
+		keep := maxBytes - len(data)
+		b.buf.Reset()
+		if keep > 0 && len(old) > keep {
+			_, _ = b.buf.Write(old[len(old)-keep:])
+		} else if keep > 0 {
+			_, _ = b.buf.Write(old)
+		}
+	}
+	return b.buf.Write(data)
+}
+
+func (b *captureBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *captureBuffer) Reset() {
+	b.mu.Lock()
+	b.buf.Reset()
+	b.mu.Unlock()
 }
 
 // Manager lazily starts one supervised helper per configured command and
@@ -144,6 +211,7 @@ type Manager struct {
 	ocrCommand       string
 	startupTimeout   time.Duration
 	requestTimeout   time.Duration
+	modelLoadTimeout time.Duration
 	idleTimeout      time.Duration
 	now              func() time.Time
 	stop             chan struct{}
@@ -162,6 +230,9 @@ func NewManager(options Options) *Manager {
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = 60 * time.Second
 	}
+	if options.ModelLoadTimeout <= 0 {
+		options.ModelLoadTimeout = options.RequestTimeout
+	}
 	if options.IdleTimeout < 0 {
 		options.IdleTimeout = 0
 	}
@@ -176,6 +247,7 @@ func NewManager(options Options) *Manager {
 		ocrCommand:       strings.TrimSpace(options.OCRCommand),
 		startupTimeout:   options.StartupTimeout,
 		requestTimeout:   options.RequestTimeout,
+		modelLoadTimeout: options.ModelLoadTimeout,
 		idleTimeout:      options.IdleTimeout,
 		now:              now,
 		stop:             make(chan struct{}),
@@ -198,6 +270,10 @@ func (m *Manager) Call(ctx context.Context, capability string, params, out any) 
 }
 
 func (m *Manager) invoke(ctx context.Context, method, capability string, params, out any) error {
+	return m.invokeWithTimeout(ctx, method, capability, params, out, m.requestTimeout)
+}
+
+func (m *Manager) invokeWithTimeout(ctx context.Context, method, capability string, params, out any, timeout time.Duration) error {
 	command := m.commandFor(capability)
 	if command == "" {
 		return &Error{Code: "runtime_unconfigured", Message: fmt.Sprintf("%s runtime command is not configured", capability)}
@@ -214,7 +290,7 @@ func (m *Manager) invoke(ctx context.Context, method, capability string, params,
 		m.processes[command] = helper
 	}
 	m.mu.Unlock()
-	return helper.call(ctx, method, capability, params, out, m.startupTimeout, m.requestTimeout)
+	return helper.call(ctx, method, capability, params, out, m.startupTimeout, timeout)
 }
 
 // Probe asks a configured helper whether a capability is ready.
@@ -222,33 +298,138 @@ func (m *Manager) Probe(ctx context.Context, capability string) (Health, error) 
 	var health Health
 	err := m.invoke(ctx, "health", capability, healthParams{Capability: capability}, &health)
 	if err != nil {
-		return Health{}, err
+		health.Capability = capability
+		health.Status = "failed"
+		health.Lifecycle = "FAILED"
+		health.LastError = err.Error()
+		health.Remediation = remediation(capability)
+		return health, err
+	}
+	health.Capability = capability
+	if health.Path == "" {
+		health.Path = m.commandFor(capability)
+	}
+	if health.Status == "" {
+		switch {
+		case health.Ready:
+			health.Status = "ready"
+		case health.Lifecycle == "FAILED":
+			health.Status = "failed"
+		case health.Lifecycle == "LOADING":
+			health.Status = "loading"
+		default:
+			health.Status = "not_installed"
+		}
+	}
+	if health.LastError == "" && health.Details != nil {
+		health.LastError = health.Details["error"]
+	}
+	if health.Remediation == "" && !health.Ready {
+		health.Remediation = remediation(capability)
 	}
 	if !health.Ready {
 		return health, &Error{Code: "runtime_not_ready", Message: fmt.Sprintf("%s runtime is not ready", capability)}
 	}
-	health.Capability = capability
 	return health, nil
+}
+
+// LoadModel performs the runtime's real model load and inference smoke. A
+// successful return is the only point at which a model may be marked READY.
+func (m *Manager) LoadModel(ctx context.Context, capability, model string) (Health, error) {
+	var health Health
+	err := m.invokeWithTimeout(ctx, "load", capability, map[string]string{"model": model, "capability": capability}, &health, m.modelLoadTimeout)
+	if err != nil {
+		health.Capability = capability
+		health.Status = "failed"
+		health.Lifecycle = "FAILED"
+		health.LastError = err.Error()
+		health.Path = m.commandFor(capability)
+		health.Remediation = remediation(capability)
+		return health, err
+	}
+	health.Capability = capability
+	if !health.Ready {
+		if health.Status == "" {
+			health.Status = "failed"
+		}
+		if health.Lifecycle == "" {
+			health.Lifecycle = "FAILED"
+		}
+		if health.Remediation == "" {
+			health.Remediation = remediation(capability)
+		}
+		return health, &Error{Code: "runtime_not_ready", Message: fmt.Sprintf("%s runtime is not ready", capability)}
+	}
+	if health.Status == "" {
+		health.Status = "ready"
+	}
+	if health.Lifecycle == "" {
+		health.Lifecycle = "READY"
+	}
+	if health.Path == "" {
+		health.Path = m.commandFor(capability)
+	}
+	return health, nil
+}
+
+// RemoveModel invalidates the runtime cache and persisted readiness state.
+func (m *Manager) RemoveModel(ctx context.Context, capability, model string) error {
+	return m.invoke(ctx, "remove", capability, map[string]string{"model": model, "capability": capability}, nil)
 }
 
 // Status probes every configured capability, including unavailable ones.
 func (m *Manager) Status(ctx context.Context) map[string]Health {
-	capabilities := []string{CapabilityEmbedding, CapabilityRerank, CapabilityOCR}
+	capabilities := []string{CapabilityEmbedding, CapabilityRerank, CapabilityOCR, CapabilityPDFRender, CapabilityOffice}
 	status := make(map[string]Health, len(capabilities))
 	for _, capability := range capabilities {
 		if !m.Configured(capability) {
+			status[capability] = Health{
+				Capability: capability, Status: "unavailable", Lifecycle: "NOT_CONFIGURED",
+				Remediation: "enable the managed runtime or configure a Knowledge-owned runtime command",
+			}
 			continue
 		}
 		health, err := m.Probe(ctx, capability)
 		if err != nil {
-			health = Health{Capability: capability, Ready: false}
+			health.Capability = capability
+			health.Ready = false
 			if details := err.Error(); details != "" {
-				health.Details = map[string]string{"error": details}
+				if health.Details == nil {
+					health.Details = map[string]string{}
+				}
+				health.Details["error"] = details
+				health.LastError = details
+			}
+			if health.Status == "" {
+				health.Status = "failed"
+			}
+			if health.Lifecycle == "" {
+				health.Lifecycle = "FAILED"
+			}
+			if health.Remediation == "" {
+				health.Remediation = remediation(capability)
 			}
 		}
 		status[capability] = health
 	}
 	return status
+}
+
+func remediation(capability string) string {
+	switch capability {
+	case CapabilityEmbedding:
+		return "select or download the pinned embedding model, then retry the runtime self-test"
+	case CapabilityRerank:
+		return "select or download the pinned reranker model, then retry the runtime self-test"
+	case CapabilityOCR:
+		return "allow one online start to cache OCR language data, or disable offline mode"
+	case CapabilityPDFRender:
+		return "verify the managed PDF runtime installation and rerun Doctor"
+	case CapabilityOffice:
+		return "verify the managed Office runtime installation and rerun Doctor"
+	default:
+		return "inspect the runtime logs and rerun Doctor"
+	}
 }
 
 // Close stops idle reaping and all active helper processes.
@@ -371,7 +552,7 @@ func (p *helperProcess) call(parent context.Context, method, capability string, 
 	}
 	callCtx, cancel := context.WithTimeout(parent, requestTimeout)
 	defer cancel()
-	deadline := time.AfterFunc(requestTimeout, p.cancel)
+	deadline := time.AfterFunc(requestTimeout, p.stopProcess)
 	defer deadline.Stop()
 
 	id := nextRequestID()
@@ -382,7 +563,7 @@ func (p *helperProcess) call(parent context.Context, method, capability string, 
 	requestData = append(requestData, '\n')
 	if _, err := p.stdin.Write(requestData); err != nil {
 		p.closeLocked()
-		return fmt.Errorf("write %s request: %w", capability, err)
+		return p.withStderr(fmt.Errorf("write %s request: %w", capability, err))
 	}
 	if err := callCtx.Err(); err != nil {
 		p.closeLocked()
@@ -392,21 +573,21 @@ func (p *helperProcess) call(parent context.Context, method, capability string, 
 		scanErr := p.scanner.Err()
 		p.closeLocked()
 		if scanErr != nil {
-			return fmt.Errorf("read %s response: %w", capability, scanErr)
+			return p.withStderr(fmt.Errorf("read %s response: %w", capability, scanErr))
 		}
 		if callCtx.Err() != nil {
 			return fmt.Errorf("%s request: %w", capability, callCtx.Err())
 		}
-		return fmt.Errorf("%s helper closed stdout", capability)
+		return p.withStderr(fmt.Errorf("%s helper closed stdout", capability))
 	}
 	var reply response
 	if err := json.Unmarshal(p.scanner.Bytes(), &reply); err != nil {
 		p.closeLocked()
-		return fmt.Errorf("decode %s response: %w", capability, err)
+		return p.withStderr(fmt.Errorf("decode %s response: %w", capability, err))
 	}
 	if reply.ID != id {
 		p.closeLocked()
-		return fmt.Errorf("%s helper returned request id %d, expected %d", capability, reply.ID, id)
+		return p.withStderr(fmt.Errorf("%s helper returned request id %d, expected %d", capability, reply.ID, id))
 	}
 	if reply.Error != nil {
 		return &Error{Code: reply.Error.Code, Message: reply.Error.Message}
@@ -430,12 +611,16 @@ func (p *helperProcess) runningLocked() bool {
 }
 
 func (p *helperProcess) startLocked(startupTimeout time.Duration) error {
-	words := strings.Fields(p.command)
-	if len(words) == 0 {
+	words, ok := splitCommand(p.command)
+	if !ok || len(words) == 0 {
 		return &Error{Code: "runtime_unconfigured", Message: "helper command is empty"}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, words[0], words[1:]...)
+	if err := configureProcess(cmd); err != nil {
+		cancel()
+		return err
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -447,34 +632,82 @@ func (p *helperProcess) startLocked(startupTimeout time.Duration) error {
 		cancel()
 		return fmt.Errorf("helper stdout: %w", err)
 	}
-	cmd.Stderr = nil // Helpers must keep diagnostics off the JSON channel.
+	p.stderr.Reset()
+	cmd.Stderr = &p.stderr // Keep diagnostics off stdout but available to Doctor.
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		cancel()
 		return fmt.Errorf("start helper: %w", err)
 	}
 	p.cancel = cancel
+	p.stopMu.Lock()
+	p.stop = func() {
+		terminateProcessTree(cmd)
+		cancel()
+	}
+	p.stopMu.Unlock()
 	p.stdin = stdin
 	p.scanner = bufio.NewScanner(stdout)
 	p.scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
-	p.wait = make(chan struct{})
-	go func() {
-		_, _ = cmd.Process.Wait()
+	wait := make(chan struct{})
+	p.wait = wait
+	go func(wait chan struct{}) {
 		_ = cmd.Wait()
-		close(p.wait)
-	}()
+		close(wait)
+	}(wait)
 
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, startupTimeout)
 	defer handshakeCancel()
-	deadline := time.AfterFunc(startupTimeout, cancel)
+	deadline := time.AfterFunc(startupTimeout, p.stopProcess)
 	defer deadline.Stop()
 	err = p.handshakeLocked(handshakeCtx)
 	if err != nil {
 		p.closeLocked()
-		return err
+		return p.withStderr(err)
 	}
 	p.lastUsed = time.Now()
 	return nil
+}
+
+// splitCommand supports quoted executable paths and arguments. Managed
+// runtimes live below the user data directory, which may itself contain
+// spaces, so strings.Fields would silently launch the wrong executable.
+func splitCommand(command string) ([]string, bool) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil, false
+	}
+	var words []string
+	var word strings.Builder
+	var quote rune
+	flush := func() {
+		if word.Len() == 0 {
+			return
+		}
+		words = append(words, word.String())
+		word.Reset()
+	}
+	for _, char := range command {
+		switch {
+		case quote != 0:
+			if char == quote {
+				quote = 0
+			} else {
+				word.WriteRune(char)
+			}
+		case char == '\'' || char == '"':
+			quote = char
+		case char == ' ' || char == '\t' || char == '\r' || char == '\n':
+			flush()
+		default:
+			word.WriteRune(char)
+		}
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	flush()
+	return words, len(words) > 0
 }
 
 func (p *helperProcess) handshakeLocked(ctx context.Context) error {
@@ -534,16 +767,41 @@ func (p *helperProcess) closeLocked() {
 	}
 	p.closeOnce.Do(func() {
 		_ = p.stdin.Close()
-		if p.cancel != nil {
+		p.stopMu.RLock()
+		stop := p.stop
+		p.stopMu.RUnlock()
+		if stop != nil {
+			stop()
+		} else if p.cancel != nil {
 			p.cancel()
 		}
+		p.lastError = strings.TrimSpace(p.stderr.String())
 	})
 	// A reaper may have recreated the process object after an idle close.
 	// This object is terminal until a new process replaces it by call.
 	p.stdin = nil
 	p.scanner = nil
 	p.cancel = nil
+	p.stopMu.Lock()
+	p.stop = nil
+	p.stopMu.Unlock()
 	p.closeOnce = sync.Once{}
+}
+
+func (p *helperProcess) stopProcess() {
+	p.stopMu.RLock()
+	stop := p.stop
+	p.stopMu.RUnlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+func (p *helperProcess) withStderr(err error) error {
+	if p.lastError == "" {
+		return err
+	}
+	return fmt.Errorf("%w (helper stderr: %s)", err, p.lastError)
 }
 
 var requestID atomic.Uint64

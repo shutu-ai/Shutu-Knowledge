@@ -11,13 +11,15 @@ SHUTU-KNOWLEDGE OUT-OF-BOX PARITY READY
 | Gate | Result |
 |---|---|
 | Final runtime candidate commit | `369c3436045165198e8360edb36693f01c0201da` |
-| GitHub ordinary CI | run `34093542980`, success, candidate SHA above |
-| GitHub runtime-release CI | run `34097221413`, success; `runtime-release` and `build` jobs both passed |
+| Earlier candidate CI | run `34093542980`, success, candidate SHA above |
+| Final release ordinary CI | run `34097716164`, success, final docs commit |
+| Final release runtime-release CI | run `34097927780`, success; `runtime-release` and `build` jobs both passed |
 | GitHub source | `https://github.com/shutu-ai/Shutu-Knowledge/tree/369c3436045165198e8360edb36693f01c0201da` |
 
-The runtime-release workflow was triggered by the pushed tag
-`runtime-gate-369c343`. It ran the real managed runtime smoke and the offline
-managed-runtime restart smoke on a GitHub Linux runner.
+The earlier runtime-release workflow for the implementation candidate was run
+`34097221413`. The final release runtime-release workflow was triggered by the
+pushed tag `runtime-gate-a871af6`; it ran the real managed runtime smoke and
+the offline managed-runtime restart smoke on a GitHub Linux runner.
 
 ## Fresh-clone gate
 

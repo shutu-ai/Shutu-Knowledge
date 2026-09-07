@@ -280,7 +280,7 @@ func (m *Manager) invoke(ctx context.Context, method, capability string, params,
 }
 
 func (m *Manager) isFirstModelInference(method, capability string) bool {
-	if (capability != CapabilityEmbedding && capability != CapabilityRerank) || method == "health" || method == "load" || method == "remove" {
+	if (capability != CapabilityEmbedding && capability != CapabilityRerank) || method == "load" || method == "remove" {
 		return false
 	}
 	m.mu.Lock()

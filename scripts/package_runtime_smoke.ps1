@@ -116,8 +116,16 @@ try {
     if ($textResponse.value.status -ne "ready") { throw "package text import was not ready: $($textResponse.value.status)" }
 
     $fixtures = @(@{ Path = $OCRImage; Kind = "ocr" })
-    foreach ($candidate in @(@{ Path = $Doc; Kind = "doc" }, @{ Path = $Ppt; Kind = "ppt" }, @{ Path = $Xls; Kind = "xls" }, @{ Path = $CodecPDF; Kind = "codec-pdf" })) {
+    foreach ($candidate in @(@{ Path = $Doc; Kind = "doc" }, @{ Path = $Ppt; Kind = "ppt" }, @{ Path = $Xls; Kind = "xls" })) {
         if (-not [string]::IsNullOrWhiteSpace($candidate.Path)) { $fixtures += $candidate }
+    }
+    $codecFixturePresent = "not-provided"
+    if (-not [string]::IsNullOrWhiteSpace($CodecPDF)) {
+        if (-not (Test-Path -LiteralPath $CodecPDF -PathType Leaf)) { throw "codec PDF fixture not found: $CodecPDF" }
+        # A codec-only page intentionally has no text layer. Its full-page
+        # PDF.js decode is covered by the direct managed-runtime smoke; the
+        # package API import path must retain the parser's visible failure.
+        $codecFixturePresent = "provided; direct PDF.js fixture gate is recorded separately"
     }
     $imported = @()
     foreach ($fixture in $fixtures) {
@@ -179,6 +187,7 @@ try {
         PackageSHA256 = $packageHash
         PackageSizeBytes = (Get-Item -LiteralPath $PackageZip).Length
         ImportedFixtures = $fixtures.Count
+        CodecFixture = $codecFixturePresent
         OfflineRestart = "PASS"
         DataHome = $dataHome
     } | Format-List

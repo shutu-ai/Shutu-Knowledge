@@ -220,6 +220,7 @@ type Manager struct {
 
 	mu        sync.Mutex
 	processes map[string]*helperProcess
+	warmed    map[string]bool
 }
 
 // NewManager creates a supervisor and starts its idle reaper.
@@ -253,6 +254,7 @@ func NewManager(options Options) *Manager {
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
 		processes:        map[string]*helperProcess{},
+		warmed:           map[string]bool{},
 	}
 	go manager.reap()
 	return manager
@@ -270,7 +272,30 @@ func (m *Manager) Call(ctx context.Context, capability string, params, out any) 
 }
 
 func (m *Manager) invoke(ctx context.Context, method, capability string, params, out any) error {
-	return m.invokeWithTimeout(ctx, method, capability, params, out, m.requestTimeout)
+	timeout := m.requestTimeout
+	if m.isFirstModelInference(method, capability) {
+		timeout = m.modelLoadTimeout
+	}
+	return m.invokeWithTimeout(ctx, method, capability, params, out, timeout)
+}
+
+func (m *Manager) isFirstModelInference(method, capability string) bool {
+	if (capability != CapabilityEmbedding && capability != CapabilityRerank) || method == "health" || method == "load" || method == "remove" {
+		return false
+	}
+	m.mu.Lock()
+	warmed := m.warmed[capability]
+	m.mu.Unlock()
+	return !warmed
+}
+
+func (m *Manager) markWarmed(method, capability string) {
+	if (method == "load" || method == CapabilityEmbedding || method == CapabilityRerank) &&
+		(capability == CapabilityEmbedding || capability == CapabilityRerank) {
+		m.mu.Lock()
+		m.warmed[capability] = true
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) invokeWithTimeout(ctx context.Context, method, capability string, params, out any, timeout time.Duration) error {
@@ -290,7 +315,11 @@ func (m *Manager) invokeWithTimeout(ctx context.Context, method, capability stri
 		m.processes[command] = helper
 	}
 	m.mu.Unlock()
-	return helper.call(ctx, method, capability, params, out, m.startupTimeout, timeout)
+	err := helper.call(ctx, method, capability, params, out, m.startupTimeout, timeout)
+	if err == nil {
+		m.markWarmed(method, capability)
+	}
+	return err
 }
 
 // Probe asks a configured helper whether a capability is ready.
@@ -579,6 +608,10 @@ func (p *helperProcess) call(parent context.Context, method, capability string, 
 			return fmt.Errorf("%s request: %w", capability, callCtx.Err())
 		}
 		return p.withStderr(fmt.Errorf("%s helper closed stdout", capability))
+	}
+	if err := callCtx.Err(); err != nil {
+		p.closeLocked()
+		return fmt.Errorf("%s request: %w", capability, err)
 	}
 	var reply response
 	if err := json.Unmarshal(p.scanner.Bytes(), &reply); err != nil {

@@ -100,6 +100,24 @@ func TestManagerHonorsCallDeadlineAndClose(t *testing.T) {
 	}
 }
 
+func TestManagerUsesModelLoadBudgetOnlyForFirstModelInference(t *testing.T) {
+	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
+	manager := NewManager(Options{
+		Command: helperCommand(t), StartupTimeout: 2 * time.Second,
+		RequestTimeout: 30 * time.Millisecond, ModelLoadTimeout: 250 * time.Millisecond,
+	})
+	defer manager.Close()
+	var result struct {
+		Vectors [][]float64 `json:"vectors"`
+	}
+	if err := manager.Call(context.Background(), CapabilityEmbedding, map[string]any{"sleepMs": 100}, &result); err != nil {
+		t.Fatalf("first model inference should use the load budget: %v", err)
+	}
+	if err := manager.Call(context.Background(), CapabilityEmbedding, map[string]any{"sleepMs": 100}, &result); err == nil {
+		t.Fatal("warmed model inference unexpectedly bypassed the ordinary request timeout")
+	}
+}
+
 func TestManagerIdleLifecycle(t *testing.T) {
 	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
 	manager := NewManager(Options{Command: helperCommand(t), StartupTimeout: 2 * time.Second, RequestTimeout: 2 * time.Second, IdleTimeout: 20 * time.Millisecond})
@@ -167,7 +185,8 @@ func runHelper(stdin *os.File, stdout *os.File) error {
 			}
 		case CapabilityEmbedding:
 			var body struct {
-				Crash bool `json:"crash"`
+				Crash   bool `json:"crash"`
+				SleepMS int  `json:"sleepMs"`
 			}
 			if err := json.Unmarshal(req.Params, &body); err != nil {
 				return err
@@ -177,6 +196,9 @@ func runHelper(stdin *os.File, stdout *os.File) error {
 					return err
 				}
 				os.Exit(9)
+			}
+			if body.SleepMS > 0 {
+				time.Sleep(time.Duration(body.SleepMS) * time.Millisecond)
 			}
 			if err := reply(map[string]any{"vectors": [][]float64{{1}, {2}}}); err != nil {
 				return err

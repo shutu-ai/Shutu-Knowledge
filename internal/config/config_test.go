@@ -3,7 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestDefaultsClamp(t *testing.T) {
@@ -29,6 +33,27 @@ func TestDefaultsClamp(t *testing.T) {
 	if cfg.Processing.Provider != "builtin" || cfg.Workflow.ConflictStrategy != "rename" ||
 		cfg.Workflow.URLRefreshHours != 0 || cfg.AutoRetrieve.Weight != 5 || cfg.Captioning.Provider != "off" {
 		t.Fatalf("new field normalization failed: %+v %+v %+v %+v", cfg.Processing, cfg.Workflow, cfg.AutoRetrieve, cfg.Captioning)
+	}
+}
+
+func TestRepositoryDefaultConfigMatchesBuiltInDefaults(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve config test source path")
+	}
+	path := filepath.Join(filepath.Dir(sourceFile), "..", "..", "config.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read repository default config: %v", err)
+	}
+	var configured Config
+	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&configured); err != nil {
+		t.Fatalf("parse repository default config: %v", err)
+	}
+	if configured != Defaults() {
+		t.Fatalf("repository config drifted from built-in defaults: %#v", configured)
 	}
 }
 

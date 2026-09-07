@@ -1,0 +1,91 @@
+# Shutu Knowledge default configuration.
+#
+# This file belongs to Shutu Knowledge. It is a safe, secret-free baseline
+# shipped with the project and formal release package. Runtime state and user
+# overrides live in <data home>/config.yaml (see SHUTU_KNOWLEDGE_HOME).
+
+database:
+  path: ""
+logging:
+  level: info
+server:
+  addr: 127.0.0.1:7730
+embedding:
+  provider: none
+  baseUrl: ""
+  model: ""
+  apiKey: ""
+  batch: 32
+rerank:
+  model: ""
+  baseUrl: ""
+  apiKey: ""
+  timeoutMs: 60000
+  enabled: false
+  required: false
+  queueLimit: 16
+captioning:
+  provider: off
+  baseUrl: ""
+  model: ""
+  apiKey: ""
+chunking:
+  smart: true
+  separator: "\n\n"
+  size: 800
+  overlap: 100
+  semantic: false
+  semanticThreshold: 0.75
+  tokenLimit: 0
+retrieval:
+  topK: 4
+  mode: auto
+  similarityMin: 0
+  mmr: false
+  mmrDiversity: 0
+  rrfVectorWeight: 1
+  siblingChunks: 1
+  contextTimeoutMs: 4000
+processing:
+  provider: builtin
+  apiKey: ""
+  apiHost: https://mineru.net
+workflow:
+  conflictStrategy: rename
+  urlRefreshHours: 0
+autoRetrieve:
+  enabled: true
+  weight: 3
+jobs:
+  importWorkers: 5
+  resumeInterrupt: true
+models:
+  cacheDir: ""
+  hfEndpoint: ""
+  workerIdleTimeoutMs: 60000
+maintenance:
+  ftsAutoOptimize: true
+  vacuum: true
+  vacuumThresholdMB: 256
+runtime:
+  helperCommand: ""
+  offline: false
+  embeddingHelper: ""
+  rerankHelper: ""
+  ocrHelper: ""
+  startupTimeoutMs: 10000
+  requestTimeoutMs: 60000
+  idleTimeoutMs: 300000
+ocr:
+  enabled: false
+  mode: auto
+  helper: ""
+  fallbackHelper: ""
+  renderHelper: ""
+  renderTimeoutMs: 120000
+  timeoutMs: 120000
+helpers:
+  legacyOffice: ""
+  contentConverter: ""
+  imageDecoder: ""
+  imageDecoderTimeoutMs: 120000

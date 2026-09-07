@@ -25,6 +25,11 @@ npm test
 
 The Go binary embeds the generated `internal/web/dist` assets.
 
+The project and formal release package also include a secret-free
+Knowledge-owned `config.yaml` baseline. It is a configuration template for
+the Knowledge data domain; initialize the active copy with
+`shutu-knowledge doctor --init`. No Agent configuration is read or written.
+
 ## Data Domain
 
 Default data home:

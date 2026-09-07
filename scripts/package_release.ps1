@@ -71,6 +71,7 @@ try {
 foreach ($fileMapping in @(
     @{ Source = "LICENSE"; Target = "LICENSE" },
     @{ Source = "README.md"; Target = "README.md" },
+    @{ Source = "config.yaml"; Target = "config.yaml" },
     @{ Source = "THIRD_PARTY_NOTICES.md"; Target = "THIRD_PARTY_NOTICES.md" },
     @{ Source = "extension.yaml"; Target = "extension.yaml" },
     @{ Source = "docs\deployment.md"; Target = "docs\deployment.md" },
@@ -121,7 +122,7 @@ if (-not (Test-Path -LiteralPath $verifiedRoot)) {
     # Compress-Archive with a wildcard creates files at the archive root.
     $verifiedRoot = $verifyRoot
 }
-foreach ($required in @("bin\$binaryName", "runtime-manifest.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "checksums.sha256", "BUILD-METADATA.json")) {
+foreach ($required in @("bin\$binaryName", "config.yaml", "runtime-manifest.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "checksums.sha256", "BUILD-METADATA.json")) {
     if (-not (Test-Path -LiteralPath (Join-Path $verifiedRoot $required) -PathType Leaf)) {
         throw "formal package verification missing $required"
     }

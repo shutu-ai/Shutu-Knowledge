@@ -101,19 +101,19 @@ try {
             throw "packaged server exited during startup: $($server.ExitCode)"
         }
         try {
-            $health = Invoke-JsonRequest "GET" "$baseURL/api/health"
-            if ($health.ok) { break }
+            $health = Invoke-JsonRequest "GET" "$baseURL/api/status"
+            if ($health.ready) { break }
         } catch { }
         Start-Sleep -Milliseconds 500
     }
-    if ($null -eq $health -or -not $health.ok) { throw "packaged server did not become healthy" }
+    if ($null -eq $health -or -not $health.ready) { throw "packaged server did not become healthy" }
 
     $baseResponse = Invoke-JsonRequest "POST" "$baseURL/api/bases" @{ name = "formal-package-smoke"; description = "package-only runtime validation"; group = "runtime"; config = @{} }
-    $baseID = $baseResponse.data.id
+    $baseID = $baseResponse.value.id
     if ([string]::IsNullOrWhiteSpace($baseID)) { throw "package API did not create a base" }
 
     $textResponse = Invoke-JsonRequest "POST" "$baseURL/api/bases/$baseID/documents" @{ title = "expense-reimbursement.md"; content = "An expense report requires the original invoice and manager approval before reimbursement." }
-    if ($textResponse.data.status -ne "ready") { throw "package text import was not ready: $($textResponse.data.status)" }
+    if ($textResponse.value.status -ne "ready") { throw "package text import was not ready: $($textResponse.value.status)" }
 
     $fixtures = @(@{ Path = $OCRImage; Kind = "ocr" })
     foreach ($candidate in @(@{ Path = $Doc; Kind = "doc" }, @{ Path = $Ppt; Kind = "ppt" }, @{ Path = $Xls; Kind = "xls" }, @{ Path = $CodecPDF; Kind = "codec-pdf" })) {
@@ -124,24 +124,24 @@ try {
         if (-not (Test-Path -LiteralPath $fixture.Path -PathType Leaf)) { throw "fixture not found: $($fixture.Path)" }
         $data = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.Path))
         $response = Invoke-JsonRequest "POST" "$baseURL/api/bases/$baseID/files" @{ conflict = "rename"; files = @(@{ fileName = [IO.Path]::GetFileName($fixture.Path); contentBase64 = $data }) }
-        $accepted = @($response.data.accepted)
+        $accepted = @($response.value.accepted)
         if ($accepted.Count -ne 1) { throw "package $($fixture.Kind) import was not accepted" }
         $document = Invoke-JsonRequest "GET" "$baseURL/api/documents/$($accepted[0].id)"
-        if ($document.data.status -ne "ready" -or $document.data.chunkCount -lt 1) {
-            throw "package $($fixture.Kind) import was not ready: status=$($document.data.status) chunks=$($document.data.chunkCount)"
+        if ($document.value.status -ne "ready" -or $document.value.chunkCount -lt 1) {
+            throw "package $($fixture.Kind) import was not ready: status=$($document.value.status) chunks=$($document.value.chunkCount)"
         }
         $imported += $accepted[0].id
     }
 
     $semantic = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "What invoice and approval are needed for expense reimbursement?"; mode = "vector"; topK = 3; baseIds = @($baseID) }
-    if (@($semantic.data.hits).Count -lt 1 -or $semantic.data.hits[0].documentTitle -ne "expense-reimbursement.md") {
+    if (@($semantic.value.hits).Count -lt 1 -or $semantic.value.hits[0].documentTitle -ne "expense-reimbursement.md") {
         throw "package semantic retrieval returned the wrong result"
     }
     $ocrSearch = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "Knowledge Runtime OCR 7788"; mode = "vector"; topK = 10; baseIds = @($baseID) }
-    if (@($ocrSearch.data.hits).Count -lt 1) { throw "package OCR vector retrieval returned no hits" }
+    if (@($ocrSearch.value.hits).Count -lt 1) { throw "package OCR vector retrieval returned no hits" }
 
     $status = Invoke-JsonRequest "GET" "$baseURL/api/runtime-status"
-    $statusText = ($status.data | ConvertTo-Json -Depth 20 -Compress)
+    $statusText = ($status.value | ConvertTo-Json -Depth 20 -Compress)
     if ($statusText -notmatch '"ready"\s*:\s*true') { throw "package runtime status did not expose a ready capability" }
     Stop-PackageServer $server
     $server = $null
@@ -163,13 +163,13 @@ try {
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
         if ($server.HasExited) { throw "packaged offline server exited: $($server.ExitCode)" }
         try {
-            $offlineHealth = Invoke-JsonRequest "GET" "$baseURL/api/health"
-            if ($offlineHealth.ok) { break }
+            $offlineHealth = Invoke-JsonRequest "GET" "$baseURL/api/status"
+            if ($offlineHealth.ready) { break }
         } catch { }
         Start-Sleep -Milliseconds 500
     }
     $offlineSearch = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "What invoice and approval are needed for expense reimbursement?"; mode = "vector"; topK = 3; baseIds = @($baseID) }
-    if (@($offlineSearch.data.hits).Count -lt 1 -or $offlineSearch.data.hits[0].documentTitle -ne "expense-reimbursement.md") {
+    if (@($offlineSearch.value.hits).Count -lt 1 -or $offlineSearch.value.hits[0].documentTitle -ne "expense-reimbursement.md") {
         throw "package offline restart retrieval failed"
     }
     $packageHash = (Get-FileHash -LiteralPath $PackageZip -Algorithm SHA256).Hash.ToLowerInvariant()

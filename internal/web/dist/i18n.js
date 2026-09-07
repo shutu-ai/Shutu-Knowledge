@@ -2,6 +2,7 @@ const STORAGE_KEY = "knowledge-language";
 
 const zh = {
   "Language": "语言",
+  "Return to Agent": "返回 Agent",
   "Dismiss notification": "关闭通知",
   "English": "English",
   "Chinese": "中文",
@@ -307,7 +308,20 @@ function translateTree(root) {
 function detectLocale() {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored === "en" || stored === "zh") return stored;
+  if (typeof window !== "undefined") {
+    for (const tag of [...(navigator.languages ?? []), navigator.language ?? ""]) {
+      if (String(tag).toLowerCase().split("-")[0] === "zh") return "zh";
+      if (String(tag).toLowerCase().split("-")[0] === "en") return "en";
+    }
+  }
   return "en";
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== STORAGE_KEY || !["en", "zh"].includes(event.newValue) || event.newValue === locale) return;
+    window.location.reload();
+  });
 }
 
 export function currentLocale() {
@@ -316,7 +330,6 @@ export function currentLocale() {
 
 export function initializeI18n() {
   locale = detectLocale();
-  document.getElementById("language").value = locale;
   applyI18n(document);
 }
 
@@ -345,13 +358,6 @@ export function observeI18n(root) {
 
 export function localized(value) {
   return localizedText(value);
-}
-
-export function setLocale(next) {
-  locale = next === "zh" ? "zh" : "en";
-  localStorage.setItem(STORAGE_KEY, locale);
-  document.getElementById("language").value = locale;
-  window.location.reload();
 }
 
 let locale = "en";

@@ -1,34 +1,34 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Shutu Knowledge</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
   <div id="app" class="app" aria-busy="true">
     <aside class="sidebar">
-      <a class="brand" href="#/overview"><span class="brand-mark" aria-hidden="true"></span>Shutu Knowledge</a>
+      <a class="brand" href="#/overview" aria-label="Shutu Knowledge">
+        <img class="brand-mark" src="./new-logo-b.png" alt="" aria-hidden="true">
+        <span class="brand-copy"><strong>SHUTU-AI</strong><span class="brand-badge">KNOWLEDGE</span></span>
+      </a>
       <nav id="navigation" class="nav" aria-label="Knowledge"></nav>
-      <label class="field language-field">
-        <span>Language</span>
-        <select id="language" aria-label="Language">
-          <option value="en">English</option>
-          <option value="zh">中文</option>
-        </select>
-      </label>
     </aside>
     <main class="main">
       <header class="topbar">
         <div><h1 id="page-title">Overview</h1><p id="page-subtitle">Knowledge service status</p></div>
-        <div id="top-actions" class="top-actions"></div>
+        <div id="top-actions" class="top-actions">
+          <a id="return-agent" class="button" href="/" aria-label="Return to Agent" hidden>
+            <span aria-hidden="true">←</span><span>Return to Agent</span>
+          </a>
+        </div>
       </header>
       <div id="screen" class="screen"></div>
     </main>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="/api.js"></script>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="./api.js"></script>
+  <script type="module" src="./app.js"></script>
 </body>
 </html>

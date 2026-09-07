@@ -1,5 +1,5 @@
 import { api, fileToBase64 } from "./api.js";
-import { applyI18n, currentLocale, formatDate, formatNumber, initializeI18n, localized, observeI18n, setLocale } from "./i18n.js";
+import { applyI18n, currentLocale, formatDate, formatNumber, initializeI18n, localized, observeI18n } from "./i18n.js";
 
 const navigation = [
   ["overview", "Overview"],
@@ -937,9 +937,9 @@ async function route() {
 
 window.addEventListener("hashchange", route);
 initializeI18n();
-document.getElementById("language").addEventListener("change", (event) => {
-  setLocale(event.target.value);
-  route();
-});
+const returnAgent = document.getElementById("return-agent");
+if (returnAgent) {
+  returnAgent.hidden = !/^\/extensions\/shutu-knowledge(?:\/|$)/.test(window.location.pathname);
+}
 observeI18n(screen);
 route();

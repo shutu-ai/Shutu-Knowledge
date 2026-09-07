@@ -8,6 +8,12 @@ Policy: behavior-level reimplementation only. dsh-knowledge is AGPL-3.0; this pr
 |---|---|---|---|---|---|
 | (none) | | | | | |
 
+## Reused brand assets
+
+| Source repository | Source asset | Reuse type | Provenance | Local destination | Notes |
+|---|---|---|---|---|---|
+| shutu-agent (`C:\dev-projects\Agent\shutu-agent`) | `web/public/new-logo-b.png` | resized derivative, 96×96 transparent PNG | tracked upstream public branding asset; source SHA-256 `062B633063BAF87251767A73FD4D489F516C81D718D4BDD26082B560EF004B9E` | `web/src/new-logo-b.png` | Used for Knowledge/Agent visual parity; Agent checkout remains read-only |
+
 ## Behavioral references (design observation only, no code reuse)
 
 | Behavior studied | dsh-knowledge evidence | Reimplementation note |

@@ -34,6 +34,37 @@ transport:
 
 Knowledge owns that directory and its SQLite/raw/model/cache state.
 
+## Local Agent entry without changing the Agent project
+
+On the Windows development workspace, the Knowledge repository provides a
+launcher that creates a temporary Agent integration profile. It enables the
+Knowledge extension, includes its contributed tools in the startup whitelist,
+builds a Knowledge-owned Agent Web dist, and starts the Agent Web portal at
+`http://127.0.0.1:18099`:
+
+```powershell
+.\scripts\start-agent-integration.ps1 -OpenBrowser
+```
+
+The launcher discovers `C:\dev-projects\Agent\shutu-agent` by default, or uses
+`SHUTU_AGENT_ROOT`/`-AgentRoot`. The temporary profile and Agent data directory
+are removed on exit; no Agent source, documentation, Web files, or permanent
+Agent `config.yaml` is modified.
+
+The dedicated dist is generated under `agent-web-dist/` from the read-only
+Agent Native Web source (`web/src/main.tsx` → `native-entry.ts`). Knowledge
+then injects a small extension-navigation bridge into that copy, so the Agent
+page shows `Tools → Knowledge` without changing the sibling Agent checkout.
+The bridge reads the Agent extension inventory API and targets the Native Web
+sidebar's stable `sidebar.workspaces` slot anchor. When the link is opened, it
+also carries the active Agent language preference into the Knowledge page.
+
+After changing Knowledge Web assets, stop any older launcher/Agent process
+before starting it again. The launcher detects stale Knowledge binaries and
+rebuilds them. The extension page is then available at
+`http://127.0.0.1:18099/extensions/shutu-knowledge/`; its assets and API calls
+must stay below that reverse-proxy prefix.
+
 ## Real-Process Evidence
 
 A pinned read-only shutu-agent build and a freshly built Knowledge binary were

@@ -26,9 +26,16 @@ owns only its own UI and API.
 | Models | provider overrides, local HF artifact cache, dedicated PaddleOCR artifact lifecycle, runtime-helper state, and Ollama models |
 | Settings | global runtime config (including processor/workflow/auto-retrieve, document helpers, image captioning, and secret state) and per-base overrides |
 
-The sidebar exposes persistent English and Chinese UI selection. Route labels,
-management forms, statuses, confirmation prompts, toasts, numeric and date
-formats, and accessibility labels use the selected locale.
+Knowledge does not expose an independent language selector. In Agent integration,
+the Knowledge navigation bridge carries the active Agent `<html lang>` preference
+into the extension page; standalone visits fall back to the browser language using
+the same `zh`/`en` negotiation as shutu-agent. Route labels, management forms,
+statuses, confirmation prompts, toasts, numeric and date formats, and accessibility
+labels use the inherited locale.
+
+In Agent integration, the top-right `Return to Agent` link returns to the Agent
+root page. It is hidden for standalone Knowledge serving, where `/` is already
+the Knowledge page.
 
 Recall supports a deep link in the form `#/recall?q=<query>`. A non-empty query
 is placed in the form and executed automatically.

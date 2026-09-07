@@ -211,6 +211,15 @@ async function run() {
       width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
     });
 
+    // The lifecycle assertions use English as their stable baseline. Keep
+    // that explicit so the test does not depend on the runner's browser
+    // language now that the UI follows Agent's browser-locale negotiation.
+    // Inject it before the first navigation so the app has no locale flash or
+    // extra reload race in the CDP harness.
+    await page.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `if (!localStorage.getItem("knowledge-language")) localStorage.setItem("knowledge-language", "en");`,
+    });
+
     let firstNavigation = true;
     const navigate = async (route) => {
       if (firstNavigation) {
@@ -370,9 +379,9 @@ async function run() {
 
     await navigate("overview");
     await evaluate(page, `
-      const language = document.getElementById("language");
-      language.value = "zh";
-      language.dispatchEvent(new Event("change", { bubbles: true }));
+      localStorage.setItem("knowledge-language", "zh");
+      location.reload();
+      true;
     `, true);
     await waitForPageValue(page, "Chinese overview", 10_000, `
       document.documentElement.lang === "zh-CN" &&
@@ -384,9 +393,9 @@ async function run() {
     await waitForPageValue(page, "Chinese settings", 10_000,
       `[...document.querySelectorAll("#screen h2")].some((item) => item.textContent === "全局设置")`);
     await evaluate(page, `
-      const language = document.getElementById("language");
-      language.value = "en";
-      language.dispatchEvent(new Event("change", { bubbles: true }));
+      localStorage.setItem("knowledge-language", "en");
+      location.reload();
+      true;
     `, true);
     await waitForPageValue(page, "English settings", 10_000,
       `[...document.querySelectorAll("#screen h2")].some((item) => item.textContent === "Global settings")`);

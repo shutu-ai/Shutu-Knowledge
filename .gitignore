@@ -12,6 +12,7 @@
 # Node / web build
 node_modules/
 web/dist/
+/agent-web-dist/
 
 # Local data (never commit user knowledge data)
 /data/

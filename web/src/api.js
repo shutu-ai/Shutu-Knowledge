@@ -6,8 +6,14 @@ class ApiError extends Error {
   }
 }
 
+// The standalone server is mounted at /, while Agent reverse-proxies the
+// extension below /extensions/<id>/. Keep API requests on the same origin and
+// proxy boundary in both modes.
+const extensionPrefix = window.location.pathname.match(/^(.*\/extensions\/[^/]+)/)?.[1] ?? "";
+const endpoint = (path) => `${extensionPrefix}${path}`;
+
 async function request(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(endpoint(path), {
     ...options,
     headers: { "content-type": "application/json", ...(options.headers ?? {}) },
   });

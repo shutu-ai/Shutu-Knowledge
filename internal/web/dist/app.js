@@ -778,11 +778,10 @@ async function trackJob(id, label) {
   for (;;) {
     const job = await api.job(id);
     state.modelJobs[id] = { label, status: job.status, progress: job.progress };
-    if (state.route === "models") await render();
     if (["done", "failed", "cancelled"].includes(job.status)) {
       const error = job.status === "failed" ? job.error : job.status === "cancelled" ? "Download cancelled" : "";
       delete state.modelJobs[id];
-      await render();
+      if (state.route === "models") await render();
       if (error) throw new Error(error);
       showToast(`${label} complete`);
       return job;

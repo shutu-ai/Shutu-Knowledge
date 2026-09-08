@@ -245,7 +245,18 @@ async function renderBases() {
 
 async function renderDocuments() {
   if (!state.selectedBaseId || !state.bases.some((base) => base.id === state.selectedBaseId)) {
-    screen.append(h("div", { class: "empty panel" }, "Select a knowledge base to manage its documents."));
+    screen.append(h("section", { class: "section" }, [
+      h("div", { class: "section-head" }, [
+        h("h2", {}, "Documents"),
+        basePicker(async (value) => {
+          syncBasePicker(value);
+          state.docFolder = "";
+          state.docPreview = null;
+          await render();
+        }),
+      ]),
+      h("div", { class: "empty panel" }, "Select a knowledge base to manage its documents."),
+    ]));
     return;
   }
   const documents = await api.documents(state.selectedBaseId);

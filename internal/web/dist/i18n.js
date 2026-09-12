@@ -189,6 +189,7 @@ const zh = {
   "Document tasks": "文档任务",
   "active tasks": "个活动任务",
   "Scanning directory": "扫描目录",
+  "Queued for disk": "等待磁盘资源",
   "Loading file": "读取文件",
   "Submitting files": "提交导入",
   "Importing document": "导入文档",

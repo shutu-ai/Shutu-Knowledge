@@ -487,7 +487,7 @@ func (s *Service) submitDirectorySync(kind string, container Document) (string, 
 	if err := s.store.putDocument(container); err != nil {
 		return "", err
 	}
-	jobID, err := s.jobMgr.SubmitWithProgress(kind, baseID, 0, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
+	jobID, err := s.jobMgr.SubmitIOWithProgress(kind, baseID, 0, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
 		report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0})
 		entries, scanErr := s.scanDirectoryTree(jobCtx, root)
 		if scanErr != nil {

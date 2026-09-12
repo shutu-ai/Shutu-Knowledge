@@ -136,6 +136,7 @@ function documentJobCountText(job) {
 }
 
 function documentJobPhaseText(job) {
+  if (job.phase === "queued") return localized("Queued for disk");
   if (job.phase === "scanning") return localized("Scanning directory");
   if (job.phase === "loading") return localized("Loading file");
   if (job.phase === "submitting") return localized("Submitting files");

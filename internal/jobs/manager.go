@@ -62,10 +62,11 @@ type persistedProgress struct {
 }
 
 type task struct {
-	job    Job
-	ctx    context.Context
-	run    func(ctx context.Context, report func(ProgressUpdate)) error
-	cancel context.CancelFunc
+	job     Job
+	ctx     context.Context
+	run     func(ctx context.Context, report func(ProgressUpdate)) error
+	cancel  context.CancelFunc
+	ioHeavy bool
 }
 
 // Manager owns the worker pool and the job registry.
@@ -74,6 +75,7 @@ type Manager struct {
 	mu        sync.Mutex
 	tasks     map[string]*task
 	queue     chan *task
+	ioQueue   chan *task
 	workers   int
 	wg        sync.WaitGroup
 	onFailure func(kind string)
@@ -84,7 +86,13 @@ func New(db *storage.DB, workers int) *Manager {
 	if workers < 1 {
 		workers = 1
 	}
-	return &Manager{db: db, tasks: map[string]*task{}, queue: make(chan *task, 256), workers: workers}
+	return &Manager{
+		db:      db,
+		tasks:   map[string]*task{},
+		queue:   make(chan *task, 256),
+		ioQueue: make(chan *task, 256),
+		workers: workers,
+	}
 }
 
 // Start recovers interrupted jobs, marks stale rows failed, and starts workers.
@@ -101,14 +109,20 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	for i := 0; i < m.workers; i++ {
 		m.wg.Add(1)
-		go m.worker(ctx)
+		go m.worker(ctx, m.queue)
 	}
+	// Storage-heavy work has its own FIFO queue and one dispatcher. This keeps
+	// multiple bases from turning the disk into an unbounded concurrent writer
+	// while normal jobs retain the configured worker pool.
+	m.wg.Add(1)
+	go m.worker(ctx, m.ioQueue)
 	return nil
 }
 
 // Stop waits for in-flight tasks (best effort) and drains workers.
 func (m *Manager) Stop() {
 	close(m.queue)
+	close(m.ioQueue)
 	m.wg.Wait()
 }
 
@@ -122,13 +136,27 @@ func (m *Manager) Submit(kind, baseID string, total int, run func(ctx context.Co
 // SubmitWithProgress enqueues a task whose worker can report phase and
 // byte-level progress in addition to the legacy percentage.
 func (m *Manager) SubmitWithProgress(kind, baseID string, total int, run func(ctx context.Context, report func(ProgressUpdate)) error) (string, error) {
+	return m.submitWithProgress(kind, baseID, total, false, run)
+}
+
+// SubmitIOWithProgress enqueues storage-heavy work behind the single IO
+// dispatcher. The job remains pending while it waits, so the Web UI can show
+// that it is queued instead of implying that disk work has started.
+func (m *Manager) SubmitIOWithProgress(kind, baseID string, total int, run func(ctx context.Context, report func(ProgressUpdate)) error) (string, error) {
+	return m.submitWithProgress(kind, baseID, total, true, run)
+}
+
+func (m *Manager) submitWithProgress(kind, baseID string, total int, ioHeavy bool, run func(ctx context.Context, report func(ProgressUpdate)) error) (string, error) {
 	id, err := newID()
 	if err != nil {
 		return "", err
 	}
 	job := Job{ID: id, Kind: kind, BaseID: baseID, Status: StatusPending, Total: total}
+	if ioHeavy {
+		job.Phase = "queued"
+	}
 	taskCtx, cancel := context.WithCancel(context.Background())
-	t := &task{job: job, ctx: taskCtx, run: run, cancel: cancel}
+	t := &task{job: job, ctx: taskCtx, run: run, cancel: cancel, ioHeavy: ioHeavy}
 	if err := m.persist(job); err != nil {
 		cancel()
 		return "", err
@@ -136,8 +164,12 @@ func (m *Manager) SubmitWithProgress(kind, baseID string, total int, run func(ct
 	m.mu.Lock()
 	m.tasks[id] = t
 	m.mu.Unlock()
+	queue := m.queue
+	if ioHeavy {
+		queue = m.ioQueue
+	}
 	select {
-	case m.queue <- t:
+	case queue <- t:
 	default:
 		// Queue full: fail the job loudly instead of blocking the caller.
 		cancel()
@@ -149,14 +181,14 @@ func (m *Manager) SubmitWithProgress(kind, baseID string, total int, run func(ct
 	return id, nil
 }
 
-func (m *Manager) worker(ctx context.Context) {
+func (m *Manager) worker(ctx context.Context, queue <-chan *task) {
 	defer m.wg.Done()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case t, ok := <-m.queue:
+		case t, ok := <-queue:
 			if !ok {
 				return
 			}
@@ -166,8 +198,15 @@ func (m *Manager) worker(ctx context.Context) {
 }
 
 func (m *Manager) runTask(t *task) {
+	if err := t.ctx.Err(); err != nil {
+		m.finishTask(t, err)
+		return
+	}
 	m.mu.Lock()
 	t.job.Status = StatusRunning
+	if t.ioHeavy && t.job.Phase == "queued" {
+		t.job.Phase = ""
+	}
 	snapshot := t.job
 	m.mu.Unlock()
 	_ = m.persist(snapshot)
@@ -211,6 +250,10 @@ func (m *Manager) runTask(t *task) {
 		_ = m.persist(snapshot)
 	}
 	err := t.run(context.WithValue(t.ctx, managerKey{}, m), report)
+	m.finishTask(t, err)
+}
+
+func (m *Manager) finishTask(t *task, err error) {
 	m.mu.Lock()
 	switch {
 	case err == nil:
@@ -222,7 +265,7 @@ func (m *Manager) runTask(t *task) {
 		t.job.Status = StatusFailed
 		t.job.Error = err.Error()
 	}
-	snapshot = t.job
+	snapshot := t.job
 	t.cancel()
 	delete(m.tasks, t.job.ID)
 	m.mu.Unlock()

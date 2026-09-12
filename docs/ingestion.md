@@ -15,7 +15,7 @@ reading each file.
 | Source | Behavior |
 |---|---|
 | Text | Creates one document and immediately parses/chunks/indexes it. |
-| Files | Batch requests are planned for title/content-hash conflicts and scheduled by a bounded pool; at most two storage-heavy ingest pipelines run concurrently to keep disk IO available to Web. |
+| Files | Batch requests are planned for title/content-hash conflicts and scheduled by a bounded pool. Storage-heavy imports, reindexes, and model downloads use a separate FIFO IO queue, with one storage-heavy job at a time; normal jobs and Web reads remain available while later IO jobs stay pending. |
 | URL | Downloads current content, derives title when possible, and supports changed/unchanged refresh. |
 | Directory | Recursively scans supported files and tracks every nested directory/file as an owned document; supports rescan, repointing to a new source path, recursive deletion, and per-entry failures. |
 

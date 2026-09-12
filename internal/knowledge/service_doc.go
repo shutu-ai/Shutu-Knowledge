@@ -580,7 +580,7 @@ func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error
 		return "", err
 	}
 	total := len(docs)
-	return s.jobMgr.SubmitWithProgress("reindex_base", baseID, total, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
+	return s.jobMgr.SubmitIOWithProgress("reindex_base", baseID, total, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
 		for i, doc := range docs {
 			select {
 			case <-jobCtx.Done():

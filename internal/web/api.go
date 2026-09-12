@@ -625,7 +625,7 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("at least one document is required"))
 		return
 	}
-	jobID, err := s.app.Jobs.SubmitWithProgress("reindex_documents", "", len(body.IDs), func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+	jobID, err := s.app.Jobs.SubmitIOWithProgress("reindex_documents", "", len(body.IDs), func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
 		for index, id := range body.IDs {
 			doc, _, docErr := s.app.Knowledge.GetDocument(id, false)
 			if docErr != nil {
@@ -655,7 +655,7 @@ func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	jobID, err := s.app.Jobs.SubmitWithProgress("reindex_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+	jobID, err := s.app.Jobs.SubmitIOWithProgress("reindex_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
 		if _, err := s.app.Knowledge.ReindexDocument(ctx, doc.ID); err != nil {
 			return err
 		}
@@ -978,7 +978,7 @@ func (s *Server) downloadLocalModel(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if managedModel {
 		progressMode = "determinate"
-		jobID, err = s.app.Jobs.SubmitWithProgress("download-model", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		jobID, err = s.app.Jobs.SubmitIOWithProgress("download-model", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
 			managed, ok := s.app.Runtime.(runtime.ManagedModelController)
 			if !ok {
 				return errors.New("managed runtime model control is unavailable")

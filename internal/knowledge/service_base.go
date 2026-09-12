@@ -44,9 +44,10 @@ type Service struct {
 	captionOptions *caption.Options
 	// batchMu serializes batch planning so title/hash decisions see one
 	// consistent snapshot before bounded ingestion workers start.
-	batchMu   sync.Mutex
-	metricsMu sync.Mutex
-	metrics   MetricsSnapshot
+	batchMu     sync.Mutex
+	ingestSlots chan struct{}
+	metricsMu   sync.Mutex
+	metrics     MetricsSnapshot
 }
 
 // NewService builds the service over the shared database.
@@ -58,7 +59,23 @@ func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config,
 			TimeoutMS: 120_000,
 		}))
 	}
-	service := &Service{store: newStore(db), raw: raw, parsers: parser.NewRegistry(registryOptions...), global: global, jobMgr: jobMgr}
+	ingestWorkers := global.Jobs.ImportWorkers
+	if ingestWorkers < 1 {
+		ingestWorkers = 1
+	}
+	// Two concurrent ingest pipelines retain useful provider parallelism while
+	// preventing several chunk/vector rewrites from saturating the disk.
+	if ingestWorkers > 2 {
+		ingestWorkers = 2
+	}
+	service := &Service{
+		store:       newStore(db),
+		raw:         raw,
+		parsers:     parser.NewRegistry(registryOptions...),
+		global:      global,
+		jobMgr:      jobMgr,
+		ingestSlots: make(chan struct{}, ingestWorkers),
+	}
 	if strings.TrimSpace(global.Helpers.ContentConverter) != "" {
 		service.content = parser.ExecHelper{
 			Template:  global.Helpers.ContentConverter,
@@ -474,7 +491,7 @@ func (s *Service) DeleteBase(id string) error {
 	if _, err := s.store.getBase(id); err != nil {
 		return err
 	}
-	docs, err := s.store.listDocuments(id)
+	docs, err := s.store.listDocumentMetadata(id)
 	if err != nil {
 		return err
 	}

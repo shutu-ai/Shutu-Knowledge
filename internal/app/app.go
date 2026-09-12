@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
@@ -42,11 +43,28 @@ type App struct {
 	Runtime   runtime.Controller
 	// ManagedRuntime reports whether Knowledge prepared its own pinned runtime
 	// rather than using an explicitly configured deployment helper.
-	ManagedRuntime bool
+	ManagedRuntime  bool
+	startupOnce     sync.Once
+	startupDone     chan struct{}
+	maintenanceOnce sync.Once
+	maintenanceDone chan struct{}
 }
 
 // New resolves config, opens storage, and registers core health checkers.
 func New(ctx context.Context) (*App, error) {
+	return NewWithOptions(ctx, Options{})
+}
+
+// Options controls whether potentially expensive startup reconciliation runs
+// before New returns. Agent extensions use deferred startup so their web
+// endpoint can be published before a large database is scanned.
+type Options struct {
+	DeferStartupRecovery bool
+}
+
+// NewWithOptions resolves config, opens storage, and registers core health
+// checkers with the requested startup behavior.
+func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -94,27 +112,94 @@ func New(ctx context.Context) (*App, error) {
 		application.Knowledge.SetOCRArtifactProvider(application.ocrArtifactPath)
 	}
 	application.registerOptionalHealth()
-	if resumed, failed, err := application.Knowledge.RecoverInterrupted(ctx); err != nil {
-		logger.Warn("startup recovery incomplete", "error", err)
-	} else if resumed > 0 || failed > 0 {
-		logger.Info("startup recovery", "resumed", resumed, "failed", failed)
+	if options.DeferStartupRecovery {
+		return application, nil
 	}
-	if removedRaw, fixedCounts, err := application.Knowledge.ReconcileStorage(); err != nil {
-		logger.Warn("storage reconciliation incomplete", "error", err)
-	} else if removedRaw > 0 || fixedCounts > 0 {
-		logger.Info("storage reconciliation", "removedRaw", removedRaw, "fixedChunkCounts", fixedCounts)
-	}
-	if maintenance, err := application.DB.MaintainSQLite(
-		cfg.Maintenance.FTSAutoOptimize,
-		cfg.Maintenance.Vacuum,
-		int64(cfg.Maintenance.VacuumThresholdMB)*1024*1024,
-	); err != nil {
-		logger.Warn("storage maintenance incomplete", "error", err)
-	} else if maintenance.FTSOptimized || maintenance.Vacuumed {
-		logger.Info("storage maintenance", "ftsOptimized", maintenance.FTSOptimized,
-			"vacuumed", maintenance.Vacuumed, "databaseBytes", maintenance.DatabaseBytes)
-	}
+	application.runStartupRecovery(ctx)
+	application.startupOnce.Do(func() {})
 	return application, nil
+}
+
+// StartBackgroundRecovery defers document recovery and storage reconciliation
+// until after the HTTP listener is available. This is important for Agent
+// extension startup when the database contains many documents or a large WAL.
+func (a *App) StartBackgroundRecovery() {
+	a.startupOnce.Do(func() {
+		a.startupDone = make(chan struct{})
+		go func() {
+			defer close(a.startupDone)
+			a.runStartupRecovery(context.Background())
+		}()
+	})
+}
+
+func (a *App) runStartupRecovery(ctx context.Context) {
+	if resumed, failed, err := a.Knowledge.RecoverInterrupted(ctx); err != nil {
+		a.Logger.Warn("startup recovery incomplete", "error", err)
+	} else if resumed > 0 || failed > 0 {
+		a.Logger.Info("startup recovery", "resumed", resumed, "failed", failed)
+	}
+	if removedRaw, fixedCounts, err := a.Knowledge.ReconcileStorage(); err != nil {
+		a.Logger.Warn("storage reconciliation incomplete", "error", err)
+	} else if removedRaw > 0 || fixedCounts > 0 {
+		a.Logger.Info("storage reconciliation", "removedRaw", removedRaw, "fixedChunkCounts", fixedCounts)
+	}
+}
+
+// StartupInProgress reports whether deferred startup recovery is still
+// running. It is deliberately a non-blocking check for HTTP and Agent health
+// handlers.
+func (a *App) StartupInProgress() bool {
+	done := a.startupDone
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
+// HealthSnapshot keeps readiness probes independent from deferred startup
+// work. The database-backed checks run once recovery has completed.
+func (a *App) HealthSnapshot(ctx context.Context) health.Report {
+	if a.StartupInProgress() {
+		return health.Report{
+			Ready:  true,
+			Status: "starting",
+			Components: []health.Component{{
+				Name:   "startup-recovery",
+				Status: "ok",
+				Detail: "storage recovery is running in the background",
+			}},
+		}
+	}
+	return a.Health.Snapshot(ctx)
+}
+
+// StartBackgroundMaintenance defers potentially long-running SQLite vacuum
+// work until the service is listening. Extension protocol initialization must
+// not wait for maintenance of a large database.
+func (a *App) StartBackgroundMaintenance() {
+	a.maintenanceOnce.Do(func() {
+		a.maintenanceDone = make(chan struct{})
+		go func() {
+			defer close(a.maintenanceDone)
+			maintenance, err := a.DB.MaintainSQLite(
+				a.Config.Maintenance.FTSAutoOptimize,
+				a.Config.Maintenance.Vacuum,
+				int64(a.Config.Maintenance.VacuumThresholdMB)*1024*1024,
+			)
+			if err != nil {
+				a.Logger.Warn("storage maintenance incomplete", "error", err)
+			} else if maintenance.FTSOptimized || maintenance.Vacuumed {
+				a.Logger.Info("storage maintenance", "ftsOptimized", maintenance.FTSOptimized,
+					"vacuumed", maintenance.Vacuumed, "databaseBytes", maintenance.DatabaseBytes)
+			}
+		}()
+	})
 }
 
 func (a *App) registerOptionalHealth() {
@@ -385,15 +470,15 @@ func (a *App) registerHealth() {
 	a.Health.Register(health.CheckerFunc{
 		CheckName: "database",
 		Level:     health.Critical,
-		Fn: func(context.Context) error {
-			return a.DB.Ping()
+		Fn: func(ctx context.Context) error {
+			return a.DB.PingContext(ctx)
 		},
 	})
 	a.Health.Register(health.CheckerFunc{
 		CheckName: "schema",
 		Level:     health.Critical,
 		Fn: func(context.Context) error {
-			v, err := storage.SchemaVersion(a.DB.DB)
+			v, err := storage.SchemaVersion(a.DB.ReadDB())
 			if err != nil {
 				return err
 			}
@@ -521,7 +606,8 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 	if a.Runtime != nil {
 		runtimeStatus := a.Runtime.Status(context.Background())
 		addManaged := func(id, kind, capability string) {
-			if strings.TrimSpace(id) == "" || !a.ManagedRuntime || seen[id] {
+			id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
+			if id == "" || !a.ManagedRuntime || seen[id] {
 				return
 			}
 			health := runtimeStatus[capability]
@@ -541,23 +627,41 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 				}
 			}
 			status := "not-downloaded"
-			if health.Ready {
+			switch {
+			case health.Lifecycle == models.LifecycleFailed:
+				status = "incomplete"
+			case health.Ready || (health.Model != "" && health.Lifecycle != models.LifecycleNotInstalled) || health.Lifecycle == models.LifecycleInstalled || health.Lifecycle == models.LifecycleLoading || health.Lifecycle == models.LifecycleReady:
 				status = "installed"
-				lifecycle = models.LifecycleReady
+				if health.Ready {
+					lifecycle = models.LifecycleReady
+				}
+			}
+			var selfTest *knowledge.RerankSelfTest
+			if kind == models.KindRerank {
+				test, err := a.Knowledge.GetRerankSelfTest(id, 0, 0, 0)
+				if err == nil && test.CheckedAt > 0 {
+					selfTest = &test
+				}
 			}
 			views = append(views, LocalModelView{Model: models.Model{
 				ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
 				Ready: health.Ready, Runtime: health.Version, RuntimePath: runtimePath,
 				LastError: lastError, Remediation: remediation,
-			}})
+			}, SelfTest: selfTest})
 			seen[id] = true
 		}
-		if a.Config.Embedding.Provider == "local" {
-			addManaged(a.Config.Embedding.Model, models.KindEmbedding, runtime.CapabilityEmbedding)
+		addManagedCandidate := func(configuredID string, kind, capability string, useConfigured bool) {
+			health := runtimeStatus[capability]
+			if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
+				addManaged(health.Model, kind, capability)
+				return
+			}
+			if useConfigured {
+				addManaged(configuredID, kind, capability)
+			}
 		}
-		if a.Config.Rerank.Enabled {
-			addManaged(strings.TrimPrefix(a.Config.Rerank.Model, "local:"), models.KindRerank, runtime.CapabilityRerank)
-		}
+		addManagedCandidate(a.Config.Embedding.Model, models.KindEmbedding, runtime.CapabilityEmbedding, a.Config.Embedding.Provider == "local")
+		addManagedCandidate(a.Config.Rerank.Model, models.KindRerank, runtime.CapabilityRerank, a.Config.Rerank.Enabled)
 	}
 	return views, nil
 }
@@ -565,16 +669,53 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 // SelfTestReranker asks the isolated helper to score relevant and irrelevant
 // samples. A passing test requires finite, ordered, differentiated scores.
 func (a *App) SelfTestReranker(ctx context.Context, id string) (knowledge.RerankSelfTest, error) {
+	return a.SelfTestRerankerWithProgress(ctx, id, nil)
+}
+
+// SelfTestRerankerWithProgress performs the same readiness check while
+// exposing managed-runtime loading phases to the Web job layer.
+func (a *App) SelfTestRerankerWithProgress(ctx context.Context, id string, report func(runtime.ModelProgress)) (knowledge.RerankSelfTest, error) {
 	id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
 	model, err := a.Models.Get(id)
 	if err != nil {
-		return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are not downloaded")
+		// The managed runtime owns its Transformers.js cache and does not
+		// publish the manifest used by the generic artifact manager. Its live
+		// health state is therefore the source of truth for managed models.
+		if !a.ManagedRuntime || a.Runtime == nil {
+			return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are not downloaded")
+		}
+		health := a.Runtime.Status(ctx)[runtime.CapabilityRerank]
+		healthModel := strings.TrimPrefix(strings.TrimSpace(health.Model), "local:")
+		if healthModel != id || health.Lifecycle == "" || health.Lifecycle == models.LifecycleNotInstalled || health.Lifecycle == models.LifecycleFailed {
+			return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are not downloaded")
+		}
+		model = models.Model{
+			ID: id, Kind: models.KindRerank, Status: "installed",
+			Lifecycle: health.Lifecycle, Ready: health.Ready,
+			Runtime: health.Version, RuntimePath: health.Path,
+			LastError: health.LastError, Remediation: health.Remediation,
+		}
 	}
 	if model.Kind != models.KindRerank || model.Status != "installed" {
 		return knowledge.RerankSelfTest{}, fmt.Errorf("local reranker artifacts are incomplete")
 	}
 	if a.Runtime == nil || !a.Runtime.Configured(runtime.CapabilityRerank) {
 		return knowledge.RerankSelfTest{}, fmt.Errorf("local rerank runtime is not configured")
+	}
+	if report != nil {
+		report(runtime.ModelProgress{Phase: "preparing", Percent: 5})
+		if a.ManagedRuntime {
+			if progressive, ok := a.Runtime.(runtime.ProgressiveManagedModelController); ok {
+				if _, err := progressive.LoadModelWithProgress(ctx, runtime.CapabilityRerank, id, report); err != nil {
+					return knowledge.RerankSelfTest{}, fmt.Errorf("rerank model load failed: %w", err)
+				}
+			} else {
+				report(runtime.ModelProgress{Phase: "loading", Percent: 25})
+			}
+		} else {
+			report(runtime.ModelProgress{Phase: "loading", Percent: 25})
+		}
+		report(runtime.ModelProgress{Phase: "testing", Percent: 75})
 	}
 
 	query := "How do I submit an expense report?"
@@ -623,11 +764,20 @@ func (a *App) SelfTestReranker(ctx context.Context, id string) (knowledge.Rerank
 	if err := a.Knowledge.SaveRerankSelfTest(result); err != nil {
 		return result, err
 	}
+	if report != nil {
+		report(runtime.ModelProgress{Phase: "ready", Percent: 100})
+	}
 	return result, nil
 }
 
 // Close releases all resources.
 func (a *App) Close() {
+	if a.startupDone != nil {
+		<-a.startupDone
+	}
+	if a.maintenanceDone != nil {
+		<-a.maintenanceDone
+	}
 	if a.Runtime != nil {
 		a.Runtime.Close()
 	}

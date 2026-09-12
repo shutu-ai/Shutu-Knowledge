@@ -12,10 +12,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 )
 
-// MaxIngestFileBytes bounds one file read from disk (reference: 22 MB).
-const MaxIngestFileBytes = 22 << 20
+// MaxIngestFileBytes bounds one imported file (100 MiB).
+const MaxIngestFileBytes = 100 << 20
 
 // maxDirectoryDepth bounds recursive scans and prevents a filesystem cycle
 // from exhausting a background worker.
@@ -29,6 +32,91 @@ type directoryEntry struct {
 	size     int64
 	isDir    bool
 	err      error
+}
+
+// directorySyncIndex keeps one database snapshot in memory while a directory
+// tree is synchronized. Re-querying all documents for every filesystem entry
+// turns a large tree into an O(files x documents) disk workload.
+type directorySyncIndex struct {
+	docs             []Document
+	byID             map[string]Document
+	directoriesByKey map[string]Document
+	filesByPath      map[string]Document
+	filesByName      map[string]Document
+}
+
+func newDirectorySyncIndex(docs []Document) *directorySyncIndex {
+	index := &directorySyncIndex{
+		docs:             append([]Document(nil), docs...),
+		byID:             make(map[string]Document, len(docs)),
+		directoriesByKey: make(map[string]Document),
+		filesByPath:      make(map[string]Document),
+		filesByName:      make(map[string]Document),
+	}
+	for _, doc := range docs {
+		index.add(doc)
+	}
+	return index
+}
+
+func directoryIndexKey(parentID, value string) string { return parentID + "\x00" + value }
+
+func (i *directorySyncIndex) add(doc Document) {
+	i.byID[doc.ID] = doc
+	if doc.SourceType == "directory" {
+		i.directoriesByKey[directoryIndexKey(doc.ParentDirectoryID, doc.SourcePath)] = doc
+		return
+	}
+	if doc.SourceType == "file" {
+		i.filesByPath[directoryIndexKey(doc.ParentDirectoryID, doc.SourcePath)] = doc
+		i.filesByName[directoryIndexKey(doc.ParentDirectoryID, doc.FileName)] = doc
+	}
+}
+
+func (i *directorySyncIndex) remove(doc Document) {
+	delete(i.byID, doc.ID)
+	if doc.SourceType == "directory" {
+		delete(i.directoriesByKey, directoryIndexKey(doc.ParentDirectoryID, doc.SourcePath))
+		return
+	}
+	if doc.SourceType == "file" {
+		delete(i.filesByPath, directoryIndexKey(doc.ParentDirectoryID, doc.SourcePath))
+		delete(i.filesByName, directoryIndexKey(doc.ParentDirectoryID, doc.FileName))
+	}
+}
+
+func (i *directorySyncIndex) findDirectory(parentID, sourcePath string) (Document, bool) {
+	doc, ok := i.directoriesByKey[directoryIndexKey(parentID, sourcePath)]
+	return doc, ok
+}
+
+func (i *directorySyncIndex) findFile(parentID, sourcePath, fileName string) (Document, bool) {
+	if doc, ok := i.filesByPath[directoryIndexKey(parentID, sourcePath)]; ok {
+		return doc, true
+	}
+	doc, ok := i.filesByName[directoryIndexKey(parentID, fileName)]
+	return doc, ok
+}
+
+func (i *directorySyncIndex) upsert(doc Document) {
+	if old, ok := i.byID[doc.ID]; ok {
+		i.remove(old)
+	}
+	i.add(doc)
+}
+
+func (i *directorySyncIndex) hasAncestor(rootID, parentID string) bool {
+	for current := parentID; current != ""; {
+		if current == rootID {
+			return true
+		}
+		doc, ok := i.byID[current]
+		if !ok {
+			return false
+		}
+		current = doc.ParentDirectoryID
+	}
+	return false
 }
 
 // DirectoryImportError is a bounded summary of per-entry failures. Individual
@@ -64,7 +152,7 @@ func (s *Service) CreateDirectory(baseID, title, parentDirectoryID, sourcePath s
 
 // findDirectoryByPath locates a tracked container by absolute source path.
 func (s *Service) findDirectoryByPath(baseID, sourcePath string) (Document, error) {
-	docs, err := s.store.listDocuments(baseID)
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return Document{}, err
 	}
@@ -79,13 +167,16 @@ func (s *Service) findDirectoryByPath(baseID, sourcePath string) (Document, erro
 // scanDirectoryTree recursively returns supported files and ordinary
 // directories, sorted by stable relative path. Read errors are retained per
 // entry so one unreadable subtree cannot hide the rest of the source tree.
-func (s *Service) scanDirectoryTree(root string) ([]directoryEntry, error) {
+func (s *Service) scanDirectoryTree(ctx context.Context, root string) ([]directoryEntry, error) {
 	supported := map[string]bool{}
 	for _, ext := range s.parsers.SupportedExtensions() {
 		supported[strings.ToLower(ext)] = true
 	}
 	var entries []directoryEntry
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			entry := directoryEntry{absPath: path, isDir: true, err: walkErr}
 			if d != nil && !d.IsDir() {
@@ -178,9 +269,10 @@ func (s *Service) scanDirectory(root string) ([]directoryEntry, error) {
 	return entries, nil
 }
 
-// ImportDirectoryTree imports (or incrementally rescans) a directory into a
-// stable container: new files import, changed files rebuild, unchanged skip,
-// missing files are removed. Runs as a background job with progress/cancel.
+// ImportDirectoryTree recursively imports (or incrementally rescans) every
+// supported file below a directory into stable directory containers: new
+// files import, changed files rebuild, unchanged skip, missing files are
+// removed. Runs as a background job with progress/cancel.
 func (s *Service) ImportDirectoryTree(ctx context.Context, baseID, rootPath string) (string, error) {
 	if s.jobMgr == nil {
 		return "", fmt.Errorf("job manager is not running")
@@ -196,10 +288,6 @@ func (s *Service) ImportDirectoryTree(ctx context.Context, baseID, rootPath stri
 	if err != nil {
 		absolute = rootPath
 	}
-	entries, err := s.scanDirectoryTree(absolute)
-	if err != nil {
-		return "", err
-	}
 	container, err := s.findDirectoryByPath(baseID, absolute)
 	if err == ErrNotFound {
 		container, err = s.CreateDirectory(baseID, filepath.Base(absolute), "", absolute)
@@ -209,12 +297,12 @@ func (s *Service) ImportDirectoryTree(ctx context.Context, baseID, rootPath stri
 	} else if err != nil {
 		return "", err
 	}
-	return s.submitDirectorySync("import_directory", container, entries)
+	return s.submitDirectorySync("import_directory", container)
 }
 
 // importChildFile imports one scanned file incrementally:
 // unchanged hash -> skip; changed/new -> (re)import; too large -> error.
-func (s *Service) importChildFile(ctx context.Context, baseID, containerID string, entry directoryEntry) (*Document, error) {
+func (s *Service) importChildFile(ctx context.Context, baseID, containerID string, entry directoryEntry, index *directorySyncIndex) (*Document, error) {
 	if entry.size > MaxIngestFileBytes {
 		return nil, fmt.Errorf("file exceeds %d MB limit", MaxIngestFileBytes>>20)
 	}
@@ -233,7 +321,7 @@ func (s *Service) importChildFile(ctx context.Context, baseID, containerID strin
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
 
-	existing, exists, err := s.findChildFile(baseID, containerID, entry)
+	existing, exists, err := s.findChildFile(baseID, containerID, entry, index)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +336,7 @@ func (s *Service) importChildFile(ctx context.Context, baseID, containerID strin
 		if err := s.DeleteDocument(existing.ID); err != nil {
 			return nil, err
 		}
+		index.remove(existing)
 	}
 	doc := s.newDocument(baseID, entry.relPath, "file")
 	doc.ParentDirectoryID = containerID
@@ -256,6 +345,7 @@ func (s *Service) importChildFile(ctx context.Context, baseID, containerID strin
 	if err := s.ingest(ctx, &doc, s.baseConfigOrEmpty(baseID), data); err != nil {
 		return nil, err
 	}
+	index.add(doc)
 	return &doc, nil
 }
 
@@ -283,11 +373,7 @@ func (s *Service) RescanDirectory(directoryID string) (string, error) {
 		}
 		return "", fmt.Errorf("%s", doc.ErrorMessage)
 	}
-	entries, err := s.scanDirectoryTree(doc.SourcePath)
-	if err != nil {
-		return "", err
-	}
-	return s.submitDirectorySync("rescan_directory", doc, entries)
+	return s.submitDirectorySync("rescan_directory", doc)
 }
 
 // RepointSource changes the live path of one top-level file or directory.
@@ -357,7 +443,7 @@ func (s *Service) DeleteDirectoryRecursive(directoryID string) (int, error) {
 	if doc.SourceType != "directory" {
 		return 0, fmt.Errorf("document is not a directory")
 	}
-	docs, err := s.store.listDocuments(doc.BaseID)
+	docs, err := s.store.listDocumentMetadata(doc.BaseID)
 	if err != nil {
 		return 0, err
 	}
@@ -385,26 +471,94 @@ func (s *Service) DeleteDirectoryRecursive(directoryID string) (int, error) {
 	return removed + 1, nil
 }
 
-func (s *Service) submitDirectorySync(kind string, container Document, entries []directoryEntry) (string, error) {
+func (s *Service) submitDirectorySync(kind string, container Document) (string, error) {
 	if s.jobMgr == nil {
 		return "", fmt.Errorf("job manager is not running")
 	}
 	containerID, baseID, root := container.ID, container.BaseID, container.SourcePath
-	return s.jobMgr.Submit(kind, baseID, len(entries), func(jobCtx context.Context, report func(int)) error {
-		return s.syncNestedDirectoryTree(jobCtx, baseID, containerID, root, entries, report)
+	container.Status = StatusProcessing
+	// The document phase is constrained by the existing schema to parsing or
+	// embedding. The job itself carries the more precise "scanning" phase.
+	container.Phase = PhaseParsing
+	container.Progress = 0
+	container.ErrorCode = ""
+	container.ErrorMessage = ""
+	container.UpdatedAt = now()
+	if err := s.store.putDocument(container); err != nil {
+		return "", err
+	}
+	jobID, err := s.jobMgr.SubmitWithProgress(kind, baseID, 0, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
+		report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0})
+		entries, scanErr := s.scanDirectoryTree(jobCtx, root)
+		if scanErr != nil {
+			s.markDirectorySyncFailed(containerID, scanErr)
+			return scanErr
+		}
+		report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0, Total: len(entries)})
+		lastProgress := -1
+		lastReportAt := time.Time{}
+		progressStep := len(entries) / 100
+		if progressStep < 1 {
+			progressStep = 1
+		}
+		emitProgress := func(progress int, file string) {
+			completed := progress >= len(entries)
+			now := time.Now()
+			if !completed && progress-lastProgress < progressStep && now.Sub(lastReportAt) < 500*time.Millisecond {
+				return
+			}
+			lastProgress = progress
+			lastReportAt = now
+			s.updateDirectorySyncProgress(containerID, progress)
+			report(jobs.ProgressUpdate{Phase: PhaseScanning, File: file, Completed: progress, Total: len(entries)})
+		}
+		syncErr := s.syncNestedDirectoryTree(jobCtx, baseID, containerID, root, entries, emitProgress)
+		if syncErr == nil && len(entries) == 0 {
+			emitProgress(0, "")
+		}
+		if syncErr != nil {
+			s.markDirectorySyncFailed(containerID, syncErr)
+		}
+		return syncErr
 	})
+	if err != nil {
+		s.markDirectorySyncFailed(containerID, err)
+	}
+	return jobID, err
 }
 
-func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, root string, entries []directoryEntry, report func(int)) error {
-	byRel := map[string]directoryEntry{}
-	directoryIDs := map[string]string{rootID: "."}
-	for _, entry := range entries {
-		byRel[entry.relPath] = entry
+func (s *Service) updateDirectorySyncProgress(id string, progress int) {
+	doc, err := s.store.getDocument(id)
+	if err != nil {
+		return
 	}
-	_, err := s.store.listDocuments(baseID)
+	doc.Status = StatusProcessing
+	doc.Phase = PhaseParsing
+	doc.Progress = progress
+	doc.UpdatedAt = now()
+	_ = s.store.putDocument(doc)
+}
+
+func (s *Service) markDirectorySyncFailed(id string, cause error) {
+	doc, err := s.store.getDocument(id)
+	if err != nil {
+		return
+	}
+	doc.Status = StatusFailed
+	doc.Phase = ""
+	doc.ErrorCode = ErrParseFailed
+	doc.ErrorMessage = cause.Error()
+	doc.UpdatedAt = now()
+	_ = s.store.putDocument(doc)
+}
+
+func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, root string, entries []directoryEntry, report func(int, string)) error {
+	directoryIDs := map[string]string{rootID: "."}
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return err
 	}
+	index := newDirectorySyncIndex(docs)
 	kept := map[string]bool{}
 	failures := 0
 	var firstErr error
@@ -413,18 +567,18 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 		if firstErr == nil {
 			firstErr = fmt.Errorf("%s: %w", entry.relPath, err)
 		}
-		if id := s.recordChildFailure(baseID, rootID, entry, err); id != "" {
+		if id := s.recordChildFailure(baseID, rootID, entry, err, index); id != "" {
 			kept[id] = true
 		}
 	}
 
-	for _, entry := range entries {
+	for entryIndex, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if entry.err != nil {
 			fail(entry, entry.err)
-			report(processedCount(entries, entry.relPath))
+			report(entryIndex+1, entry.relPath)
 			continue
 		}
 		parentRel := filepath.ToSlash(filepath.Dir(entry.relPath))
@@ -434,12 +588,12 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 				parentID = id
 			} else {
 				fail(entry, fmt.Errorf("parent directory was not synced"))
-				report(processedCount(entries, entry.relPath))
+				report(entryIndex+1, entry.relPath)
 				continue
 			}
 		}
 		if entry.isDir {
-			doc, err := s.syncDirectoryContainer(baseID, parentID, entry)
+			doc, err := s.syncDirectoryContainer(baseID, parentID, entry, index)
 			if err != nil {
 				fail(entry, err)
 			} else {
@@ -447,25 +601,21 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 				directoryIDs[entry.relPath] = doc.ID
 			}
 		} else {
-			doc, err := s.importChildFile(ctx, baseID, parentID, entry)
+			doc, err := s.importChildFile(ctx, baseID, parentID, entry, index)
 			if err != nil {
 				fail(entry, err)
 			} else if doc != nil {
 				kept[doc.ID] = true
 			}
 		}
-		report(processedCount(entries, entry.relPath))
+		report(entryIndex+1, entry.relPath)
 	}
 
-	descendants, err := s.store.listDocuments(baseID)
-	if err != nil {
-		return err
-	}
-	for _, doc := range descendants {
+	for _, doc := range index.docs {
 		if doc.ParentDirectoryID == "" || kept[doc.ID] {
 			continue
 		}
-		if !s.hasAncestor(rootID, doc.ParentDirectoryID, descendants) {
+		if !index.hasAncestor(rootID, doc.ParentDirectoryID) {
 			continue
 		}
 		if err := s.DeleteDocument(doc.ID); err != nil && err != ErrNotFound {
@@ -480,6 +630,8 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 	}
 	if container, err := s.store.getDocument(rootID); err == nil {
 		container.Status = StatusReady
+		container.Phase = ""
+		container.Progress = 100
 		container.ErrorCode = ""
 		container.ErrorMessage = ""
 		container.UpdatedAt = now()
@@ -488,62 +640,42 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 	return nil
 }
 
-func (s *Service) syncDirectoryContainer(baseID, parentID string, entry directoryEntry) (Document, error) {
-	docs, err := s.store.listDocuments(baseID)
-	if err != nil {
-		return Document{}, err
-	}
-	for _, doc := range docs {
-		if doc.SourceType == "directory" && doc.ParentDirectoryID == parentID && doc.SourcePath == entry.absPath {
-			doc.Title = entry.fileName
-			doc.UpdatedAt = now()
-			return doc, s.store.putDocument(doc)
+func (s *Service) syncDirectoryContainer(baseID, parentID string, entry directoryEntry, index *directorySyncIndex) (Document, error) {
+	if doc, ok := index.findDirectory(parentID, entry.absPath); ok {
+		doc.Title = entry.fileName
+		doc.UpdatedAt = now()
+		if err := s.store.putDocument(doc); err != nil {
+			return Document{}, err
 		}
+		index.upsert(doc)
+		return doc, nil
 	}
-	return s.CreateDirectory(baseID, entry.fileName, parentID, entry.absPath)
+	doc, err := s.CreateDirectory(baseID, entry.fileName, parentID, entry.absPath)
+	if err == nil {
+		index.add(doc)
+	}
+	return doc, err
 }
 
-func (s *Service) findChildFile(baseID, parentID string, entry directoryEntry) (Document, bool, error) {
-	docs, err := s.store.listDocuments(baseID)
-	if err != nil {
-		return Document{}, false, err
-	}
-	for _, doc := range docs {
-		if doc.SourceType != "file" || doc.ParentDirectoryID != parentID {
-			continue
-		}
-		if doc.SourcePath == entry.absPath || doc.FileName == entry.fileName {
-			return doc, true, nil
-		}
+func (s *Service) findChildFile(_ string, parentID string, entry directoryEntry, index *directorySyncIndex) (Document, bool, error) {
+	if doc, ok := index.findFile(parentID, entry.absPath, entry.fileName); ok {
+		return doc, true, nil
 	}
 	return Document{}, false, nil
 }
 
-func (s *Service) recordChildFailure(baseID, rootID string, entry directoryEntry, cause error) string {
+func (s *Service) recordChildFailure(baseID, rootID string, entry directoryEntry, cause error, index *directorySyncIndex) string {
 	if entry.isDir {
 		return ""
 	}
-	docs, err := s.store.listDocuments(baseID)
-	if err != nil {
-		return ""
-	}
 	parentID := rootID
-	var existing *Document
-	for index, doc := range docs {
-		if doc.SourceType == "file" && (doc.SourcePath == entry.absPath || doc.FileName == entry.fileName) {
-			candidate := docs[index]
-			existing = &candidate
-			if doc.SourcePath == entry.absPath {
-				break
-			}
-		}
-	}
-	if existing != nil {
+	if existing, ok := index.findFile(parentID, entry.absPath, entry.fileName); ok {
 		existing.Status = StatusFailed
 		existing.ErrorCode = ErrParseFailed
 		existing.ErrorMessage = cause.Error()
 		existing.UpdatedAt = now()
-		_ = s.store.putDocument(*existing)
+		_ = s.store.putDocument(existing)
+		index.upsert(existing)
 		return existing.ID
 	}
 	failed := s.newDocument(baseID, entry.relPath, "file")
@@ -554,33 +686,6 @@ func (s *Service) recordChildFailure(baseID, rootID string, entry directoryEntry
 	failed.ErrorCode = ErrParseFailed
 	failed.ErrorMessage = cause.Error()
 	_ = s.store.putDocument(failed)
+	index.add(failed)
 	return failed.ID
-}
-
-func (s *Service) hasAncestor(rootID, parentID string, docs []Document) bool {
-	byID := map[string]Document{}
-	for _, doc := range docs {
-		byID[doc.ID] = doc
-	}
-	for current := parentID; current != ""; {
-		if current == rootID {
-			return true
-		}
-		parent, ok := byID[current]
-		if !ok || parent.ParentDirectoryID == "" {
-			return false
-		}
-		current = parent.ParentDirectoryID
-	}
-	return false
-}
-
-func processedCount(entries []directoryEntry, relPath string) int {
-	count := 0
-	for _, entry := range entries {
-		if entry.relPath == "." || entry.relPath <= relPath {
-			count++
-		}
-	}
-	return count
 }

@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -87,6 +88,10 @@ const documentColumns = `id, base_id, title, source_type, file_name, mime_type, 
 	source_path, content_hash, raw_file_path, raw_text, char_count, token_count, chunk_count,
 	status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked`
 
+const documentMetadataColumns = `id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
+	source_path, content_hash, raw_file_path, char_count, token_count, chunk_count,
+	status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked`
+
 func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	var d Document
 	var fileName, mimeType, url, parentDir, sourcePath, contentHash, rawFilePath, rawText sql.NullString
@@ -108,6 +113,36 @@ func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	d.ContentHash = contentHash.String
 	d.RawFilePath = rawFilePath.String
 	d.RawText = rawText.String
+	d.TokenCount = int(tokenCount.Int64)
+	d.UpdatedAt = updatedAt.Int64
+	d.Phase = phase.String
+	d.Incomplete = incomplete != 0
+	d.TitleLocked = titleLocked != 0
+	d.ErrorCode = errorCode.String
+	d.ErrorMessage = errorMessage.String
+	return d, nil
+}
+
+func scanDocumentMetadata(row interface{ Scan(...any) error }) (Document, error) {
+	var d Document
+	var fileName, mimeType, url, parentDir, sourcePath, contentHash, rawFilePath sql.NullString
+	var tokenCount, updatedAt sql.NullInt64
+	var phase, errorCode, errorMessage sql.NullString
+	var incomplete, titleLocked int
+	err := row.Scan(&d.ID, &d.BaseID, &d.Title, &d.SourceType, &fileName, &mimeType, &url, &parentDir,
+		&sourcePath, &contentHash, &rawFilePath, &d.CharCount, &tokenCount, &d.ChunkCount,
+		&d.Status, &phase, &d.Progress, &incomplete, &errorCode, &errorMessage, &d.CreatedAt, &updatedAt,
+		&titleLocked)
+	if err != nil {
+		return Document{}, err
+	}
+	d.FileName = fileName.String
+	d.MimeType = mimeType.String
+	d.URL = url.String
+	d.ParentDirectoryID = parentDir.String
+	d.SourcePath = sourcePath.String
+	d.ContentHash = contentHash.String
+	d.RawFilePath = rawFilePath.String
 	d.TokenCount = int(tokenCount.Int64)
 	d.UpdatedAt = updatedAt.Int64
 	d.Phase = phase.String
@@ -186,6 +221,15 @@ func (s *store) listDocuments(baseID string) ([]Document, error) {
 	return collectDocuments(rows)
 }
 
+func (s *store) listDocumentMetadata(baseID string) ([]Document, error) {
+	rows, err := s.db.Query(`SELECT `+documentMetadataColumns+` FROM documents WHERE base_id = ? ORDER BY created_at, id`, baseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectDocumentMetadata(rows)
+}
+
 func (s *store) listAllDocuments() ([]Document, error) {
 	rows, err := s.db.Query(`SELECT ` + documentColumns + ` FROM documents`)
 	if err != nil {
@@ -193,6 +237,82 @@ func (s *store) listAllDocuments() ([]Document, error) {
 	}
 	defer rows.Close()
 	return collectDocuments(rows)
+}
+
+func (s *store) listAllDocumentMetadata() ([]Document, error) {
+	rows, err := s.db.Query(`SELECT ` + documentMetadataColumns + ` FROM documents`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectDocumentMetadata(rows)
+}
+
+type storageDocumentRef struct {
+	ID          string
+	RawFilePath string
+	ChunkCount  int
+}
+
+func (s *store) recoverInterrupted(updatedAt int64, pendingStatus, processingStatus, failedStatus, interruptedCode, interruptedMessage string) (resumed, failed int, err error) {
+	result, err := s.db.Exec(`UPDATE documents SET status = ?, incomplete = 1, updated_at = ?
+		WHERE source_type <> 'directory' AND status IN (?, ?)
+		  AND (COALESCE(raw_text, '') <> '' OR COALESCE(raw_file_path, '') <> '')`,
+		pendingStatus, updatedAt, pendingStatus, processingStatus)
+	if err != nil {
+		return 0, 0, err
+	}
+	resumed64, err := result.RowsAffected()
+	if err != nil {
+		return 0, 0, err
+	}
+	result, err = s.db.Exec(`UPDATE documents SET status = ?, incomplete = 0,
+		error_code = ?, error_message = ?, updated_at = ?
+		WHERE source_type <> 'directory' AND status IN (?, ?)
+		  AND COALESCE(raw_text, '') = '' AND COALESCE(raw_file_path, '') = ''`,
+		failedStatus, interruptedCode, interruptedMessage, updatedAt, pendingStatus, processingStatus)
+	if err != nil {
+		return int(resumed64), 0, err
+	}
+	failed64, err := result.RowsAffected()
+	if err != nil {
+		return int(resumed64), 0, err
+	}
+	// Directory containers do not have a source payload that can be resumed by
+	// the document importer. If their scan job disappeared with the process,
+	// leave an explicit failed state instead of exposing a phantom active task
+	// forever in indexing-status.
+	result, err = s.db.Exec(`UPDATE documents SET status = ?, incomplete = 0,
+		error_code = ?, error_message = ?, updated_at = ?
+		WHERE source_type = 'directory' AND status IN (?, ?)`,
+		failedStatus, interruptedCode, interruptedMessage, updatedAt, pendingStatus, processingStatus)
+	if err != nil {
+		return int(resumed64), int(failed64), err
+	}
+	directoryFailed64, err := result.RowsAffected()
+	if err != nil {
+		return int(resumed64), int(failed64), err
+	}
+	return int(resumed64), int(failed64) + int(directoryFailed64), nil
+}
+
+// listStorageRefs reads only the fields needed by storage reconciliation.
+// In particular, it avoids loading raw_text for every document.
+func (s *store) listStorageRefs() ([]storageDocumentRef, error) {
+	rows, err := s.db.Query(`SELECT id, COALESCE(raw_file_path, ''), chunk_count FROM documents`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []storageDocumentRef
+	for rows.Next() {
+		var ref storageDocumentRef
+		if err := rows.Scan(&ref.ID, &ref.RawFilePath, &ref.ChunkCount); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
 }
 
 func collectDocuments(rows *sql.Rows) ([]Document, error) {
@@ -207,8 +327,31 @@ func collectDocuments(rows *sql.Rows) ([]Document, error) {
 	return out, rows.Err()
 }
 
+func collectDocumentMetadata(rows *sql.Rows) ([]Document, error) {
+	var out []Document
+	for rows.Next() {
+		d, err := scanDocumentMetadata(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 func (s *store) deleteDocument(id string) error {
 	_, err := s.db.Exec(`DELETE FROM documents WHERE id = ?`, id)
+	return err
+}
+
+func (s *store) countChunksByDoc(docID string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM chunks WHERE doc_id = ?`, docID).Scan(&count)
+	return count, err
+}
+
+func (s *store) updateChunkCount(docID string, count int) error {
+	_, err := s.db.Exec(`UPDATE documents SET chunk_count = ?, updated_at = ? WHERE id = ?`, count, now(), docID)
 	return err
 }
 
@@ -223,12 +366,15 @@ func (s *store) findDocumentByTitle(baseID, title string) (Document, error) {
 
 // ── chunks ───────────────────────────────────────────────────────────────────
 
-func (s *store) putChunksReplace(chunks []Chunk) error {
+func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	docID := chunks[0].DocID
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -236,7 +382,7 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 	// Carry over stored vectors whose embedding-text hash survives the
 	// re-chunk: a reindex must not silently destroy reusable vectors.
 	carried := map[string][2]any{}
-	legacy, err := tx.Query(`SELECT embedding_text_hash, embedding, embedding_model FROM chunks WHERE doc_id = ? AND embedding IS NOT NULL`, docID)
+	legacy, err := tx.QueryContext(ctx, `SELECT embedding_text_hash, embedding, embedding_model FROM chunks WHERE doc_id = ? AND embedding IS NOT NULL`, docID)
 	if err != nil {
 		return err
 	}
@@ -258,7 +404,12 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE doc_id = ?`, docID); err != nil {
 		return err
 	}
-	for _, c := range chunks {
+	for index, c := range chunks {
+		if index%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		var heading any
 		if c.Heading != "" {
 			heading = c.Heading
@@ -276,7 +427,7 @@ func (s *store) putChunksReplace(chunks []Chunk) error {
 			embedding = encodeEmbedding(c.EmbeddingVec)
 			model = c.EmbeddingModel
 		}
-		if _, err := tx.Exec(
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO chunks (id, doc_id, base_id, idx, text, heading, context, embedding, embedding_model, embedding_text_hash, created_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			c.ID, c.DocID, c.BaseID, c.Index, c.Text, heading, c.Context, embedding, model, hash, c.CreatedAt,
@@ -338,7 +489,7 @@ func (s *store) statsFor(baseID string) (Stats, error) {
 		return Stats{}, err
 	}
 	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM chunks`+baseFilter, args...,
+		`SELECT COALESCE(SUM(chunk_count), 0) FROM documents`+baseFilter, args...,
 	).Scan(&stats.ChunkCount); err != nil {
 		return Stats{}, err
 	}

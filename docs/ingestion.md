@@ -7,12 +7,17 @@ directory import. Source bytes or recoverable text are owned by Knowledge's
 raw store before indexing, so a document can be reindexed after configuration
 changes or a restart.
 
+A single imported file is limited to 100 MiB. Web/API uploads accept a larger
+140 MiB JSON envelope to account for Base64 encoding overhead; the raw file
+limit remains 100 MiB. Directory imports apply the same raw-file limit before
+reading each file.
+
 | Source | Behavior |
 |---|---|
 | Text | Creates one document and immediately parses/chunks/indexes it. |
-| Files | Batch requests are planned for title/content-hash conflicts and ingested by a bounded pool of at most five workers. |
+| Files | Batch requests are planned for title/content-hash conflicts and scheduled by a bounded pool; at most two storage-heavy ingest pipelines run concurrently to keep disk IO available to Web. |
 | URL | Downloads current content, derives title when possible, and supports changed/unchanged refresh. |
-| Directory | Tracks nested files as owned documents, supports rescan, repointing to a new source path, recursive deletion, and per-entry failures. |
+| Directory | Recursively scans supported files and tracks every nested directory/file as an owned document; supports rescan, repointing to a new source path, recursive deletion, and per-entry failures. |
 
 ## Formats
 

@@ -402,11 +402,19 @@ func TestRecoverInterrupted(t *testing.T) {
 	if err := f.service.store.putDocument(resumable); err != nil {
 		t.Fatal(err)
 	}
+	// A directory container has no resumable importer after its job is lost;
+	// it must not remain visible as an active scan after restart.
+	directory := f.service.newDocument(base.ID, "directory", "directory")
+	directory.Status = StatusProcessing
+	directory.Phase = PhaseParsing
+	if err := f.service.store.putDocument(directory); err != nil {
+		t.Fatal(err)
+	}
 	resumed, failed, err := f.service.RecoverInterrupted(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resumed != 1 || failed != 1 {
+	if resumed != 1 || failed != 2 {
 		t.Fatalf("recovery counts: resumed=%d failed=%d", resumed, failed)
 	}
 	got, _, err := f.service.GetDocument(hopeless.ID, false)
@@ -416,6 +424,10 @@ func TestRecoverInterrupted(t *testing.T) {
 	got2, _, _ := f.service.GetDocument(resumable.ID, false)
 	if got2.Status != StatusPending {
 		t.Fatalf("resumable doc status: %+v", got2)
+	}
+	got3, _, _ := f.service.GetDocument(directory.ID, false)
+	if got3.Status != StatusFailed || got3.ErrorCode != ErrInterrupted {
+		t.Fatalf("directory doc: %+v", got3)
 	}
 }
 

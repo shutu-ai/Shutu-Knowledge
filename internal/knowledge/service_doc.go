@@ -15,6 +15,7 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/caption"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
+	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
 
@@ -74,7 +75,7 @@ func (s *Service) chunkOptions(cfg BaseConfig) ChunkOptions {
 
 // ListDocuments returns summaries for one base.
 func (s *Service) ListDocuments(baseID string) ([]DocumentSummary, error) {
-	docs, err := s.store.listDocuments(baseID)
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +167,7 @@ type IndexingStatus struct {
 
 // IndexingStatus reports active imports across every base.
 func (s *Service) IndexingStatus() ([]IndexingStatus, error) {
-	docs, err := s.store.listAllDocuments()
+	docs, err := s.store.listAllDocumentMetadata()
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +210,7 @@ func (s *Service) DeleteDocument(id string) error {
 		return err
 	}
 	if doc.SourceType == "directory" {
-		children, err := s.store.listDocuments(doc.BaseID)
+		children, err := s.store.listDocumentMetadata(doc.BaseID)
 		if err != nil {
 			return err
 		}
@@ -278,6 +279,9 @@ func (s *Service) AddFileDocument(ctx context.Context, baseID, fileName string, 
 	if fileName = strings.TrimSpace(fileName); fileName == "" {
 		return Document{}, fmt.Errorf("file name is required")
 	}
+	if len(data) > MaxIngestFileBytes {
+		return Document{}, fmt.Errorf("file exceeds %d MB limit", MaxIngestFileBytes>>20)
+	}
 	doc := s.newDocument(baseID, fileName, "file")
 	doc.FileName = fileName
 	doc.ParentDirectoryID = parentDirID
@@ -329,7 +333,8 @@ type plannedFile struct {
 // AddFiles imports a batch of base64 files with server-side conflict
 // detection: conflict=detect refuses the whole batch when any name collides;
 // rename/replace resolve collisions per file; duplicates by content hash are
-// skipped. Ingestion runs with at most five workers.
+// skipped. The request workers are bounded at five, while storage-heavy
+// ingest pipelines are capped separately at two by NewService.
 func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesItem, conflict, parentDirID string) (AddFilesResult, error) {
 	base, err := s.store.getBase(baseID)
 	if err != nil {
@@ -462,7 +467,7 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 	// workers are serialized by SQLite; a race with another import can create
 	// a legitimate duplicate and will be reconciled by later operations.
 	existingHashes := map[string]bool{}
-	docs, err := s.store.listDocuments(baseID)
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +503,7 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 }
 
 func (s *Service) hasContentHash(baseID, hash string) bool {
-	docs, err := s.store.listDocuments(baseID)
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return false
 	}
@@ -570,12 +575,12 @@ func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error
 	if _, err := s.store.getBase(baseID); err != nil {
 		return "", err
 	}
-	docs, err := s.store.listDocuments(baseID)
+	docs, err := s.store.listDocumentMetadata(baseID)
 	if err != nil {
 		return "", err
 	}
 	total := len(docs)
-	return s.jobMgr.Submit("reindex_base", baseID, total, func(jobCtx context.Context, report func(int)) error {
+	return s.jobMgr.SubmitWithProgress("reindex_base", baseID, total, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
 		for i, doc := range docs {
 			select {
 			case <-jobCtx.Done():
@@ -583,7 +588,7 @@ func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error
 			default:
 			}
 			if doc.SourceType == "directory" {
-				report(i + 1)
+				report(jobs.ProgressUpdate{Phase: "reindexing", Completed: i + 1, Total: total, File: doc.Title})
 				continue
 			}
 			if _, err := s.ReindexDocument(jobCtx, doc.ID); err != nil {
@@ -595,7 +600,7 @@ func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error
 				doc.UpdatedAt = now()
 				_ = s.store.putDocument(doc)
 			}
-			report(i + 1)
+			report(jobs.ProgressUpdate{Phase: "reindexing", Completed: i + 1, Total: total, File: doc.Title})
 		}
 		return nil
 	})
@@ -605,38 +610,11 @@ func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error
 // recoverable ones (raw source present) are marked for reindex, hopeless
 // placeholders become failed.
 func (s *Service) RecoverInterrupted(ctx context.Context) (resumed int, failed int, err error) {
-	docs, err := s.store.listAllDocuments()
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	for _, doc := range docs {
-		if doc.SourceType == "directory" {
-			continue
-		}
-		switch doc.Status {
-		case StatusPending, StatusProcessing:
-			hasSource := doc.RawText != "" || doc.RawFilePath != ""
-			if hasSource {
-				doc.Status = StatusPending
-				doc.Incomplete = true
-				doc.UpdatedAt = now()
-				if err := s.store.putDocument(doc); err != nil {
-					return resumed, failed, err
-				}
-				resumed++
-				continue
-			}
-			doc.Status = StatusFailed
-			doc.ErrorCode = ErrInterrupted
-			doc.ErrorMessage = "import was interrupted before the source was stored"
-			doc.UpdatedAt = now()
-			if err := s.store.putDocument(doc); err != nil {
-				return resumed, failed, err
-			}
-			failed++
-		}
-	}
-	return resumed, failed, nil
+	return s.store.recoverInterrupted(now(), StatusPending, StatusProcessing, StatusFailed,
+		ErrInterrupted, "import was interrupted before the source was stored")
 }
 
 func (s *Service) newDocument(baseID, title, sourceType string) Document {
@@ -651,6 +629,14 @@ func (s *Service) newDocument(baseID, title, sourceType string) Document {
 // are persisted to the raw store first ("import means copy"); a failure in
 // later steps leaves the raw copy for recovery.
 func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fileBytes []byte) error {
+	if s.ingestSlots != nil {
+		select {
+		case s.ingestSlots <- struct{}{}:
+			defer func() { <-s.ingestSlots }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	importStarted := Now()
 	defer func() {
 		s.recordMetric(func(m *MetricsSnapshot) {
@@ -737,7 +723,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if len(rows) == 0 {
 		return s.failDocument(doc, ErrParseFailed, fmt.Errorf("chunker produced no chunks"))
 	}
-	if err := s.store.putChunksReplace(rows); err != nil {
+	if err := s.store.putChunksReplace(ctx, rows); err != nil {
 		return s.failDocument(doc, ErrParseFailed, err)
 	}
 	s.recordMetric(func(m *MetricsSnapshot) { m.ChunkCount += int64(len(rows)) })

@@ -4,7 +4,7 @@ package knowledge
 // referenced by a document, and document chunk-count metadata that diverged
 // from the actual chunk table.
 func (s *Service) ReconcileStorage() (removedRaw int, fixedCounts int, err error) {
-	docs, err := s.store.listAllDocuments()
+	docs, err := s.store.listStorageRefs()
 	if err != nil {
 		return 0, 0, err
 	}
@@ -29,16 +29,14 @@ func (s *Service) ReconcileStorage() (removedRaw int, fixedCounts int, err error
 	}
 
 	for _, doc := range docs {
-		chunks, err := s.store.listChunksByDoc(doc.ID, 0, 0)
+		chunkCount, err := s.store.countChunksByDoc(doc.ID)
 		if err != nil {
 			return removedRaw, fixedCounts, err
 		}
-		if doc.ChunkCount == len(chunks) {
+		if doc.ChunkCount == chunkCount {
 			continue
 		}
-		doc.ChunkCount = len(chunks)
-		doc.UpdatedAt = now()
-		if err := s.store.putDocument(doc); err != nil {
+		if err := s.store.updateChunkCount(doc.ID, chunkCount); err != nil {
 			return removedRaw, fixedCounts, err
 		}
 		fixedCounts++

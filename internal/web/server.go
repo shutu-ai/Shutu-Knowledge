@@ -24,8 +24,9 @@ type Server struct {
 	srv *http.Server
 }
 
-// MaxBodyBytes matches the upstream Knowledge API upload envelope limit.
-const MaxBodyBytes = 32 << 20
+// MaxBodyBytes allows a 100 MiB raw file plus Base64 and JSON envelope
+// overhead for the file-upload API.
+const MaxBodyBytes = 140 << 20
 
 //go:embed all:dist
 var distFS embed.FS
@@ -99,7 +100,7 @@ func spaHandler() http.Handler {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	report := s.app.Health.Snapshot(r.Context())
+	report := s.app.HealthSnapshot(r.Context())
 	status := http.StatusOK
 	if !report.Ready {
 		status = http.StatusServiceUnavailable
@@ -108,7 +109,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	report := s.app.Health.Snapshot(r.Context())
+	report := s.app.HealthSnapshot(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version": version.Version,
 		"ready":   report.Ready,

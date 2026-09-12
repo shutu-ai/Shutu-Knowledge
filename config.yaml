@@ -42,7 +42,7 @@ retrieval:
   mode: auto
   similarityMin: 0
   mmr: false
-  mmrDiversity: 0
+  mmrDiversity: 0.75
   rrfVectorWeight: 1
   siblingChunks: 1
   contextTimeoutMs: 4000

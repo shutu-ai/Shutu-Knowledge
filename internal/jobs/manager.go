@@ -27,19 +27,44 @@ const (
 
 // Job is a snapshot of one background task.
 type Job struct {
-	ID       string `json:"id"`
-	Kind     string `json:"kind"`
-	BaseID   string `json:"baseId,omitempty"`
-	Status   string `json:"status"`
-	Progress int    `json:"progress"`
-	Total    int    `json:"total"`
-	Error    string `json:"error,omitempty"`
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	BaseID         string `json:"baseId,omitempty"`
+	Status         string `json:"status"`
+	Progress       int    `json:"progress"`
+	Total          int    `json:"total"`
+	Phase          string `json:"phase,omitempty"`
+	File           string `json:"file,omitempty"`
+	CompletedBytes int64  `json:"completedBytes,omitempty"`
+	TotalBytes     int64  `json:"totalBytes,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+// ProgressUpdate carries either a conventional percentage, completed units, or
+// byte-level progress from a download-capable subsystem. Completed is used by
+// jobs whose total is a count of files/documents; Percent remains for jobs
+// whose work is naturally expressed as a percentage.
+type ProgressUpdate struct {
+	Percent        int
+	Completed      int
+	Total          int
+	Phase          string
+	File           string
+	CompletedBytes int64
+	TotalBytes     int64
+}
+
+type persistedProgress struct {
+	Phase          string `json:"phase,omitempty"`
+	File           string `json:"file,omitempty"`
+	CompletedBytes int64  `json:"completedBytes,omitempty"`
+	TotalBytes     int64  `json:"totalBytes,omitempty"`
 }
 
 type task struct {
 	job    Job
 	ctx    context.Context
-	run    func(ctx context.Context, report func(progress int)) error
+	run    func(ctx context.Context, report func(ProgressUpdate)) error
 	cancel context.CancelFunc
 }
 
@@ -89,6 +114,14 @@ func (m *Manager) Stop() {
 
 // Submit enqueues one task and persists its job row.
 func (m *Manager) Submit(kind, baseID string, total int, run func(ctx context.Context, report func(progress int)) error) (string, error) {
+	return m.SubmitWithProgress(kind, baseID, total, func(ctx context.Context, report func(ProgressUpdate)) error {
+		return run(ctx, func(progress int) { report(ProgressUpdate{Percent: progress}) })
+	})
+}
+
+// SubmitWithProgress enqueues a task whose worker can report phase and
+// byte-level progress in addition to the legacy percentage.
+func (m *Manager) SubmitWithProgress(kind, baseID string, total int, run func(ctx context.Context, report func(ProgressUpdate)) error) (string, error) {
 	id, err := newID()
 	if err != nil {
 		return "", err
@@ -138,9 +171,40 @@ func (m *Manager) runTask(t *task) {
 	snapshot := t.job
 	m.mu.Unlock()
 	_ = m.persist(snapshot)
-	report := func(progress int) {
+	report := func(update ProgressUpdate) {
+		percent := update.Percent
+		if update.TotalBytes > 0 {
+			percent = int(float64(update.CompletedBytes) / float64(update.TotalBytes) * 100)
+		} else if update.Completed > 0 {
+			percent = update.Completed
+		}
 		m.mu.Lock()
-		t.job.Progress = progress
+		if update.Completed > 0 {
+			t.job.Progress = update.Completed
+		} else {
+			if percent < 0 {
+				percent = 0
+			}
+			if percent > 100 {
+				percent = 100
+			}
+			t.job.Progress = percent
+		}
+		if update.Phase != "" {
+			t.job.Phase = update.Phase
+		}
+		if update.File != "" {
+			t.job.File = update.File
+		}
+		if update.TotalBytes > 0 {
+			t.job.CompletedBytes = update.CompletedBytes
+			t.job.TotalBytes = update.TotalBytes
+		} else if update.CompletedBytes > 0 {
+			t.job.CompletedBytes = update.CompletedBytes
+		}
+		if update.Total > 0 {
+			t.job.Total = update.Total
+		}
 		t.job.Status = StatusRunning
 		snapshot := t.job
 		m.mu.Unlock()
@@ -207,6 +271,13 @@ func (m *Manager) Status(id string) (Job, bool) {
 	}
 	job.BaseID = baseID.String
 	job.Error = errText.String
+	var progress persistedProgress
+	if len(payload) > 0 && json.Unmarshal(payload, &progress) == nil {
+		job.Phase = progress.Phase
+		job.File = progress.File
+		job.CompletedBytes = progress.CompletedBytes
+		job.TotalBytes = progress.TotalBytes
+	}
 	return job, true
 }
 
@@ -223,7 +294,10 @@ func (m *Manager) Cancel(id string) bool {
 }
 
 func (m *Manager) persist(job Job) error {
-	payload, _ := json.Marshal(map[string]any{})
+	payload, _ := json.Marshal(persistedProgress{
+		Phase: job.Phase, File: job.File,
+		CompletedBytes: job.CompletedBytes, TotalBytes: job.TotalBytes,
+	})
 	var errText any
 	if job.Error != "" {
 		errText = job.Error
@@ -231,7 +305,7 @@ func (m *Manager) persist(job Job) error {
 	_, err := m.db.Exec(
 		`INSERT INTO jobs (id, kind, base_id, payload, status, progress, total, error, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET status = excluded.status, progress = excluded.progress,
+		 ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, status = excluded.status, progress = excluded.progress,
 		   total = excluded.total, error = excluded.error, updated_at = excluded.updated_at`,
 		job.ID, job.Kind, job.BaseID, payload, job.Status, job.Progress, job.Total, errText,
 		time.Now().UnixMilli(), time.Now().UnixMilli(),

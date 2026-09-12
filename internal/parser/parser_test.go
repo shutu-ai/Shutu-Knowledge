@@ -973,6 +973,15 @@ func TestDecodeTextGB18030Fallback(t *testing.T) {
 	}
 }
 
+func TestPDFReplacementRuneIsMarkedUnhealthy(t *testing.T) {
+	if !hasReplacementRune("正常文本�") {
+		t.Fatal("replacement rune was not detected")
+	}
+	if hasReplacementRune("正常文本") {
+		t.Fatal("clean text was marked unhealthy")
+	}
+}
+
 func TestRegistryDispatchAndRejections(t *testing.T) {
 	registry := NewRegistry()
 	got := registry.SupportedExtensions()

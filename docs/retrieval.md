@@ -8,9 +8,10 @@
 2. lexical SQLite FTS5 trigram/BM25 retrieval,
 3. vector cosine retrieval when a usable embedding provider is configured,
 4. weighted Reciprocal Rank Fusion,
-5. optional MMR diversification,
-6. optional reranking,
-7. context-window composition and serialization under a token budget.
+5. optional reranking,
+6. relevance filtering,
+7. optional MMR diversification over the credible candidate set,
+8. context-window composition and serialization under a token budget.
 
 Modes are `auto`, `hybrid`, `vector`, and `lexical`. A missing embedding
 provider or vector-query failure degrades to lexical rather than making the
@@ -20,9 +21,16 @@ return no results; they are never reinterpreted as unrestricted.
 ## Scoring
 
 RRF uses `k=60`. The configured `rrfVectorWeight` controls the vector lane
-weight relative to lexical. MMR trades relevance against near-duplicate
-suppression. Search hits expose lexical, vector, fusion, rerank, and final
-scores where applicable, plus elapsed time and selected mode.
+weight relative to lexical. Reranking and relevance filtering happen before
+MMR. MMR uses `lambda * relevance - (1-lambda) * maxSimilarity`, with a
+relative-to-best floor, and is disabled by default because same-document
+high-relevance chunks are preferable to weak cross-document diversity.
+Search hits expose lexical, vector, fusion, rerank, and final scores where
+applicable, plus elapsed time and selected mode.
+
+Set `debug: true` on a search request to receive structured stage diagnostics
+(`bm25`, `vector`, `rrf`, `rerank`, `mmrInput`, `mmrOutput`, and `final`). The
+default response does not expose these internal ranking details.
 
 The optional reranker may be remote OpenAI-compatible/Jina-style or an isolated
 local helper. Scores are validated for count, index alignment, and the

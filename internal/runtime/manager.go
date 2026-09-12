@@ -51,9 +51,29 @@ type request struct {
 }
 
 type response struct {
-	ID     uint64          `json:"id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *wireError      `json:"error,omitempty"`
+	ID       uint64          `json:"id"`
+	Result   json.RawMessage `json:"result,omitempty"`
+	Progress *progressEvent  `json:"progress,omitempty"`
+	Error    *wireError      `json:"error,omitempty"`
+}
+
+type progressEvent struct {
+	Phase          string  `json:"phase,omitempty"`
+	File           string  `json:"file,omitempty"`
+	Percent        float64 `json:"percent,omitempty"`
+	CompletedBytes int64   `json:"completedBytes,omitempty"`
+	TotalBytes     int64   `json:"totalBytes,omitempty"`
+}
+
+// ModelProgress is emitted by a managed runtime while it downloads or loads
+// a model. Byte counts are authoritative when supplied; Percent is a
+// fallback for runtimes that can only report aggregate percentages.
+type ModelProgress struct {
+	Phase          string
+	File           string
+	Percent        float64
+	CompletedBytes int64
+	TotalBytes     int64
 }
 
 type wireError struct {
@@ -120,6 +140,16 @@ type ManagedModelController interface {
 }
 
 var _ ManagedModelController = (*Manager)(nil)
+
+// ProgressiveManagedModelController is an optional extension used by the
+// Web download job. Keeping it separate preserves compatibility with custom
+// runtimes that only implement the original lifecycle surface.
+type ProgressiveManagedModelController interface {
+	ManagedModelController
+	LoadModelWithProgress(ctx context.Context, capability, model string, progress func(ModelProgress)) (Health, error)
+}
+
+var _ ProgressiveManagedModelController = (*Manager)(nil)
 
 // Options configures process supervision.
 type Options struct {
@@ -299,6 +329,10 @@ func (m *Manager) markWarmed(method, capability string) {
 }
 
 func (m *Manager) invokeWithTimeout(ctx context.Context, method, capability string, params, out any, timeout time.Duration) error {
+	return m.invokeWithTimeoutAndProgress(ctx, method, capability, params, out, nil, timeout)
+}
+
+func (m *Manager) invokeWithTimeoutAndProgress(ctx context.Context, method, capability string, params, out any, progress func(ModelProgress), timeout time.Duration) error {
 	command := m.commandFor(capability)
 	if command == "" {
 		return &Error{Code: "runtime_unconfigured", Message: fmt.Sprintf("%s runtime command is not configured", capability)}
@@ -315,7 +349,7 @@ func (m *Manager) invokeWithTimeout(ctx context.Context, method, capability stri
 		m.processes[command] = helper
 	}
 	m.mu.Unlock()
-	err := helper.call(ctx, method, capability, params, out, m.startupTimeout, timeout)
+	err := helper.call(ctx, method, capability, params, out, progress, m.startupTimeout, timeout)
 	if err == nil {
 		m.markWarmed(method, capability)
 	}
@@ -365,8 +399,14 @@ func (m *Manager) Probe(ctx context.Context, capability string) (Health, error) 
 // LoadModel performs the runtime's real model load and inference smoke. A
 // successful return is the only point at which a model may be marked READY.
 func (m *Manager) LoadModel(ctx context.Context, capability, model string) (Health, error) {
+	return m.LoadModelWithProgress(ctx, capability, model, nil)
+}
+
+// LoadModelWithProgress performs the runtime model load and forwards download
+// progress events before returning the final readiness report.
+func (m *Manager) LoadModelWithProgress(ctx context.Context, capability, model string, progress func(ModelProgress)) (Health, error) {
 	var health Health
-	err := m.invokeWithTimeout(ctx, "load", capability, map[string]string{"model": model, "capability": capability}, &health, m.modelLoadTimeout)
+	err := m.invokeWithTimeoutAndProgress(ctx, "load", capability, map[string]string{"model": model, "capability": capability}, &health, progress, m.modelLoadTimeout)
 	if err != nil {
 		health.Capability = capability
 		health.Status = "failed"
@@ -561,7 +601,7 @@ func (m *Manager) commandFor(capability string) string {
 
 // call serializes requests on one process and recreates it after EOF or a
 // failed startup. The lock intentionally includes stdin, stdout, and wait.
-func (p *helperProcess) call(parent context.Context, method, capability string, params, out any, startupTimeout, requestTimeout time.Duration) error {
+func (p *helperProcess) call(parent context.Context, method, capability string, params, out any, progress func(ModelProgress), startupTimeout, requestTimeout time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -598,29 +638,44 @@ func (p *helperProcess) call(parent context.Context, method, capability string, 
 		p.closeLocked()
 		return fmt.Errorf("%s request: %w", capability, err)
 	}
-	if !p.scanner.Scan() {
-		scanErr := p.scanner.Err()
-		p.closeLocked()
-		if scanErr != nil {
-			return p.withStderr(fmt.Errorf("read %s response: %w", capability, scanErr))
-		}
-		if callCtx.Err() != nil {
-			return fmt.Errorf("%s request: %w", capability, callCtx.Err())
-		}
-		return p.withStderr(fmt.Errorf("%s helper closed stdout", capability))
-	}
-	if err := callCtx.Err(); err != nil {
-		p.closeLocked()
-		return fmt.Errorf("%s request: %w", capability, err)
-	}
 	var reply response
-	if err := json.Unmarshal(p.scanner.Bytes(), &reply); err != nil {
-		p.closeLocked()
-		return p.withStderr(fmt.Errorf("decode %s response: %w", capability, err))
-	}
-	if reply.ID != id {
-		p.closeLocked()
-		return p.withStderr(fmt.Errorf("%s helper returned request id %d, expected %d", capability, reply.ID, id))
+	for {
+		if !p.scanner.Scan() {
+			scanErr := p.scanner.Err()
+			p.closeLocked()
+			if scanErr != nil {
+				return p.withStderr(fmt.Errorf("read %s response: %w", capability, scanErr))
+			}
+			if callCtx.Err() != nil {
+				return fmt.Errorf("%s request: %w", capability, callCtx.Err())
+			}
+			return p.withStderr(fmt.Errorf("%s helper closed stdout", capability))
+		}
+		if err := callCtx.Err(); err != nil {
+			p.closeLocked()
+			return fmt.Errorf("%s request: %w", capability, err)
+		}
+		var event response
+		if err := json.Unmarshal(p.scanner.Bytes(), &event); err != nil {
+			p.closeLocked()
+			return p.withStderr(fmt.Errorf("decode %s response: %w", capability, err))
+		}
+		if event.ID != id {
+			p.closeLocked()
+			return p.withStderr(fmt.Errorf("%s helper returned request id %d, expected %d", capability, event.ID, id))
+		}
+		if event.Progress != nil {
+			if progress != nil {
+				progress(ModelProgress{
+					Phase: event.Progress.Phase, File: event.Progress.File,
+					Percent:        event.Progress.Percent,
+					CompletedBytes: event.Progress.CompletedBytes, TotalBytes: event.Progress.TotalBytes,
+				})
+			}
+			continue
+		}
+		reply = event
+		break
 	}
 	if reply.Error != nil {
 		return &Error{Code: reply.Error.Code, Message: reply.Error.Message}

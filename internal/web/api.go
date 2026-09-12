@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
+	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
@@ -620,29 +621,52 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	reindexed := 0
-	skipped := 0
-	for _, id := range body.IDs {
-		if _, err := s.app.Knowledge.ReindexDocument(r.Context(), id); err != nil {
-			if errors.Is(err, knowledge.ErrNotFound) {
-				skipped++
-				continue
-			}
-			writeErr(w, err)
-			return
-		}
-		reindexed++
+	if len(body.IDs) == 0 {
+		writeErr(w, errors.New("at least one document is required"))
+		return
 	}
-	writeOK(w, map[string]int{"reindexed": reindexed, "skipped": skipped})
-}
-
-func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
-	doc, err := s.app.Knowledge.ReindexDocument(r.Context(), r.PathValue("id"))
+	jobID, err := s.app.Jobs.SubmitWithProgress("reindex_documents", "", len(body.IDs), func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		for index, id := range body.IDs {
+			doc, _, docErr := s.app.Knowledge.GetDocument(id, false)
+			if docErr != nil {
+				if errors.Is(docErr, knowledge.ErrNotFound) {
+					report(jobs.ProgressUpdate{Phase: "reindexing", Completed: index + 1, Total: len(body.IDs), File: id})
+					continue
+				}
+				return docErr
+			}
+			if _, err := s.app.Knowledge.ReindexDocument(ctx, id); err != nil {
+				return err
+			}
+			report(jobs.ProgressUpdate{Phase: "reindexing", Completed: index + 1, Total: len(body.IDs), File: doc.Title})
+		}
+		return nil
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, doc)
+	writeOK(w, map[string]string{"jobId": jobID})
+}
+
+func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
+	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	jobID, err := s.app.Jobs.SubmitWithProgress("reindex_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		if _, err := s.app.Knowledge.ReindexDocument(ctx, doc.ID); err != nil {
+			return err
+		}
+		report(jobs.ProgressUpdate{Phase: "reindexing", Completed: 1, Total: 1, File: doc.Title})
+		return nil
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]string{"jobId": jobID})
 }
 
 func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
@@ -855,7 +879,7 @@ func (s *Server) downloadOCRModel(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeOK(w, map[string]string{"jobId": jobID, "progressMode": "determinate"})
 }
 
 func (s *Server) removeOCRModel(w http.ResponseWriter, _ *http.Request) {
@@ -895,12 +919,26 @@ func (s *Server) selfTestLocalReranker(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.app.SelfTestReranker(r.Context(), body.ID)
+	progressMode := "indeterminate"
+	if s.app.ManagedRuntime {
+		if _, ok := s.app.Runtime.(runtime.ProgressiveManagedModelController); ok {
+			progressMode = "determinate"
+		}
+	}
+	jobID, err := s.app.Jobs.SubmitWithProgress("self-test-reranker", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		_, err := s.app.SelfTestRerankerWithProgress(ctx, body.ID, func(update runtime.ModelProgress) {
+			report(jobs.ProgressUpdate{
+				Percent: int(update.Percent), Phase: update.Phase, File: update.File,
+				CompletedBytes: update.CompletedBytes, TotalBytes: update.TotalBytes,
+			})
+		})
+		return err
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, result)
+	writeOK(w, map[string]string{"jobId": jobID, "progressMode": progressMode})
 }
 
 func (s *Server) runtimeStatus(w http.ResponseWriter, r *http.Request) {
@@ -934,26 +972,43 @@ func (s *Server) downloadLocalModel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	jobID, err := s.app.Jobs.Submit("download-model", body.ID, 100, func(ctx context.Context, report func(progress int)) error {
-		if s.app.ManagedRuntime && (body.Kind == models.KindEmbedding || body.Kind == models.KindRerank) {
+	managedModel := s.app.ManagedRuntime && (body.Kind == models.KindEmbedding || body.Kind == models.KindRerank)
+	progressMode := "indeterminate"
+	var jobID string
+	var err error
+	if managedModel {
+		progressMode = "determinate"
+		jobID, err = s.app.Jobs.SubmitWithProgress("download-model", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
 			managed, ok := s.app.Runtime.(runtime.ManagedModelController)
 			if !ok {
 				return errors.New("managed runtime model control is unavailable")
 			}
-			report(5)
-			if _, err := managed.LoadModel(ctx, body.Kind, body.ID); err != nil {
+			if progressive, ok := managed.(runtime.ProgressiveManagedModelController); ok {
+				_, err := progressive.LoadModelWithProgress(ctx, body.Kind, body.ID, func(update runtime.ModelProgress) {
+					report(jobs.ProgressUpdate{
+						Percent: int(update.Percent), Phase: update.Phase, File: update.File,
+						CompletedBytes: update.CompletedBytes, TotalBytes: update.TotalBytes,
+					})
+				})
+				if err != nil {
+					return err
+				}
+			} else if _, err := managed.LoadModel(ctx, body.Kind, body.ID); err != nil {
 				return err
 			}
-			report(100)
+			report(jobs.ProgressUpdate{Percent: 100, Phase: "ready"})
 			return nil
-		}
-		return s.app.Models.Download(ctx, models.DownloadRequest(body), report)
-	})
+		})
+	} else {
+		jobID, err = s.app.Jobs.Submit("download-model", body.ID, 100, func(ctx context.Context, report func(progress int)) error {
+			return s.app.Models.Download(ctx, models.DownloadRequest(body), report)
+		})
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeOK(w, map[string]string{"jobId": jobID, "progressMode": progressMode})
 }
 
 type localModelRemoveRequest struct {
@@ -973,10 +1028,17 @@ func (s *Server) removeLocalModel(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		normalizedID := strings.TrimPrefix(body.ID, "local:")
 		if s.app.ManagedRuntime {
-			for _, candidate := range []struct{ id, capability string }{
+			candidates := []struct{ id, capability string }{
 				{id: s.app.Config.Embedding.Model, capability: runtime.CapabilityEmbedding},
-				{id: strings.TrimPrefix(s.app.Config.Rerank.Model, "local:"), capability: runtime.CapabilityRerank},
-			} {
+				{id: s.app.Config.Rerank.Model, capability: runtime.CapabilityRerank},
+			}
+			for capability, health := range s.app.Runtime.Status(r.Context()) {
+				if health.Model != "" && health.Lifecycle != models.LifecycleNotInstalled {
+					candidates = append(candidates, struct{ id, capability string }{id: health.Model, capability: capability})
+				}
+			}
+			for _, candidate := range candidates {
+				candidate.id = strings.TrimPrefix(strings.TrimSpace(candidate.id), "local:")
 				if candidate.id == normalizedID {
 					managed, managedOK := s.app.Runtime.(runtime.ManagedModelController)
 					if !managedOK {

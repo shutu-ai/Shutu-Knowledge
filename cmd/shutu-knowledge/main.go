@@ -64,7 +64,7 @@ commands:
 }
 
 func cmdServe(ctx context.Context) error {
-	application, err := app.New(ctx)
+	application, err := app.NewWithOptions(ctx, app.Options{DeferStartupRecovery: true})
 	if err != nil {
 		return err
 	}
@@ -74,13 +74,15 @@ func cmdServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", application.Config.Server.Addr, err)
 	}
+	application.StartBackgroundRecovery()
+	application.StartBackgroundMaintenance()
 	application.Logger.Info("serve started", "addr", addr.String(), "home", application.Home)
 	<-ctx.Done()
 	return server.Shutdown(context.Background())
 }
 
 func cmdExtension(ctx context.Context) error {
-	application, err := app.New(ctx)
+	application, err := app.NewWithOptions(ctx, app.Options{DeferStartupRecovery: true})
 	if err != nil {
 		return err
 	}

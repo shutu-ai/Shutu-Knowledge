@@ -32,7 +32,43 @@ type SearchRequest struct {
 	Mode      string        `json:"mode,omitempty"`
 	Threshold float64       `json:"threshold,omitempty"`
 	MMR       bool          `json:"mmr,omitempty"`
+	Debug     bool          `json:"debug,omitempty"`
 	Filter    *SearchFilter `json:"filter,omitempty"`
+}
+
+// RetrievalDiagnosticCandidate is one stage-local, source-attributed ranking
+// record. It is emitted only when SearchRequest.Debug is true.
+type RetrievalDiagnosticCandidate struct {
+	ChunkID     string  `json:"chunkId"`
+	DocID       string  `json:"docId"`
+	BaseID      string  `json:"baseId"`
+	Document    string  `json:"document"`
+	SectionPath string  `json:"sectionPath,omitempty"`
+	BM25Rank    int     `json:"bm25Rank,omitempty"`
+	BM25Score   float64 `json:"bm25Score,omitempty"`
+	VectorRank  int     `json:"vectorRank,omitempty"`
+	VectorScore float64 `json:"vectorScore,omitempty"`
+	RRFScore    float64 `json:"rrfScore,omitempty"`
+	RerankScore float64 `json:"rerankScore,omitempty"`
+	MMRScore    float64 `json:"mmrScore,omitempty"`
+	FinalRank   int     `json:"finalRank,omitempty"`
+}
+
+// RetrievalDiagnostics exposes reproducible stage evidence for audits and
+// regression tests without changing the default user-facing response.
+type RetrievalDiagnostics struct {
+	Query           string                         `json:"query"`
+	NormalizedQuery string                         `json:"normalizedQuery"`
+	BaseIDs         []string                       `json:"baseIds,omitempty"`
+	DocIDs          []string                       `json:"docIds,omitempty"`
+	BM25            []RetrievalDiagnosticCandidate `json:"bm25"`
+	Vector          []RetrievalDiagnosticCandidate `json:"vector"`
+	RRF             []RetrievalDiagnosticCandidate `json:"rrf"`
+	Rerank          []RetrievalDiagnosticCandidate `json:"rerank,omitempty"`
+	MMRInput        []RetrievalDiagnosticCandidate `json:"mmrInput,omitempty"`
+	MMROutput       []RetrievalDiagnosticCandidate `json:"mmrOutput,omitempty"`
+	FinalThreshold  float64                        `json:"finalThreshold"`
+	Final           []RetrievalDiagnosticCandidate `json:"final"`
 }
 
 // SearchHit is one ranked result with lane scores and its context window.
@@ -66,16 +102,23 @@ type RerankStatus struct {
 
 // SearchResult carries the ranked hits plus explainability metadata.
 type SearchResult struct {
-	Query     string        `json:"query"`
-	Mode      string        `json:"mode"`
-	Total     int           `json:"total"`
-	Reranked  bool          `json:"reranked"`
-	Rerank    *RerankStatus `json:"rerank,omitempty"`
-	ElapsedMS int64         `json:"elapsedMs"`
-	Hits      []SearchHit   `json:"hits"`
+	Query       string                `json:"query"`
+	Mode        string                `json:"mode"`
+	Total       int                   `json:"total"`
+	Reranked    bool                  `json:"reranked"`
+	Rerank      *RerankStatus         `json:"rerank,omitempty"`
+	Diagnostics *RetrievalDiagnostics `json:"diagnostics,omitempty"`
+	ElapsedMS   int64                 `json:"elapsedMs"`
+	Hits        []SearchHit           `json:"hits"`
 }
 
 const defaultHitTokens = 768
+
+// defaultVectorRelevanceFloor is a conservative abstention floor for vector
+// candidates when callers did not configure an explicit threshold. Lexical
+// matches are not subjected to this model-dependent floor; vector-only
+// evidence must clear it or it is not allowed to fill Final Context.
+const defaultVectorRelevanceFloor = 0.35
 
 // ContextOptions is an anchor continuation request: read around a chunk
 // without re-searching (the model's "keep reading" path).
@@ -196,6 +239,11 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 	laneLexicals := map[string]float64{}
 	embeddings := map[string][]float32{}
 	chunkIDs := map[string]Chunk{}
+	bm25Ranks := map[string]int{}
+	vectorRanks := map[string]int{}
+	bm25Order := map[string]bool{}
+	vectorOrderSeen := map[string]bool{}
+	var queryVector []float32
 	vectorAvailable := false
 
 	for _, variant := range variants {
@@ -204,7 +252,11 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 			return SearchResult{}, err
 		}
 		lexicalOrder := make([]string, 0, len(lexicalHits))
-		for _, hit := range lexicalHits {
+		for rank, hit := range lexicalHits {
+			if previous, ok := bm25Ranks[hit.ID]; !ok || rank+1 < previous {
+				bm25Ranks[hit.ID] = rank + 1
+			}
+			bm25Order[hit.ID] = true
 			if laneLexicals[hit.ID] < hit.Score {
 				laneLexicals[hit.ID] = hit.Score
 			}
@@ -223,12 +275,19 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 				// Query embedding failure degrades this variant to lexical.
 				mode = "lexical"
 			} else if len(queryVectors) == 1 {
+				if variant == query {
+					queryVector = toFloat32(queryVectors[0])
+				}
 				vectorHits, err := s.store.VectorSearch(queryVectors[0], baseIDs, docIDs, poolSize)
 				if err != nil {
 					return SearchResult{}, err
 				}
 				vectorAvailable = vectorAvailable || len(vectorHits) > 0
-				for _, hit := range vectorHits {
+				for rank, hit := range vectorHits {
+					if previous, ok := vectorRanks[hit.ID]; !ok || rank+1 < previous {
+						vectorRanks[hit.ID] = rank + 1
+					}
+					vectorOrderSeen[hit.ID] = true
 					if laneVectors[hit.ID] < hit.Score {
 						laneVectors[hit.ID] = hit.Score
 					}
@@ -280,33 +339,8 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		ordered = append(ordered, chunkIDs[id])
 	}
 
-	// MMR diversity pass over the pooled candidates.
-	if req.MMR && s.global.Retrieval.MMR {
-		lambda := s.global.Retrieval.MMRDiversity
-		hits := make([]retrieval.RankedHit, 0, len(ordered))
-		for _, c := range ordered {
-			hits = append(hits, retrieval.RankedHit{ID: c.ID, Score: 1, Embedding: embeddings[c.ID]})
-		}
-		// Relevance is the current order; approximate with uniform relevance
-		// and let similarity drive the reordering within the pool.
-		var queryVector []float32
-		if vecs, err := s.embedder.Embed(ctx, []string{query}); err == nil && len(vecs) == 1 {
-			queryVector = toFloat32(vecs[0])
-		}
-		reordered := retrieval.MaximalMarginalRelevance(hits, queryVector, lambda, len(ordered))
-		byID := map[string]Chunk{}
-		for _, c := range ordered {
-			byID[c.ID] = c
-		}
-		ordered = ordered[:0]
-		for _, hit := range reordered {
-			if c, ok := byID[hit.ID]; ok {
-				ordered = append(ordered, c)
-			}
-		}
-	}
-
 	result := SearchResult{Query: query, Mode: mode}
+	var rerankStage []Chunk
 
 	// Rerank stage (optional): strict validation upstream; any failure keeps
 	// the current order and reports degraded.
@@ -344,27 +378,102 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		sort.SliceStable(ordered, func(i, j int) bool {
 			return rerankScores[ordered[i].ID] > rerankScores[ordered[j].ID]
 		})
+		rerankStage = append([]Chunk(nil), ordered...)
 	}
 	if rerankScores != nil {
 		result.Reranked = true
 	}
+	if rerankStage == nil {
+		rerankStage = append([]Chunk(nil), ordered...)
+	}
 
-	// Threshold applies only to comparable relevance scores (rerank or pure
-	// vector), never to rank-fusion order scores.
+	// MMR is a post-relevance optional pass. Its relevance term must be the
+	// actual reranker/vector/fusion score, never a uniform placeholder; its
+	// floor also prevents diversity from admitting weak candidates. Reranking
+	// first is important because adjacent chunks often have nearly identical
+	// embeddings but very different answer relevance.
+	relevance := make(map[string]float64, len(ordered))
+	maxFusion := 0.0
+	for _, score := range fusionScores {
+		if score > maxFusion {
+			maxFusion = score
+		}
+	}
+	for _, c := range ordered {
+		score := laneLexicals[c.ID]
+		switch {
+		case rerankScores != nil:
+			score = rerankScores[c.ID]
+		case mode == "vector":
+			score = laneVectors[c.ID]
+		case mode == "hybrid" && maxFusion > 0:
+			score = fusionScores[c.ID] / maxFusion
+		}
+		relevance[c.ID] = score
+	}
+	// Threshold applies to the score that represents relevance for the active
+	// mode. A zero threshold preserves historical behavior; MMR raises it to a
+	// relative-to-best floor when explicitly enabled.
+	threshold := req.Threshold
+	if threshold <= 0 && mode == "vector" {
+		threshold = s.global.Retrieval.SimilarityMin
+		if threshold <= 0 {
+			threshold = defaultVectorRelevanceFloor
+		}
+	}
+	mmrEnabled := req.MMR && s.global.Retrieval.MMR && len(queryVector) > 0
+	var mmrInput, mmrOutput []Chunk
+	mmrScores := map[string]float64{}
+	if mmrEnabled {
+		lambda := s.global.Retrieval.MMRDiversity
+		if lambda <= 0 {
+			lambda = 0.75
+		}
+		best := 0.0
+		for _, score := range relevance {
+			if score > best {
+				best = score
+			}
+		}
+		floor := best * 0.60
+		if threshold > floor {
+			floor = threshold
+		}
+		threshold = floor
+		eligible := make([]retrieval.RankedHit, 0, len(ordered))
+		ineligible := make([]Chunk, 0)
+		for _, c := range ordered {
+			if relevance[c.ID] < floor {
+				ineligible = append(ineligible, c)
+				continue
+			}
+			eligible = append(eligible, retrieval.RankedHit{ID: c.ID, Score: relevance[c.ID], Embedding: embeddings[c.ID]})
+		}
+		mmrInput = append([]Chunk(nil), ordered...)
+		reordered := retrieval.MaximalMarginalRelevance(eligible, queryVector, lambda, len(eligible))
+		byID := make(map[string]Chunk, len(ordered))
+		for _, c := range ordered {
+			byID[c.ID] = c
+		}
+		ordered = ordered[:0]
+		for _, hit := range reordered {
+			mmrScores[hit.ID] = hit.MMRScore
+			ordered = append(ordered, byID[hit.ID])
+		}
+		ordered = append(ordered, ineligible...)
+		mmrOutput = append([]Chunk(nil), ordered...)
+	}
+
 	final := make([]Chunk, 0, topK)
 	for _, c := range ordered {
 		if len(final) == topK {
 			break
 		}
-		switch {
-		case rerankScores != nil:
-			if rerankScores[c.ID] < req.Threshold {
-				continue
-			}
-		case mode == "vector":
-			if laneVectors[c.ID] < req.Threshold {
-				continue
-			}
+		if threshold > 0 && relevance[c.ID] < threshold {
+			continue
+		}
+		if mode == "hybrid" && laneLexicals[c.ID] <= 0 && laneVectors[c.ID] < defaultVectorRelevanceFloor {
+			continue
 		}
 		final = append(final, c)
 	}
@@ -419,6 +528,14 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		result.Hits = append(result.Hits, hit)
 	}
 	result.Total = len(result.Hits)
+	if req.Debug {
+		result.Diagnostics = s.makeRetrievalDiagnostics(
+			query, baseIDs, docIDs, chunkIDs, bm25Order, vectorOrderSeen,
+			bm25Ranks, vectorRanks, globalOrder, rerankStage, mmrInput, mmrOutput,
+			fusionScores, laneLexicals, laneVectors, rerankScores,
+			mmrScores, threshold, final,
+		)
+	}
 	result.ElapsedMS = Now().UnixMilli() - startedAt.UnixMilli()
 	s.recordMetric(func(m *MetricsSnapshot) {
 		m.Searches++
@@ -577,6 +694,78 @@ func (s *Service) documentTitles(chunks []Chunk) map[string]string {
 	return out
 }
 
+func (s *Service) makeRetrievalDiagnostics(
+	query string, baseIDs, docIDs []string, chunks map[string]Chunk,
+	bm25Set, vectorSet map[string]bool, bm25Ranks, vectorRanks map[string]int,
+	rrfOrder []string, rerankOrder, mmrInput, mmrOutput []Chunk,
+	rrfScores, bm25Scores, vectorScores, rerankScores map[string]float64,
+	mmrScores map[string]float64, threshold float64, final []Chunk,
+) *RetrievalDiagnostics {
+	all := make([]Chunk, 0, len(chunks))
+	for _, c := range chunks {
+		all = append(all, c)
+	}
+	titles := s.documentTitles(all)
+	fromIDs := func(ids []string) []Chunk {
+		out := make([]Chunk, 0, len(ids))
+		seen := map[string]bool{}
+		for _, id := range ids {
+			if seen[id] {
+				continue
+			}
+			if c, ok := chunks[id]; ok {
+				out = append(out, c)
+				seen[id] = true
+			}
+		}
+		return out
+	}
+	setChunks := func(set map[string]bool, ranks map[string]int, scores map[string]float64) []Chunk {
+		ids := make([]string, 0, len(set))
+		for id := range set {
+			ids = append(ids, id)
+		}
+		sort.SliceStable(ids, func(i, j int) bool {
+			if ranks[ids[i]] != ranks[ids[j]] {
+				return ranks[ids[i]] < ranks[ids[j]]
+			}
+			if scores[ids[i]] != scores[ids[j]] {
+				return scores[ids[i]] > scores[ids[j]]
+			}
+			return ids[i] < ids[j]
+		})
+		return fromIDs(ids)
+	}
+	finalRanks := map[string]int{}
+	for i, c := range final {
+		finalRanks[c.ID] = i + 1
+	}
+	toDiagnostics := func(list []Chunk) []RetrievalDiagnosticCandidate {
+		out := make([]RetrievalDiagnosticCandidate, 0, len(list))
+		for _, c := range list {
+			out = append(out, RetrievalDiagnosticCandidate{
+				ChunkID: c.ID, DocID: c.DocID, BaseID: c.BaseID,
+				Document: titles[c.DocID], SectionPath: c.Heading,
+				BM25Rank: bm25Ranks[c.ID], BM25Score: bm25Scores[c.ID],
+				VectorRank: vectorRanks[c.ID], VectorScore: vectorScores[c.ID],
+				RRFScore: rrfScores[c.ID], RerankScore: rerankScores[c.ID],
+				MMRScore: mmrScores[c.ID], FinalRank: finalRanks[c.ID],
+			})
+		}
+		return out
+	}
+	return &RetrievalDiagnostics{
+		Query: query, NormalizedQuery: strings.TrimSpace(query),
+		BaseIDs: baseIDs, DocIDs: docIDs,
+		BM25:     toDiagnostics(setChunks(bm25Set, bm25Ranks, bm25Scores)),
+		Vector:   toDiagnostics(setChunks(vectorSet, vectorRanks, vectorScores)),
+		RRF:      toDiagnostics(fromIDs(rrfOrder)),
+		Rerank:   toDiagnostics(rerankOrder),
+		MMRInput: toDiagnostics(mmrInput), MMROutput: toDiagnostics(mmrOutput),
+		FinalThreshold: threshold, Final: toDiagnostics(final),
+	}
+}
+
 // queryVariants normalizes the primary plus extra phrasings (max 3 extras,
 // deduplicated).
 func queryVariants(query string, extras []string) []string {
@@ -603,12 +792,13 @@ func clipToTokens(text string, tokens int) string {
 	if chunk.EstimateTokens(text) <= tokens {
 		return text
 	}
-	cpt := float64(len(text)) / float64(chunk.EstimateTokens(text))
+	cpt := float64(len([]rune(text))) / float64(chunk.EstimateTokens(text))
 	target := int(float64(tokens) * cpt)
-	if target >= len(text) {
+	runes := []rune(text)
+	if target >= len(runes) {
 		return text
 	}
-	return text[:target]
+	return string(runes[:target])
 }
 
 func mapKey(ids []string) map[string]bool {

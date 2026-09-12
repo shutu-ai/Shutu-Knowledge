@@ -90,6 +90,7 @@ const (
 const (
 	PhaseParsing   = "parsing"
 	PhaseEmbedding = "embedding"
+	PhaseScanning  = "scanning"
 )
 
 // Document error codes (stable, UI-localizable).

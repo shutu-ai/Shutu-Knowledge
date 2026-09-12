@@ -172,6 +172,53 @@ function setComponent(capability, patch) {
   };
 }
 
+function reportModelPhase(report, phase) {
+  if (typeof report === "function") report({ phase });
+}
+
+// Transformers.js emits per-file and aggregate progress callbacks. Keep the
+// latest byte counters for each loader so rerank (tokenizer + classifier) can
+// expose one monotonic aggregate stream to the Go supervisor.
+function createModelProgressReporter(report) {
+  const streams = new Map();
+  return (source, info) => {
+    if (typeof report !== "function" || !info || typeof info !== "object") return;
+    const status = String(info.status ?? "");
+    if (status === "ready") {
+      reportModelPhase(report, "loading");
+      return;
+    }
+    if (status === "initiate" || status === "download") {
+      report({ phase: "downloading", file: info.file });
+      return;
+    }
+    if (status !== "progress" && status !== "progress_total") return;
+
+    const previous = streams.get(source) ?? { loaded: 0, total: 0 };
+    const totalValue = Number(info.total);
+    const progressValue = Number(info.progress);
+    const total = Number.isFinite(totalValue) && totalValue > 0 ? totalValue : previous.total;
+    let loadedValue = Number(info.loaded);
+    if ((!Number.isFinite(loadedValue) || loadedValue < 0) && total > 0 && Number.isFinite(progressValue)) {
+      loadedValue = total * Math.max(0, Math.min(100, progressValue)) / 100;
+    }
+    const loaded = Number.isFinite(loadedValue) && loadedValue >= 0 ? Math.min(loadedValue, total || loadedValue) : previous.loaded;
+    streams.set(source, { loaded, total });
+
+    const aggregate = [...streams.values()].reduce((result, item) => ({
+      loaded: result.loaded + item.loaded,
+      total: result.total + item.total,
+    }), { loaded: 0, total: 0 });
+    const percent = aggregate.total > 0
+      ? aggregate.loaded / aggregate.total * 100
+      : (Number.isFinite(progressValue) ? progressValue : undefined);
+    report({
+      phase: "downloading", file: info.file, percent,
+      completedBytes: aggregate.loaded, totalBytes: aggregate.total,
+    });
+  };
+}
+
 function diagnostic(capability, lifecycle, error = "") {
   const ready = lifecycle === "READY";
   let status = ready ? "ready" : "not_installed";
@@ -203,7 +250,7 @@ function spec(capability, requested) {
   return { id: id.slice(0, separator), revision: id.slice(separator + 1), dtype: fallback.dtype };
 }
 
-async function embeddingModel(modelName) {
+async function embeddingModel(modelName, report = null) {
   const model = spec("embedding", modelName);
   const key = `${model.id}@${model.revision}`;
   if (!embeddingModels.has(key)) {
@@ -216,25 +263,31 @@ async function embeddingModel(modelName) {
     let source = model.id;
     const options = { dtype: model.dtype, revision: model.revision };
     if (localFiles) {
+      reportModelPhase(report, "verifying");
       await verifyModel(model);
       source = localModelDirectory(model);
       options.local_files_only = true;
       delete options.revision;
     }
-    const loading = pipeline("feature-extraction", source, options).catch((error) => {
+    const progress = createModelProgressReporter(report);
+    const loading = pipeline("feature-extraction", source, {
+      ...options,
+      progress_callback: (info) => progress("embedding", info),
+    }).catch((error) => {
       embeddingModels.delete(key);
       throw error;
     });
     embeddingModels.set(key, loading);
   }
   const extractor = await embeddingModels.get(key);
+  reportModelPhase(report, "verifying");
   await verifyModel(model);
   setComponent("embedding", { lifecycle: "INSTALLED", ready: false, model: model.id, revision: model.revision });
   await saveState();
   return { model, extractor };
 }
 
-async function rerankModel(modelName) {
+async function rerankModel(modelName, report = null) {
   const model = spec("rerank", modelName);
   const key = `${model.id}@${model.revision}`;
   if (!rerankModels.has(key)) {
@@ -247,14 +300,16 @@ async function rerankModel(modelName) {
     let source = model.id;
     const options = { revision: model.revision };
     if (localFiles) {
+      reportModelPhase(report, "verifying");
       await verifyModel(model);
       source = localModelDirectory(model);
       options.local_files_only = true;
       delete options.revision;
     }
+    const progress = createModelProgressReporter(report);
     const loading = Promise.all([
-      AutoTokenizer.from_pretrained(source, options),
-      AutoModelForSequenceClassification.from_pretrained(source, { ...options, dtype: model.dtype }),
+      AutoTokenizer.from_pretrained(source, { ...options, progress_callback: (info) => progress("tokenizer", info) }),
+      AutoModelForSequenceClassification.from_pretrained(source, { ...options, dtype: model.dtype, progress_callback: (info) => progress("model", info) }),
     ]).catch((error) => {
       rerankModels.delete(key);
       throw error;
@@ -262,6 +317,7 @@ async function rerankModel(modelName) {
     rerankModels.set(key, loading);
   }
   const [tokenizer, classifier] = await rerankModels.get(key);
+  reportModelPhase(report, "verifying");
   await verifyModel(model);
   setComponent("rerank", { lifecycle: "INSTALLED", ready: false, model: model.id, revision: model.revision });
   await saveState();
@@ -287,12 +343,16 @@ async function health(capability) {
     if (capability === "embedding") {
       const { model, extractor } = await embeddingModel(item.model);
       await extractor(["runtime health smoke"], { pooling: "last_token", normalize: true });
+      setComponent("embedding", { lifecycle: "READY", ready: true, model: model.id, revision: model.revision, lastError: undefined });
+      await saveState();
       return { ready: true, capability, status: "ready", lifecycle: "READY", path: runtimeHome, version: "transformers.js/onnxruntime-node", model: model.id, details: { revision: model.revision, lifecycle: "READY" } };
     }
     if (capability === "rerank") {
       const { model, tokenizer, classifier } = await rerankModel(item.model);
       const inputs = tokenizer(["health"], { text_pair: ["health"], padding: true, truncation: true, max_length: 32 });
       await classifier(inputs);
+      setComponent("rerank", { lifecycle: "READY", ready: true, model: model.id, revision: model.revision, lastError: undefined });
+      await saveState();
       return { ready: true, capability, status: "ready", lifecycle: "READY", path: runtimeHome, version: "transformers.js/onnxruntime-node", model: model.id, details: { revision: model.revision, lifecycle: "READY" } };
     }
     if (capability === "ocr") {
@@ -308,10 +368,11 @@ async function health(capability) {
   return { ready: false, capability, details: { error: "unsupported capability" } };
 }
 
-async function embed(params) {
+async function embed(params, report = null) {
   const texts = Array.isArray(params.texts) ? params.texts.map((value) => String(value)) : [];
   if (texts.length === 0) return { vectors: [] };
-  const { model, extractor } = await embeddingModel(params.model);
+  const { model, extractor } = await embeddingModel(params.model, report);
+  reportModelPhase(report, "loading");
   setComponent("embedding", { lifecycle: "LOADING", ready: false, model: model.id, revision: model.revision });
   await saveState();
   const output = await extractor(texts, { pooling: "last_token", normalize: true });
@@ -327,11 +388,12 @@ async function embed(params) {
   return { vectors };
 }
 
-async function rerank(params) {
+async function rerank(params, report = null) {
   const query = String(params.query ?? "");
   const documents = Array.isArray(params.documents) ? params.documents.map((value) => String(value)) : [];
   if (documents.length === 0) return { scores: [] };
-  const { model, tokenizer, classifier } = await rerankModel(params.model);
+  const { model, tokenizer, classifier } = await rerankModel(params.model, report);
+  reportModelPhase(report, "loading");
   setComponent("rerank", { lifecycle: "LOADING", ready: false, model: model.id, revision: model.revision });
   await saveState();
   const inputs = tokenizer(documents.map(() => query), {
@@ -414,14 +476,14 @@ async function office(params) {
   return { text: String(markdown).trim() };
 }
 
-async function loadModel(params) {
+async function loadModel(params, report = null) {
   const capability = String(params.capability ?? "");
   if (capability === "embedding") {
-    await embed({ model: params.model, texts: ["Knowledge managed runtime smoke"] });
+    await embed({ model: params.model, texts: ["Knowledge managed runtime smoke"] }, report);
     return health(capability);
   }
   if (capability === "rerank") {
-    await rerank({ model: params.model, query: "Knowledge managed runtime smoke", documents: ["Knowledge managed runtime smoke"] });
+    await rerank({ model: params.model, query: "Knowledge managed runtime smoke", documents: ["Knowledge managed runtime smoke"] }, report);
     return health(capability);
   }
   if (capability === "ocr") {
@@ -450,7 +512,7 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function dispatch(request) {
+async function dispatch(request, report = null) {
   const method = request.method;
   const params = request.params ?? {};
   if (method === "initialize") {
@@ -459,7 +521,7 @@ async function dispatch(request) {
       capabilities: ["embedding", "rerank", "ocr", "pdf_render", "office"],
     };
   }
-  if (method === "load") return loadModel(params);
+  if (method === "load") return loadModel(params, report);
   if (method === "remove") return removeModel(params);
   if (method === "health") return health(String(params.capability ?? ""));
   if (method === "embed" || method === "embedding") return embed(params);
@@ -487,7 +549,8 @@ for await (const line of input) {
   let request;
   try {
     request = JSON.parse(line);
-    const result = await dispatch(request);
+    const report = (update) => process.stdout.write(`${JSON.stringify({ id: request.id, progress: update })}\n`);
+    const result = await dispatch(request, report);
     process.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
   } catch (error) {
     const capability = capabilityForRequest(request);

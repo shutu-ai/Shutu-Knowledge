@@ -35,15 +35,35 @@ func (pdfParser) Parse(_ string, data []byte) (Result, error) {
 		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
 	}
 
-	if AverageLineLength(plain) >= 5 {
+	// U+FFFD is produced by the PDF library when a font's ToUnicode map is
+	// missing or broken. It is valid UTF-8, so a byte-validity check alone
+	// cannot detect it. Keep the native text as a fallback, but mark it
+	// unhealthy so the ingestion chain can try OCR/reconstruction.
+	if AverageLineLength(plain) >= 5 && !hasReplacementRune(plain) {
 		return Result{Text: plain}, nil
 	}
 	reassembled, layoutErr := reassemblePDFLayout(data)
-	if layoutErr == nil && strings.TrimSpace(reassembled) != "" && AverageLineLength(reassembled) >= 12 {
+	if layoutErr == nil && strings.TrimSpace(reassembled) != "" &&
+		AverageLineLength(reassembled) >= 12 && !hasReplacementRune(reassembled) {
 		return Result{Text: reassembled}, nil
 	}
 	// Preserve the native text for the caller's OCR/fallback chain.
-	return Result{Text: plain, NeedsOCR: true}, nil
+	if strings.TrimSpace(plain) != "" {
+		return Result{Text: plain, NeedsOCR: true}, nil
+	}
+	if plainErr != nil {
+		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
+	}
+	return Result{}, fmt.Errorf("PDF contains no healthy extractable text")
+}
+
+func hasReplacementRune(text string) bool {
+	for _, r := range text {
+		if r == '\uFFFD' {
+			return true
+		}
+	}
+	return false
 }
 
 func extractPDFPlainText(data []byte) (string, error) {

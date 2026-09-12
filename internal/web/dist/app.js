@@ -12,12 +12,13 @@ const navigation = [
 ];
 
 const state = {
-  route: "overview", bases: [], selectedBaseId: localStorage.getItem("knowledge-base") ?? "",
-  modelJobs: {}, chunkExpansionAll: false, expandedChunks: new Set(),
+  route: "overview", bases: [], selectedBaseId: localStorage.getItem("knowledge-base") ?? "", docFolder: "",
+  modelJobs: {}, documentJobs: {}, chunkExpansionAll: false, expandedChunks: new Set(),
 };
 const screen = document.getElementById("screen");
 const toastNode = document.getElementById("toast");
 let toastTimer;
+let documentRefreshPromise;
 const MAX_IMPORT_FILES = 20;
 const SUPPORTED_IMPORT_EXTENSIONS = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.epub";
 
@@ -111,6 +112,211 @@ function metric(label, value) {
   return h("div", { class: "metric" }, [h("strong", {}, number(value)), h("span", {}, label)]);
 }
 
+function documentJobPercent(job) {
+  const progress = Number(job.progress ?? 0);
+  const total = Number(job.total ?? 0);
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, progress / total * 100));
+}
+
+function documentJobPercentText(percent) {
+  if (percent > 0 && percent < 0.1) return "<0.1%";
+  if (percent < 10) return `${percent.toFixed(1)}%`;
+  if (percent < 100) return `${Math.round(percent)}%`;
+  return `${percent}%`;
+}
+
+function documentJobIndeterminate(job) {
+  return !["done", "failed", "cancelled"].includes(job.status) && Number(job.total ?? 0) <= 0;
+}
+
+function documentJobCountText(job) {
+  if (Number(job.total ?? 0) > 0) return `${Number(job.progress ?? 0)} / ${Number(job.total ?? 0)}`;
+  return localized(["importing", "submitting"].includes(job.phase) ? "Waiting for import" : "Waiting for scan count");
+}
+
+function documentJobPhaseText(job) {
+  if (job.phase === "scanning") return localized("Scanning directory");
+  if (job.phase === "loading") return localized("Loading file");
+  if (job.phase === "submitting") return localized("Submitting files");
+  if (job.phase === "importing") return localized("Importing document");
+  if (job.phase === "parsing") return localized("Parsing file");
+  if (job.phase === "embedding") return localized("Embedding file");
+  if (job.phase === "reindexing") return localized("Reindexing file");
+  if (job.kind === "rescan_directory") return localized("Rescanning directory");
+  if (job.kind === "import_directory") return localized("Importing directory");
+  if (job.kind === "reindex_documents") return localized("Reindexing files");
+  return localized("Processing");
+}
+
+function documentJobCard(id, job) {
+  const percent = documentJobPercent(job);
+  const indeterminate = documentJobIndeterminate(job);
+  return h("article", { class: "document-job", "data-document-job-id": id }, [
+    h("div", { class: "document-job-head" }, [
+      h("div", { class: "document-job-copy" }, [
+        h("strong", { class: "truncate" }, job.label || id),
+        h("span", { class: "muted truncate", "data-document-job-file": "" }, job.file || documentJobPhaseText(job)),
+      ]),
+      h("span", { class: `chip document-job-status ${job.status || "pending"}`, "data-document-job-status": "" }, localized(job.status || "pending")),
+    ]),
+    h("div", { class: "document-job-progress-row" }, [
+      h("span", { class: "muted", "data-document-job-phase": "" }, documentJobPhaseText(job)),
+      h("strong", { class: "document-job-percent", "data-document-job-percent": "" }, indeterminate ? localized("In progress") : documentJobPercentText(percent)),
+    ]),
+    h("div", {
+      class: `progress document-job-progress${indeterminate ? " indeterminate" : ""}`,
+      role: "progressbar", "aria-label": "Document processing progress", "aria-valuemin": "0", "aria-valuemax": "100",
+      ...(indeterminate ? { "aria-valuetext": documentJobPhaseText(job) } : { "aria-valuenow": String(percent), "aria-valuetext": documentJobPercentText(percent) }),
+    }, h("span", { class: `document-job-fill${indeterminate ? " indeterminate" : ""}`, style: `width:${percent}%` })),
+    h("div", { class: "document-job-foot" }, [
+      h("span", { class: "muted", "data-document-job-count": "" }, documentJobCountText(job)),
+      h("button", { class: "button small danger", onclick: () => guard(async () => { await api.cancelJob(id); }) }, localized("Cancel")),
+    ]),
+  ]);
+}
+
+function updateDocumentJobCard(id, job, label) {
+  const card = [...document.querySelectorAll("[data-document-job-id]")]
+    .find((node) => node.getAttribute("data-document-job-id") === id);
+  if (!card) return;
+  const percent = documentJobPercent(job);
+  const indeterminate = documentJobIndeterminate(job);
+  const statusNode = card.querySelector("[data-document-job-status]");
+  const fileNode = card.querySelector("[data-document-job-file]");
+  const phaseNode = card.querySelector("[data-document-job-phase]");
+  const percentNode = card.querySelector("[data-document-job-percent]");
+  const countNode = card.querySelector("[data-document-job-count]");
+  const progressNode = card.querySelector(".document-job-progress");
+  const fillNode = card.querySelector(".document-job-fill");
+  if (statusNode) {
+    statusNode.textContent = localized(job.status || "pending");
+    statusNode.className = `chip document-job-status ${job.status || "pending"}`;
+  }
+  if (fileNode) fileNode.textContent = job.file || documentJobPhaseText(job);
+  if (phaseNode) phaseNode.textContent = documentJobPhaseText(job);
+  if (percentNode) percentNode.textContent = indeterminate ? localized("In progress") : documentJobPercentText(percent);
+  if (countNode) countNode.textContent = documentJobCountText(job);
+  if (progressNode) {
+    progressNode.classList.toggle("indeterminate", indeterminate);
+    if (indeterminate) {
+      progressNode.removeAttribute("aria-valuenow");
+      progressNode.setAttribute("aria-valuetext", documentJobPhaseText(job));
+    } else {
+      progressNode.setAttribute("aria-valuenow", String(percent));
+      progressNode.setAttribute("aria-valuetext", documentJobPercentText(percent));
+    }
+  }
+  if (fillNode) {
+    fillNode.classList.toggle("indeterminate", indeterminate);
+    fillNode.style.width = `${percent}%`;
+  }
+  if (label) {
+    const title = card.querySelector(".document-job-copy strong");
+    if (title) title.textContent = label;
+  }
+}
+
+function documentJobSection() {
+  const entries = Object.entries(state.documentJobs);
+  return h("section", { class: "section", "data-document-jobs-section": "", hidden: !entries.length }, [
+    h("div", { class: "section-head" }, [
+      h("h2", {}, localized("Document tasks")),
+      h("span", { class: "chip processing", "data-document-job-summary": "" }, `${entries.length} ${localized("active tasks")}`),
+    ]),
+    h("div", { class: "document-jobs", "data-document-jobs-container": "" }, entries.map(([id, job]) => documentJobCard(id, job))),
+  ]);
+}
+
+function syncDocumentJobSection() {
+  const section = document.querySelector("[data-document-jobs-section]");
+  if (!section) return;
+  const count = Object.keys(state.documentJobs).length;
+  section.hidden = count === 0;
+  const summary = section.querySelector("[data-document-job-summary]");
+  if (summary) summary.textContent = `${count} ${localized("active tasks")}`;
+}
+
+function removeDocumentJobCard(id) {
+  const card = [...document.querySelectorAll("[data-document-job-id]")]
+    .find((node) => node.getAttribute("data-document-job-id") === id);
+  if (card) card.remove();
+  syncDocumentJobSection();
+}
+
+function refreshDocumentViewInBackground() {
+  if (state.route !== "documents" && state.route !== "import") return;
+  if (documentRefreshPromise) return;
+  documentRefreshPromise = render()
+    .catch((error) => showToast(error.message, true))
+    .finally(() => { documentRefreshPromise = null; });
+}
+
+// Mount task UI synchronously. A document import/reindex can hold SQLite while
+// it parses or embeds; waiting for a full page render here would hide the task
+// card until that work has already finished.
+function mountDocumentJobSection() {
+  let section = document.querySelector("[data-document-jobs-section]");
+  if (!section) {
+    section = documentJobSection();
+    screen.prepend(section);
+    return;
+  }
+  const container = section.querySelector("[data-document-jobs-container]");
+  if (!container) return;
+  for (const [id, job] of Object.entries(state.documentJobs)) {
+    const mounted = [...container.querySelectorAll("[data-document-job-id]")]
+      .some((node) => node.getAttribute("data-document-job-id") === id);
+    if (!mounted) container.append(documentJobCard(id, job));
+  }
+  syncDocumentJobSection();
+}
+
+async function trackDocumentJob(id, label, metadata = {}) {
+  state.documentJobs[id] = { label, status: "pending", progress: 0, total: 0, ...metadata };
+  if (state.route === "documents" || state.route === "import") mountDocumentJobSection();
+  for (;;) {
+    const job = await api.job(id);
+    state.documentJobs[id] = {
+      ...state.documentJobs[id], status: job.status, progress: job.progress, total: job.total,
+      phase: job.phase || state.documentJobs[id].phase,
+      file: job.file || state.documentJobs[id].file,
+    };
+    updateDocumentJobCard(id, state.documentJobs[id], label);
+    if (["done", "failed", "cancelled"].includes(job.status)) {
+      const error = job.status === "failed" ? job.error : job.status === "cancelled" ? "Download cancelled" : "";
+      delete state.documentJobs[id];
+      removeDocumentJobCard(id);
+      refreshDocumentViewInBackground();
+      if (error) throw new Error(error);
+      return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+}
+
+async function runLocalImportTask(label, { total = 0, phase = "importing" } = {}, runner) {
+  const id = `file-import-${Date.now()}`;
+  const job = { id, label, status: "running", progress: 0, total, phase, file: "" };
+  state.documentJobs[id] = job;
+  mountDocumentJobSection();
+  const update = (patch) => {
+    Object.assign(job, patch);
+    updateDocumentJobCard(id, job);
+  };
+  try {
+    await runner(update);
+    delete state.documentJobs[id];
+    removeDocumentJobCard(id);
+    refreshDocumentViewInBackground();
+  } catch (error) {
+    delete state.documentJobs[id];
+    removeDocumentJobCard(id);
+    refreshDocumentViewInBackground();
+    throw error;
+  }
+}
+
 function table(headers, rows) {
   return h("div", { class: "panel table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {}, headers.map((header) => h("th", { scope: "col" }, header)))),
@@ -124,13 +330,16 @@ async function render(initialQuery = "") {
   const searchButton = state.route !== "recall"
     ? h("a", { class: "button", href: "#/recall" }, [icon(icons.search), "Recall Test"]) : null;
   setHeader(`${localized(status.status)} · v${status.version}`, [healthChip, searchButton].filter(Boolean));
+  if (state.route === "models") {
+    await renderModels();
+    return;
+  }
   screen.replaceChildren();
   if (state.route === "overview") await renderOverview();
   if (state.route === "bases") await renderBases();
   if (state.route === "documents") await renderDocuments();
   if (state.route === "import") await renderImport();
   if (state.route === "recall") await renderRecall(initialQuery);
-  if (state.route === "models") await renderModels();
   if (state.route === "settings") await renderSettings();
 }
 
@@ -280,7 +489,7 @@ async function renderDocuments() {
 
   const statusText = (doc) => h("div", {}, [
     chip(doc.status),
-    h("div", { class: "muted mono" }, `${doc.phase || doc.status}${doc.status === "processing" ? ` · ${doc.progress}%` : ""}`),
+    h("div", { class: "muted mono" }, `${doc.sourceType === "directory" && doc.status === "processing" ? localized("Scanning directory") : (doc.phase || doc.status)}${doc.status === "processing" ? ` · ${doc.progress}%` : ""}`),
   ]);
   const documentTitle = (doc) => h("div", { class: "truncate" }, [
     h("strong", {}, doc.title),
@@ -292,7 +501,8 @@ async function renderDocuments() {
   const documentActions = (doc) => h("div", { class: "toolbar" }, [
     doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => { state.docFolder = doc.id; state.docPreview = null; render(); } }, "Open") : null,
     doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => guard(async () => {
-      const job = await api.rescanDirectory(doc.id); await pollJob(job.jobId); await render();
+      const job = await api.rescanDirectory(doc.id);
+      await trackDocumentJob(job.jobId, `rescan ${doc.title}`, { kind: "rescan_directory", documentId: doc.id });
     }, "Directory rescanned") }, "Rescan") : null,
     doc.sourceType === "url" ? h("button", { class: "button small", onclick: () => guard(async () => {
       const result = await api.refreshURL(doc.id); showToast(result.changed ? "URL refreshed" : "URL unchanged"); await render();
@@ -305,7 +515,8 @@ async function renderDocuments() {
       await api.updateDocument(doc.id, title); await render();
     }, "Document renamed") }, "Rename"),
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => guard(async () => {
-      await api.reindexDocument(doc.id); await render();
+      const job = await api.reindexDocument(doc.id);
+      await trackDocumentJob(job.jobId, `reindex ${doc.title}`, { kind: "reindex_document", documentId: doc.id });
     }, "Document reindexed") }, "Reindex") : null,
     h("button", { class: "button small danger", onclick: () => guard(async () => {
       const message = doc.sourceType === "directory" ? `Delete folder "${doc.title}" and all nested documents?` : `Delete "${doc.title}"?`;
@@ -318,7 +529,8 @@ async function renderDocuments() {
   const form = h("form", { class: "section", onsubmit: (event) => { event.preventDefault(); guard(async () => {
     const ids = [...event.target.querySelectorAll("input[name='select']:checked")].map((input) => input.value);
     if (!ids.length) return;
-    const job = await api.reindexDocuments(ids); await pollJob(job.jobId); await render();
+    const job = await api.reindexDocuments(ids);
+    await trackDocumentJob(job.jobId, `reindex ${ids.length} files`, { kind: "reindex_documents" });
   }, "Selected documents reindexed"); } }, [
     h("section", { class: "section toolbar" }, [
       basePicker(async (value) => { syncBasePicker(value); state.docFolder = ""; state.docPreview = null; await render(); }),
@@ -340,6 +552,7 @@ async function renderDocuments() {
       h("td", {}, documentActions(doc)),
     )))),
   ]);
+  screen.append(documentJobSection());
   screen.append(form);
   screen.append(previewPanel);
   if (state.docPreview) {
@@ -420,10 +633,16 @@ async function renderImport() {
   if (!state.selectedBaseId) { screen.append(h("div", { class: "empty panel" }, "Select a knowledge base before importing.")); return; }
   const base = selectedBase();
   screen.append(h("section", { class: "section toolbar" }, [basePicker(async (value) => { syncBasePicker(value); await render(); })]));
+  screen.append(documentJobSection());
   screen.append(h("section", { class: "section grid-2" }, [
     h("form", { class: "panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
       const form = event.target;
-      await api.addText(state.selectedBaseId, { title: form.title.value, content: form.content.value });
+      const title = form.title.value;
+      const content = form.content.value;
+      await runLocalImportTask(`import ${title || "text"}`, {}, async (update) => {
+        update({ phase: "importing", file: title || "text" });
+        await api.addText(state.selectedBaseId, { title, content });
+      });
       form.reset(); await render();
     }, "Text imported"); } }, [
       h("h2", {}, "Text"), h("label", { class: "field" }, "Title", h("input", { name: "title", required: true })),
@@ -432,7 +651,12 @@ async function renderImport() {
     ]),
     h("form", { class: "panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
       const form = event.target;
-      await api.addURL(state.selectedBaseId, { url: form.url.value, title: form.title.value });
+      const url = form.url.value;
+      const title = form.title.value;
+      await runLocalImportTask(`import ${title || url}`, {}, async (update) => {
+        update({ phase: "importing", file: title || url });
+        await api.addURL(state.selectedBaseId, { url, title });
+      });
       form.reset(); await render();
     }, "URL imported"); } }, [
       h("h2", {}, "URL"), h("label", { class: "field" }, "Page URL", h("input", { name: "url", type: "url", required: true })),
@@ -441,15 +665,25 @@ async function renderImport() {
     ]),
     h("form", { class: "panel panel-body", onsubmit: async (event) => { event.preventDefault(); await guard(async () => {
       const form = event.target;
-      if (form.files.files.length > MAX_IMPORT_FILES) {
+      const selectedFiles = [...form.files.files];
+      if (selectedFiles.length > MAX_IMPORT_FILES) {
         showToast(`At most ${MAX_IMPORT_FILES} files per import; split the selection`, true);
         return;
       }
-      const files = await Promise.all([...form.files.files].map(async (file) => ({
-        fileName: file.name, contentBase64: await fileToBase64(file),
-      })));
-      await api.addFiles(state.selectedBaseId, { files, conflict: form.conflict.value });
-      form.reset(); await render();
+      const conflict = form.conflict.value;
+      await runLocalImportTask(`import ${selectedFiles.length} files`, { total: selectedFiles.length, phase: "loading" }, async (update) => {
+        const files = [];
+        for (const [index, file] of selectedFiles.entries()) {
+          update({ phase: "loading", file: file.name, progress: index });
+          const contentBase64 = await fileToBase64(file, (loaded, total) => {
+            update({ phase: "loading", file: file.name, progress: index + loaded / total });
+          });
+          files.push({ fileName: file.name, contentBase64 });
+        }
+        update({ phase: "submitting", file: "", progress: selectedFiles.length, total: 0 });
+        await api.addFiles(state.selectedBaseId, { files, conflict });
+      });
+      form.reset();
     }, "Files imported"); } }, [
       h("h2", {}, "Files"), h("input", { name: "files", type: "file", multiple: true, required: true, accept: SUPPORTED_IMPORT_EXTENSIONS }),
       h("label", { class: "field" }, "Conflict strategy", h("select", { name: "conflict" },
@@ -459,7 +693,8 @@ async function renderImport() {
     h("form", { class: "panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
       const form = event.target;
       const job = await api.importDirectory(state.selectedBaseId, form.path.value);
-      await pollJob(job.jobId); form.reset(); await render();
+      await trackDocumentJob(job.jobId, `import ${form.path.value}`, { kind: "import_directory" });
+      form.reset();
     }, "Directory imported"); } }, [
       h("h2", {}, "Directory"), h("label", { class: "field" }, "Absolute local path", h("input", { name: "path", required: true })),
       h("button", { class: "button primary" }, "Import directory"),
@@ -615,10 +850,269 @@ function renderResults(container, result) {
   );
 }
 
+function modelJobPercent(job) {
+  const progress = Number(job.progress ?? 0);
+  const total = Number(job.total ?? 100);
+  if (total <= 0) return Math.max(0, Math.min(100, progress));
+  return Math.round(Math.max(0, Math.min(100, progress / total * 100)));
+}
+
+function modelJobIsIndeterminate(job) {
+  return job.progressMode === "indeterminate" && !["done", "failed", "cancelled"].includes(job.status);
+}
+
+function modelJobProgressText(job) {
+  return modelJobIsIndeterminate(job) ? localized("In progress") : `${modelJobPercent(job)}%`;
+}
+
+function modelJobPhaseText(job) {
+  return localized(job.phase || (job.kind === "self-test" ? "Self-test" : "Download progress"));
+}
+
+function modelJobTaskText(job) {
+  return localized(job.kind === "self-test" ? "Self-test" : "Model download");
+}
+
+function modelJobBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function modelJobCountText(job) {
+  return modelJobIsIndeterminate(job)
+    ? localized("No exact percentage available")
+    : Number(job.totalBytes) > 0
+      ? `${modelJobBytes(job.completedBytes)} / ${modelJobBytes(job.totalBytes)}`
+    : `${Number(job.progress ?? 0)} / ${Number(job.total ?? 100)}`;
+}
+
+function modelJobCard(id, job) {
+  const status = job.status || "pending";
+  const percent = modelJobPercent(job);
+  const indeterminate = modelJobIsIndeterminate(job);
+  return h("article", { class: "model-job", "data-model-job-id": id }, [
+    h("div", { class: "model-job-head" }, [
+      h("div", { class: "model-job-title" }, [
+        h("span", { class: "model-job-icon", "aria-hidden": "true" }, icon(icons.refresh)),
+        h("div", { class: "model-job-copy" }, [
+          h("strong", { class: "truncate" }, job.label || id),
+          h("span", { class: "muted truncate", "data-model-job-file": "" }, job.file || modelJobTaskText(job)),
+        ]),
+      ]),
+      h("span", { class: `chip model-job-chip ${status}`, "data-model-job-status": "" }, localized(status)),
+    ]),
+    h("div", { class: "model-job-progress-row" }, [
+      h("span", { class: "muted", "data-model-job-phase": "" }, modelJobPhaseText(job)),
+      h("strong", { class: "model-job-percent", "data-model-job-percent": "" }, modelJobProgressText(job)),
+    ]),
+    h("div", {
+      class: "progress model-job-progress",
+      role: "progressbar",
+      "aria-label": "Download progress",
+      "aria-valuemin": "0",
+      "aria-valuemax": "100",
+      "aria-valuetext": indeterminate ? modelJobPhaseText(job) : `${percent}%`,
+      ...(indeterminate ? {} : { "aria-valuenow": String(percent) }),
+    }, h("span", { class: `model-job-fill${indeterminate ? " indeterminate" : ""}`, style: `width:${percent}%` })),
+    h("div", { class: "model-job-foot" }, [
+      h("span", { class: "muted", "data-model-job-count": "" }, modelJobCountText(job)),
+      h("button", { class: "button small danger", onclick: () => guard(async () => {
+        state.modelJobs[id].cancelling = true;
+        await api.cancelJob(id);
+      }) }, "Cancel"),
+    ]),
+  ]);
+}
+
+function updateModelJobCard(id, job, label) {
+  const card = [...document.querySelectorAll("[data-model-job-id]")]
+    .find((node) => node.getAttribute("data-model-job-id") === id);
+  if (!card) return;
+  const status = job.status || "pending";
+  const percent = modelJobPercent(job);
+  const indeterminate = modelJobIsIndeterminate(job);
+  const statusNode = card.querySelector("[data-model-job-status]");
+  const percentNode = card.querySelector("[data-model-job-percent]");
+  const phaseNode = card.querySelector("[data-model-job-phase]");
+  const fileNode = card.querySelector("[data-model-job-file]");
+  const countNode = card.querySelector("[data-model-job-count]");
+  const progressNode = card.querySelector(".model-job-progress");
+  const fillNode = card.querySelector(".model-job-fill");
+  if (statusNode) {
+    statusNode.textContent = localized(status);
+    statusNode.className = `chip model-job-chip ${status}`;
+  }
+  if (percentNode) percentNode.textContent = modelJobProgressText(job);
+  if (phaseNode) phaseNode.textContent = modelJobPhaseText(job);
+  if (fileNode) fileNode.textContent = job.file || modelJobTaskText(job);
+  if (countNode) countNode.textContent = modelJobCountText(job);
+  if (progressNode) {
+    progressNode.classList.toggle("indeterminate", indeterminate);
+    if (indeterminate) {
+      progressNode.removeAttribute("aria-valuenow");
+      progressNode.setAttribute("aria-valuetext", modelJobPhaseText(job));
+    } else {
+      progressNode.setAttribute("aria-valuenow", String(percent));
+      progressNode.setAttribute("aria-valuetext", `${percent}%`);
+    }
+  }
+  if (fillNode) {
+    fillNode.classList.toggle("indeterminate", indeterminate);
+    fillNode.style.width = `${percent}%`;
+  }
+  if (label) {
+    const title = card.querySelector(".model-job-copy strong");
+    if (title) title.textContent = label;
+  }
+}
+
+function syncModelJobSection() {
+  const section = document.querySelector("[data-model-jobs-section]");
+  const container = document.querySelector("[data-model-jobs-container]");
+  if (!section || !container) return;
+  const count = Object.keys(state.modelJobs).length;
+  section.hidden = count === 0;
+  const summary = section.querySelector("[data-model-job-summary]");
+  if (summary) summary.textContent = localized(`${count} active task${count === 1 ? "" : "s"}`);
+}
+
+function mountModelJobCard(id, job) {
+  const container = document.querySelector("[data-model-jobs-container]");
+  if (!container) return;
+  const existing = [...container.querySelectorAll("[data-model-job-id]")]
+    .find((node) => node.getAttribute("data-model-job-id") === id);
+  if (existing) {
+    updateModelJobCard(id, job, job.label);
+  } else {
+    container.append(modelJobCard(id, job));
+  }
+  syncModelJobSection();
+}
+
+function removeModelJobCard(id) {
+  const card = [...document.querySelectorAll("[data-model-job-id]")]
+    .find((node) => node.getAttribute("data-model-job-id") === id);
+  card?.remove();
+  syncModelJobSection();
+}
+
+function modelJobRow(id, job) {
+  const percent = modelJobPercent(job);
+  const indeterminate = modelJobIsIndeterminate(job);
+  return h("div", { class: "list-row model-row model-row-downloading", "data-model-job-row": id }, [
+    h("div", { class: "model-job-row-copy" }, [
+      h("strong", { class: "truncate" }, job.modelId || job.label || id),
+      h("div", { class: "model-meta" }, [
+        h("span", { class: `chip ${job.kind === "self-test" ? "processing" : "downloading"}`, "data-model-job-row-status": "" }, localized(job.kind === "self-test" ? "testing" : "downloading")),
+        h("span", { class: "muted", "data-model-job-row-phase": "" }, `${localized(job.kind || "embedding")} · ${modelJobPhaseText(job)}`),
+      ]),
+    ]),
+    h("div", { class: "model-job-row-progress" }, [
+      h("strong", { class: "model-inline-percent", "data-model-job-row-percent": "" }, modelJobProgressText(job)),
+      h("div", { class: `progress model-inline-progress${indeterminate ? " indeterminate" : ""}` }, h("span", { class: `model-inline-fill${indeterminate ? " indeterminate" : ""}`, style: `width:${percent}%` })),
+    ]),
+  ]);
+}
+
+function updateModelJobRow(id, job) {
+  const row = [...document.querySelectorAll("[data-model-job-row]")]
+    .find((node) => node.getAttribute("data-model-job-row") === id);
+  if (!row) return;
+  const percent = modelJobPercent(job);
+  const indeterminate = modelJobIsIndeterminate(job);
+  const percentNode = row.querySelector("[data-model-job-row-percent]");
+  const phaseNode = row.querySelector("[data-model-job-row-phase]");
+  const progressNode = row.querySelector(".model-inline-progress");
+  const fillNode = row.querySelector(".model-inline-fill");
+  if (percentNode) percentNode.textContent = modelJobProgressText(job);
+  if (phaseNode) phaseNode.textContent = `${localized(job.kind || "embedding")} · ${modelJobPhaseText(job)}`;
+  if (progressNode) progressNode.classList.toggle("indeterminate", indeterminate);
+  if (fillNode) {
+    fillNode.classList.toggle("indeterminate", indeterminate);
+    fillNode.style.width = `${percent}%`;
+  }
+}
+
+function mountModelJobRow(id, job) {
+  if (!job.modelId) return;
+  const list = document.querySelector("[data-local-models-list]");
+  if (!list) return;
+  const existing = [...list.querySelectorAll("[data-model-job-row]")]
+    .find((node) => node.getAttribute("data-model-job-row") === id);
+  if (existing) updateModelJobRow(id, job);
+  else list.append(modelJobRow(id, job));
+}
+
+function removeModelJobRow(id) {
+  const row = [...document.querySelectorAll("[data-model-job-row]")]
+    .find((node) => node.getAttribute("data-model-job-row") === id);
+  row?.remove();
+}
+
+function normalizeLocalModelId(value) {
+  return String(value ?? "").trim().replace(/^local:/i, "");
+}
+
+function installedLocalModelChoices(models, kind) {
+  const seen = new Set();
+  return models
+    .filter((model) => {
+      const status = String(model.status ?? "").toLowerCase();
+      const lifecycle = String(model.lifecycle ?? "").toUpperCase();
+      return model.kind === kind
+        && !["registered", "not-downloaded", "incomplete"].includes(status)
+        && (status === "installed" || model.ready || ["READY", "INSTALLED", "LOADING"].includes(lifecycle));
+    })
+    .map((model) => ({ id: normalizeLocalModelId(model.id), status: model.status, lifecycle: model.lifecycle }))
+    .filter((model) => model.id && !seen.has(model.id) && seen.add(model.id))
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function localModelOptions(kind, choices, current) {
+  const currentId = normalizeLocalModelId(current);
+  const options = choices.map((model) => h("option", {
+    value: model.id,
+    selected: model.id === currentId,
+  }, model.id));
+  if (currentId && !choices.some((model) => model.id === currentId)) {
+    options.unshift(h("option", { value: currentId, selected: true }, `${currentId} · ${localized("Current setting not found locally")}`));
+  }
+  if (!options.length) {
+    options.push(h("option", { value: "", selected: true, disabled: true }, localized(`No installed ${kind} models`)));
+  }
+  return options;
+}
+
+function modelField(slot, name, kind, current, local, choices) {
+  const control = local
+    ? h("select", { name, required: true }, localModelOptions(kind, choices, current))
+    : h("input", { name, value: current ?? "", placeholder: "org/model-name" });
+  slot.replaceChildren(h("label", { class: "field" }, [
+    h("span", { class: "field-label" }, localized("Model")),
+    control,
+    h("span", { class: "field-help" }, localized(local ? "Select an installed local model" : "Remote model identifier")),
+  ]));
+}
+
+function urlField(slot, name, current, local, kind) {
+  slot.replaceChildren(local
+    ? h("div", { class: "model-field-note" }, localized(`${kind} local models need no URL`))
+    : h("label", { class: "field" }, [
+      h("span", { class: "field-label" }, localized("Base URL")),
+      h("input", { name, value: current ?? "", placeholder: "http://127.0.0.1:11434/v1" }),
+      h("span", { class: "field-help" }, localized("Remote URL only; leave blank for local models")),
+    ]));
+}
+
 async function renderModels() {
   const base = selectedBase();
   const config = base?.config ?? {};
   const localModels = await api.localModels();
+  const localEmbeddingModels = installedLocalModelChoices(localModels.models, "embedding");
+  const localRerankModels = installedLocalModelChoices(localModels.models, "rerank");
   const ocrModel = await api.ocrModel();
   let ocrRuntime = { status: {} };
   try {
@@ -635,30 +1129,76 @@ async function renderModels() {
   } catch (error) {
     ollamaError = error.message;
   }
-  const jobBanners = Object.entries(state.modelJobs).map(([id, job]) => h("div", { class: "panel panel-body", style: "margin-bottom:10px" }, [
-    h("div", { class: "toolbar", style: "justify-content:space-between" }, [
-      h("span", { class: "mono" }, `${job.label || id} · ${job.status} · ${job.progress || 0}%`),
-      h("button", { class: "button small danger", onclick: () => guard(async () => {
-        state.modelJobs[id].cancelling = true;
-        await api.cancelJob(id);
-      }) }, "Cancel"),
+  const jobCards = Object.entries(state.modelJobs).map(([id, job]) => modelJobCard(id, job));
+  const activeModelJobs = Object.entries(state.modelJobs).filter(([, job]) => job.modelId && job.kind !== "self-test");
+  const embeddingProvider = h("select", { name: "provider" }, ["openai", "ollama", "local", "none"].map((value) => h("option", { value, selected: config.embeddingProvider === value }, value)));
+  const rerankMode = h("select", { name: "rerankMode" }, [
+    ["local", "Local"], ["remote", "Remote"],
+  ].map(([value, label]) => h("option", { value, selected: (config.rerankBaseUrl ? "remote" : "local") === value }, localized(label))));
+  const embeddingModelSlot = h("div", { class: "model-config-slot" });
+  const embeddingURLSlot = h("div", { class: "model-config-slot" });
+  const rerankModelSlot = h("div", { class: "model-config-slot" });
+  const rerankURLSlot = h("div", { class: "model-config-slot" });
+  const providerForm = h("form", { class: "panel panel-body model-config-form", onsubmit: (event) => { event.preventDefault(); guard(async () => {
+    const form = event.target;
+    const embeddingIsLocal = form.provider.value === "local";
+    const rerankIsLocal = form.rerankMode.value === "local";
+    await api.updateBase(state.selectedBaseId, { config: {
+      ...config,
+      embeddingProvider: form.provider.value,
+      embeddingBaseUrl: embeddingIsLocal ? "" : (form.elements.embeddingBaseUrl?.value ?? ""),
+      embeddingModel: embeddingIsLocal ? normalizeLocalModelId(form.elements.embeddingModel?.value) : (form.elements.embeddingModel?.value ?? ""),
+      rerankModel: rerankIsLocal ? normalizeLocalModelId(form.elements.rerankModel?.value) : (form.elements.rerankModel?.value ?? ""),
+      rerankBaseUrl: rerankIsLocal ? "" : (form.elements.rerankBaseUrl?.value ?? ""),
+    } });
+    await loadBases(); await render();
+  }, "Model configuration saved"); } }, [
+    h("div", { class: "model-provider-grid" }, [
+      h("section", { class: "model-provider-card" }, [
+        h("div", { class: "model-provider-card-head" }, [h("div", { class: "eyebrow" }, "EMBEDDING"), h("h3", {}, localized("Embedding model"))]),
+        h("label", { class: "field" }, [h("span", { class: "field-label" }, localized("Provider")), embeddingProvider]),
+        embeddingModelSlot,
+        embeddingURLSlot,
+      ]),
+      h("section", { class: "model-provider-card" }, [
+        h("div", { class: "model-provider-card-head" }, [h("div", { class: "eyebrow" }, "RERANK"), h("h3", {}, localized("Rerank model"))]),
+        h("label", { class: "field" }, [h("span", { class: "field-label" }, localized("Source")), rerankMode]),
+        rerankModelSlot,
+        rerankURLSlot,
+      ]),
     ]),
-  ]));
+    h("div", { class: "model-config-actions" }, [
+      h("span", { class: "model-config-note" }, localized("Local models are selected from the installed model list; URL is only for remote providers.")),
+      h("button", { class: "button primary" }, [icon(icons.save), localized("Save providers")]),
+    ]),
+  ]);
+  const refreshProviderFields = () => {
+    const embeddingIsLocal = embeddingProvider.value === "local";
+    const rerankIsLocal = rerankMode.value === "local";
+    const currentEmbeddingModel = providerForm.elements.embeddingModel?.value ?? config.embeddingModel ?? "";
+    const currentRerankModel = providerForm.elements.rerankModel?.value ?? config.rerankModel ?? "";
+    const currentEmbeddingURL = providerForm.elements.embeddingBaseUrl?.value ?? config.embeddingBaseUrl ?? "";
+    const currentRerankURL = providerForm.elements.rerankBaseUrl?.value ?? config.rerankBaseUrl ?? "";
+    modelField(embeddingModelSlot, "embeddingModel", "embedding", currentEmbeddingModel, embeddingIsLocal, localEmbeddingModels);
+    modelField(rerankModelSlot, "rerankModel", "rerank", currentRerankModel, rerankIsLocal, localRerankModels);
+    urlField(embeddingURLSlot, "embeddingBaseUrl", currentEmbeddingURL, embeddingIsLocal || embeddingProvider.value === "none", "Embedding");
+    urlField(rerankURLSlot, "rerankBaseUrl", currentRerankURL, rerankIsLocal, "Rerank");
+  };
+  embeddingProvider.addEventListener("change", refreshProviderFields);
+  rerankMode.addEventListener("change", refreshProviderFields);
+  refreshProviderFields();
+  screen.replaceChildren();
   screen.append(h("section", { class: "section" }, [
-    h("div", { class: "section-head" }, [h("h2", {}, "Provider"), basePicker(async (value) => { syncBasePicker(value); await render(); })]),
-    h("form", { class: "panel panel-body form-grid", onsubmit: (event) => { event.preventDefault(); guard(async () => {
-      const form = event.target;
-      await api.updateBase(state.selectedBaseId, { config: { ...config, embeddingProvider: form.provider.value, embeddingBaseUrl: form.baseUrl.value, embeddingModel: form.model.value, rerankModel: form.rerankModel.value, rerankBaseUrl: form.rerankUrl.value } });
-      await loadBases(); await render();
-    }, "Model configuration saved"); } }, [
-      h("label", { class: "field" }, "Embedding provider", h("select", { name: "provider" }, ["openai", "ollama", "local", "none"].map((value) => h("option", { value, selected: config.embeddingProvider === value }, value)))),
-      h("label", { class: "field" }, "Base URL", h("input", { name: "baseUrl", value: config.embeddingBaseUrl ?? "" })),
-      h("label", { class: "field" }, "Embedding model", h("input", { name: "model", value: config.embeddingModel ?? "" })),
-      h("label", { class: "field" }, "Rerank model", h("input", { name: "rerankModel", value: config.rerankModel ?? "" })),
-      h("label", { class: "field" }, "Rerank URL", h("input", { name: "rerankUrl", value: config.rerankBaseUrl ?? "" })),
-      h("button", { class: "button primary" }, [icon(icons.save), "Save providers"]),
+    h("div", { class: "section-head" }, [h("h2", {}, localized("Model selection")), basePicker(async (value) => { syncBasePicker(value); await render(); })]),
+    providerForm,
+  ]));
+  const activeJobs = Object.values(state.modelJobs).length;
+  screen.append(h("section", { class: "section", "data-model-jobs-section": "", hidden: !jobCards.length }, [
+    h("div", { class: "section-head" }, [
+      h("h2", {}, "Model tasks"),
+      h("span", { class: "chip processing", "data-model-job-summary": "" }, `${activeJobs} active task${activeJobs === 1 ? "" : "s"}`),
     ]),
-    ...jobBanners,
+    h("div", { class: "model-jobs", "data-model-jobs-container": "" }, jobCards),
   ]));
   screen.append(h("section", { class: "section grid-2" }, [
     h("div", {}, [
@@ -676,7 +1216,7 @@ async function renderModels() {
             }, "OCR model removed") }, [icon(icons.trash), "Delete"]) : null,
             h("button", { class: "button small primary", onclick: () => guard(async () => {
               const job = await api.downloadOCRModel();
-              trackJob(job.jobId, `ocr ${ocrModel.id}`).catch((error) => showToast(error.message, true));
+              trackJob(job.jobId, `ocr ${ocrModel.id}`, { modelId: ocrModel.id, kind: "ocr" }).catch((error) => showToast(error.message, true));
               await render();
             }) }, [icon(icons.refresh), "Download"]),
           ]),
@@ -692,23 +1232,43 @@ async function renderModels() {
           : "OCR remains unavailable until both are ready"),
       ]),
       h("div", { class: "section-head" }, [h("h2", {}, "Local model files"), h("span", { class: "muted mono" }, localModels.cacheDir)]),
-        h("div", { class: "panel list" }, localModels.models.length ? localModels.models.map((model) => h("div", { class: "list-row" }, [
+        h("div", { class: "panel list", "data-local-models-list": "" }, [
+          ...(localModels.models.length ? localModels.models.map((model) => h("div", { class: "list-row model-row" }, [
           h("div", {}, [
             h("strong", { class: "truncate" }, model.id),
-            h("div", { class: "muted" }, `${model.kind} · ${number(model.sizeBytes)} bytes · ${model.status} · ${model.lifecycle || "INSTALLED"}${model.runtimeStatus ? ` · ${model.runtimeStatus}` : ""}${model.selfTest ? (model.selfTest.current ? " · self-test passed" : model.selfTest.healthy ? " · stale self-test" : " · self-test failed") : model.kind === "rerank" ? " · self-test required" : ""}`),
+            h("div", { class: "model-meta" }, [
+              (() => {
+                const runtimeReady = model.ready || model.lifecycle === "READY";
+                return h("span", { class: `chip ${runtimeReady ? "ready" : (model.status || "unknown")}` }, localized(runtimeReady ? "READY" : (model.status || "unknown")));
+              })(),
+              h("span", { class: "muted" }, `${localized(model.kind)} · ${model.sizeBytes ? `${number(model.sizeBytes)} bytes` : localized("Managed runtime cache")}`),
+              !(model.ready || model.lifecycle === "READY") && localized(model.lifecycle || "INSTALLED") !== localized(model.status || "unknown")
+                ? h("span", { class: "muted mono" }, localized(model.lifecycle || "INSTALLED")) : null,
+              model.runtimeStatus ? h("span", { class: "muted mono" }, localized(model.runtimeStatus)) : null,
+              model.selfTest ? h("span", { class: "muted" }, model.selfTest.current ? "self-test passed" : model.selfTest.healthy ? "stale self-test" : "self-test failed") : model.kind === "rerank" ? h("span", { class: "muted" }, "self-test required") : null,
+            ]),
           ]),
           h("div", { class: "toolbar" }, [
-            model.kind === "rerank" ? h("button", { class: "button small", onclick: () => guard(async () => {
-              const result = await api.selfTestReranker(model.id);
-              showToast(`Reranker self-test passed · ${result.latencyMs} ms`);
+          model.kind === "rerank" ? (() => {
+            const selfTestRunning = Object.values(state.modelJobs).some((job) => job.kind === "self-test" && job.selfTestModelId === model.id);
+            return h("button", { class: "button small", disabled: selfTestRunning, onclick: () => guard(async () => {
+              const job = await api.selfTestReranker(model.id);
+              trackJob(job.jobId, `self-test ${model.id}`, {
+                modelId: model.id, kind: "self-test", selfTestModelId: model.id,
+                progressMode: job.progressMode || "indeterminate",
+              }).catch((error) => showToast(error.message, true));
               await render();
-            }) }, "Self-test") : null,
+            }) }, selfTestRunning ? "Self-test running" : "Self-test");
+          })() : null,
             h("button", { class: "button small danger", onclick: () => guard(async () => {
               if (!window.confirm(`Delete local model "${model.id}"?`)) return;
               await api.removeModel(model.id); await render();
             }, "Model removed") }, "Delete"),
           ]),
-        ])) : h("div", { class: "empty" }, "No local model files")),
+        ])) : []),
+          ...activeModelJobs.map(([id, job]) => modelJobRow(id, job)),
+          ...(!localModels.models.length && !activeModelJobs.length ? [h("div", { class: "empty" }, "No local model files")] : []),
+        ]),
           h("form", { class: "panel panel-body form-grid", style: "margin-top:12px", onsubmit: (event) => { event.preventDefault(); guard(async () => {
             const form = event.target;
             await api.registerReranker(form.customReranker.value);
@@ -723,7 +1283,7 @@ async function renderModels() {
         const body = { id: form.id.value, kind: form.kind.value };
         if (form.artifacts.value) body.artifacts = form.artifacts.value.split(",").map((value) => value.trim()).filter(Boolean);
         const job = await api.downloadModel(body);
-        trackJob(job.jobId, `${body.kind} ${body.id}`).catch((error) => showToast(error.message, true));
+        trackJob(job.jobId, `${body.kind} ${body.id}`, { modelId: body.id, kind: body.kind, progressMode: job.progressMode || "indeterminate" }).catch((error) => showToast(error.message, true));
         form.reset();
       }); } }, [
         h("label", { class: "field" }, "Hugging Face model", h("input", { name: "id", required: true, placeholder: "org/model-name" })),
@@ -772,18 +1332,32 @@ function ollamaPanel(ollamaModels, ollamaError) {
   ]);
 }
 
-async function trackJob(id, label) {
-  state.modelJobs[id] = { label, status: "pending", progress: 0 };
-  if (state.route === "models") await render();
+async function trackJob(id, label, metadata = {}) {
+  state.modelJobs[id] = { label, status: "pending", progress: 0, total: 100, ...metadata };
+  if (state.route === "models") {
+    mountModelJobCard(id, state.modelJobs[id]);
+    mountModelJobRow(id, state.modelJobs[id]);
+  }
   for (;;) {
     const job = await api.job(id);
-    state.modelJobs[id] = { label, status: job.status, progress: job.progress };
+    state.modelJobs[id] = {
+      ...state.modelJobs[id], status: job.status, progress: job.progress, total: job.total || 100,
+      phase: job.phase || state.modelJobs[id].phase,
+      file: job.file || state.modelJobs[id].file,
+      completedBytes: job.completedBytes ?? state.modelJobs[id].completedBytes,
+      totalBytes: job.totalBytes ?? state.modelJobs[id].totalBytes,
+    };
+    updateModelJobCard(id, state.modelJobs[id], label);
+    updateModelJobRow(id, state.modelJobs[id]);
     if (["done", "failed", "cancelled"].includes(job.status)) {
       const error = job.status === "failed" ? job.error : job.status === "cancelled" ? "Download cancelled" : "";
       delete state.modelJobs[id];
-      if (state.route === "models") await render();
+      if (state.route === "models") {
+        removeModelJobCard(id);
+        removeModelJobRow(id);
+        render().catch((refreshError) => showToast(refreshError.message, true));
+      }
       if (error) throw new Error(error);
-      showToast(`${label} complete`);
       return job;
     }
     await new Promise((resolve) => setTimeout(resolve, 350));
@@ -909,17 +1483,6 @@ async function renderSettings() {
     ]),
     h("button", { class: "button primary" }, [icon(icons.save), "Save base settings"]),
   ]));
-}
-
-async function pollJob(id) {
-  for (;;) {
-    const job = await api.job(id);
-    if (["done", "failed", "cancelled"].includes(job.status)) {
-      if (job.status !== "done") throw new Error(job.error || `Job ${job.status}`);
-      return job;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
 }
 
 async function loadBases() {

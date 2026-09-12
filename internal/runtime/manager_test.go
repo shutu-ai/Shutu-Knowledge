@@ -118,6 +118,28 @@ func TestManagerUsesModelLoadBudgetOnlyForFirstModelInference(t *testing.T) {
 	}
 }
 
+func TestManagerForwardsModelProgressEvents(t *testing.T) {
+	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
+	manager := NewManager(Options{Command: helperCommand(t), StartupTimeout: 2 * time.Second, RequestTimeout: 2 * time.Second, ModelLoadTimeout: 2 * time.Second})
+	defer manager.Close()
+	var updates []ModelProgress
+	health, err := manager.LoadModelWithProgress(context.Background(), CapabilityEmbedding, "fixture-model", func(update ModelProgress) {
+		updates = append(updates, update)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Ready || len(updates) != 2 {
+		t.Fatalf("load result: %+v, progress: %+v", health, updates)
+	}
+	if updates[0].Phase != "downloading" || updates[0].CompletedBytes != 25 || updates[0].TotalBytes != 100 {
+		t.Fatalf("download progress: %+v", updates[0])
+	}
+	if updates[1].Phase != "loading" {
+		t.Fatalf("loading progress: %+v", updates[1])
+	}
+}
+
 func TestManagerIdleLifecycle(t *testing.T) {
 	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
 	manager := NewManager(Options{Command: helperCommand(t), StartupTimeout: 2 * time.Second, RequestTimeout: 2 * time.Second, IdleTimeout: 20 * time.Millisecond})
@@ -201,6 +223,22 @@ func runHelper(stdin *os.File, stdout *os.File) error {
 				time.Sleep(time.Duration(body.SleepMS) * time.Millisecond)
 			}
 			if err := reply(map[string]any{"vectors": [][]float64{{1}, {2}}}); err != nil {
+				return err
+			}
+		case "load":
+			if _, err := writer.WriteString(fmt.Sprintf("{\"id\":%d,\"progress\":{\"phase\":\"downloading\",\"completedBytes\":25,\"totalBytes\":100}}\n", id)); err != nil {
+				return err
+			}
+			if err := writer.Flush(); err != nil {
+				return err
+			}
+			if _, err := writer.WriteString(fmt.Sprintf("{\"id\":%d,\"progress\":{\"phase\":\"loading\"}}\n", id)); err != nil {
+				return err
+			}
+			if err := writer.Flush(); err != nil {
+				return err
+			}
+			if err := reply(Health{Ready: true, Model: "fixture-model"}); err != nil {
 				return err
 			}
 		case CapabilityRerank:

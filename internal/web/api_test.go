@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
@@ -352,6 +353,7 @@ func TestDocumentTreeAndGroupAPI(t *testing.T) {
 type fakeRerankRuntime struct {
 	request map[string]any
 	scores  []float64
+	health  runtime.Health
 }
 
 func (f *fakeRerankRuntime) Configured(capability string) bool {
@@ -375,10 +377,83 @@ func (f *fakeRerankRuntime) Probe(_ context.Context, capability string) (runtime
 }
 
 func (f *fakeRerankRuntime) Status(_ context.Context) map[string]runtime.Health {
+	if f.health.Model != "" {
+		return map[string]runtime.Health{runtime.CapabilityRerank: f.health}
+	}
 	return map[string]runtime.Health{runtime.CapabilityRerank: {Capability: runtime.CapabilityRerank, Ready: true}}
 }
 
 func (f *fakeRerankRuntime) Close() {}
+
+type fakeManagedModelRuntime struct {
+	health  runtime.Health
+	removed bool
+}
+
+func (f *fakeManagedModelRuntime) Configured(capability string) bool {
+	return capability == runtime.CapabilityEmbedding
+}
+
+func (f *fakeManagedModelRuntime) Call(_ context.Context, capability string, _ any, _ any) error {
+	return &runtime.Error{Code: "unsupported", Message: capability}
+}
+
+func (f *fakeManagedModelRuntime) Probe(_ context.Context, capability string) (runtime.Health, error) {
+	if capability != runtime.CapabilityEmbedding {
+		return runtime.Health{Capability: capability}, nil
+	}
+	return f.health, nil
+}
+
+func (f *fakeManagedModelRuntime) Status(_ context.Context) map[string]runtime.Health {
+	return map[string]runtime.Health{runtime.CapabilityEmbedding: f.health}
+}
+
+func (f *fakeManagedModelRuntime) Close() {}
+
+func (f *fakeManagedModelRuntime) LoadModel(_ context.Context, _ string, _ string) (runtime.Health, error) {
+	return f.health, nil
+}
+
+func (f *fakeManagedModelRuntime) RemoveModel(_ context.Context, _ string, _ string) error {
+	f.removed = true
+	return nil
+}
+
+func TestManagedRuntimeModelAppearsInLocalModelList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", home)
+	application, err := app.New(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	modelID := "onnx-community/Qwen3-Embedding-0.6B-ONNX"
+	application.Runtime = &fakeManagedModelRuntime{health: runtime.Health{
+		Capability: runtime.CapabilityEmbedding, Model: modelID,
+		Status: "installed", Lifecycle: "INSTALLED", Version: "transformers.js/onnxruntime-node",
+	}}
+	application.ManagedRuntime = true
+	s := New(application)
+
+	_, payload := call(t, s, "GET", "/api/local-models", nil)
+	items := valueMap(t, payload)["models"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("managed model list: %v", items)
+	}
+	item := items[0].(map[string]any)
+	if item["id"] != modelID || item["status"] != "installed" || item["lifecycle"] != "INSTALLED" {
+		t.Fatalf("managed model state: %v", item)
+	}
+
+	code, _ := call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": modelID})
+	if code != http.StatusOK {
+		t.Fatalf("remove managed model: %d", code)
+	}
+	if !application.Runtime.(*fakeManagedModelRuntime).removed {
+		t.Fatal("managed runtime remove was not called")
+	}
+}
 
 func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	home := t.TempDir()
@@ -420,9 +495,26 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("self-test: %d %v", code, payload)
 	}
-	result := valueMap(t, payload)
-	if result["healthy"] != true || result["current"] != true || result["artifactCount"].(float64) != 1 {
-		t.Fatalf("self-test result: %v", result)
+	jobID := valueMap(t, payload)["jobId"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job, ok := application.Jobs.Status(jobID)
+		if !ok {
+			t.Fatalf("self-test job missing: %s", jobID)
+		}
+		if job.Status == "done" {
+			if job.Progress != 100 || job.Phase != "ready" {
+				t.Fatalf("self-test job result: %+v", job)
+			}
+			break
+		}
+		if job.Status == "failed" {
+			t.Fatalf("self-test job failed: %+v", job)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("self-test job timeout: %+v", job)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	documents, ok := runtimeStub.request["documents"].([]string)
 	if runtimeStub.request["model"] != "owner/custom-reranker" || !ok || len(documents) != 2 {
@@ -460,6 +552,39 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	_, payload = call(t, s, "GET", "/api/local-models", nil)
 	if models := valueMap(t, payload)["models"].([]any); len(models) != 0 {
 		t.Fatalf("registered reranker was not unregistered: %v", models)
+	}
+}
+
+func TestManagedRerankerSelfTestAcceptsRuntimeCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", home)
+	application, err := app.New(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	modelID := "Xenova/bge-reranker-base"
+	runtimeStub := &fakeRerankRuntime{
+		scores: []float64{0.91, 0.08},
+		health: runtime.Health{
+			Capability: runtime.CapabilityRerank, Model: modelID,
+			Status: "installed", Lifecycle: "INSTALLED",
+			Version: "transformers.js/onnxruntime-node",
+		},
+	}
+	application.Runtime = runtimeStub
+	application.ManagedRuntime = true
+
+	result, err := application.SelfTestReranker(context.Background(), "local:"+modelID)
+	if err != nil {
+		t.Fatalf("managed self-test: %v", err)
+	}
+	if !result.Healthy || !result.Current || runtimeStub.request["model"] != modelID {
+		t.Fatalf("managed self-test result: %v request=%v", result, runtimeStub.request)
+	}
+	views, err := application.ListLocalModels()
+	if err != nil || len(views) != 1 || views[0].SelfTest == nil || !views[0].SelfTest.Current {
+		t.Fatalf("managed self-test state: %+v err=%v", views, err)
 	}
 }
 

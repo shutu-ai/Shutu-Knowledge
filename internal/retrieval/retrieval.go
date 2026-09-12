@@ -160,12 +160,19 @@ type RankedHit struct {
 	HasVector    bool
 	HasLexical   bool
 	Embedding    []float32
+	MMRScore     float64
 }
 
 // MaximalMarginalRelevance reorders hits for diversity using
 // lambda * relevance - (1 - lambda) * max-similarity-to-selected.
 // Hits without embeddings keep their positions after the selected set.
 func MaximalMarginalRelevance(hits []RankedHit, queryVector []float32, lambda float64, topK int) []RankedHit {
+	if lambda < 0 {
+		lambda = 0
+	}
+	if lambda > 1 {
+		lambda = 1
+	}
 	var withEmbedding []RankedHit
 	var without []RankedHit
 	for _, hit := range hits {
@@ -201,7 +208,9 @@ func MaximalMarginalRelevance(hits []RankedHit, queryVector []float32, lambda fl
 				bestIndex = i
 			}
 		}
-		selected = append(selected, remaining[bestIndex])
+		picked := remaining[bestIndex]
+		picked.MMRScore = bestScore
+		selected = append(selected, picked)
 		remaining = append(remaining[:bestIndex], remaining[bestIndex+1:]...)
 	}
 	out := append([]RankedHit{}, selected...)
@@ -294,18 +303,28 @@ func Rank(query string, candidates Candidates, opts RankOptions) []RankedHit {
 		}
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].Score > ranked[j].Score })
+	// Apply the relevance threshold before MMR. Diversification is allowed to
+	// reorder credible candidates, never to promote a candidate that the
+	// relevance gate already rejected.
+	eligible := ranked[:0]
+	for _, hit := range ranked {
+		if hit.Score >= opts.Threshold {
+			eligible = append(eligible, hit)
+		}
+	}
 	if opts.MMR && opts.MMRLambda > 0 && len(opts.QueryVector) > 0 {
 		pool := opts.TopK * 3
 		if pool < 12 {
 			pool = 12
 		}
-		ranked = MaximalMarginalRelevance(ranked, opts.QueryVector, opts.MMRLambda, pool)
-	}
-	out := ranked[:0]
-	for _, hit := range ranked {
-		if hit.Score >= opts.Threshold {
-			out = append(out, hit)
+		if pool < len(eligible) {
+			eligible = eligible[:pool]
 		}
+		eligible = MaximalMarginalRelevance(eligible, opts.QueryVector, opts.MMRLambda, len(eligible))
+	}
+	out := eligible[:0]
+	for _, hit := range eligible {
+		out = append(out, hit)
 		if len(out) == opts.TopK {
 			break
 		}

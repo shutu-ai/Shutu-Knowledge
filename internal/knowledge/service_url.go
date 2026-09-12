@@ -153,7 +153,7 @@ func (s *Service) RefreshStaleURLs(ctx context.Context, now int64) []error {
 			continue
 		}
 		cutoff := now - int64(intervalHours)*3_600_000
-		docs, err := s.store.listDocuments(base.ID)
+		docs, err := s.store.listDocumentMetadata(base.ID)
 		if err != nil {
 			failures = append(failures, err)
 			continue

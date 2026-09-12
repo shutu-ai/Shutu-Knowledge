@@ -3,6 +3,7 @@ package chunk
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestChunkHeadingPathAndFenceProtection(t *testing.T) {
@@ -107,6 +108,36 @@ func TestHeadingStackReplacesDeeperLevels(t *testing.T) {
 	}
 	if c.Heading != "C" {
 		t.Fatalf("c path (level reset expected): %q", c.Heading)
+	}
+}
+
+func TestChunkRecognizesNumberedPDFHeadings(t *testing.T) {
+	doc := "1.1 Requirements\nfirst section text\n1.2 Code Agent\nsecond section text"
+	pieces := Chunk(doc, 64, 0, Options{})
+	var first, second *Piece
+	for i := range pieces {
+		if strings.Contains(pieces[i].Text, "first section") {
+			first = &pieces[i]
+		}
+		if strings.Contains(pieces[i].Text, "second section") {
+			second = &pieces[i]
+		}
+	}
+	if first == nil || second == nil {
+		t.Fatalf("missing numbered sections: %+v", pieces)
+	}
+	if first.Heading != "1.1 Requirements" || second.Heading != "1.2 Code Agent" {
+		t.Fatalf("numbered heading lineage: first=%q second=%q", first.Heading, second.Heading)
+	}
+}
+
+func TestChunkNeverSplitsUTF8(t *testing.T) {
+	text := strings.Repeat("中文检索边界。", 200)
+	pieces := Chunk(text, 64, 8, Options{Smart: boolPtr(false)})
+	for i, piece := range pieces {
+		if !utf8.ValidString(piece.Text) {
+			t.Fatalf("piece %d is invalid UTF-8", i)
+		}
 	}
 }
 

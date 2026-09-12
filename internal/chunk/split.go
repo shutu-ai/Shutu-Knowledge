@@ -3,6 +3,7 @@ package chunk
 import (
 	"math"
 	"strings"
+	"unicode/utf8"
 )
 
 type block struct {
@@ -44,7 +45,11 @@ func splitBlocks(text string) []block {
 			current.WriteString("\n")
 			continue
 		}
-		if level, title, ok := matchHeading(line); ok {
+		level, title, ok := matchHeading(line)
+		if !ok {
+			level, title, ok = matchNumberedHeading(line)
+		}
+		if ok {
 			flush()
 			for len(headings) < level {
 				headings = append(headings, "")
@@ -119,20 +124,65 @@ func matchHeading(line string) (level int, title string, ok bool) {
 	return i, strings.TrimSpace(trimmed[i:]), true
 }
 
+// matchNumberedHeading recognizes the numbered headings emitted by common
+// PDF text extractors (for example "1.2 Code Agent"). PDF text often loses
+// Markdown markers, so without this boundary the whole extracted page can be
+// treated as one paragraph and windows may cross unrelated sections.
+func matchNumberedHeading(line string) (level int, title string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return 0, "", false
+	}
+	i := 0
+	dots := 0
+	for i < len(trimmed) {
+		switch {
+		case trimmed[i] >= '0' && trimmed[i] <= '9':
+			i++
+		case trimmed[i] == '.':
+			dots++
+			i++
+		default:
+			goto numberEnd
+		}
+	}
+numberEnd:
+	if dots == 0 || i == 0 || i >= len(trimmed) || (trimmed[i] != ' ' && trimmed[i] != '\t') {
+		return 0, "", false
+	}
+	// A section number must alternate digit groups and contain no trailing dot.
+	if trimmed[i-1] == '.' || strings.Contains(trimmed[:i], "..") {
+		return 0, "", false
+	}
+	level = dots + 1
+	if level > 6 {
+		level = 6
+	}
+	title = strings.TrimSpace(trimmed[i:])
+	if title == "" {
+		return 0, "", false
+	}
+	return level, strings.TrimSpace(trimmed[:i] + " " + title), true
+}
+
 // windowBlock windows one long block at the best scored break within the
 // final 22% of the budget; scores decay toward the window end (0.7 factor).
 func windowBlock(text string, size, overlap int) []string {
+	runes := []rune(text)
 	var out []string
 	start := 0
-	for start < len(text) {
+	for start < len(runes) {
 		end := start + size
-		if end >= len(text) {
-			out = append(out, strings.TrimSpace(text[start:]))
+		if end >= len(runes) {
+			out = append(out, strings.TrimSpace(string(runes[start:])))
 			break
 		}
-		windowStart := maxInt(start+1, end-maxInt(1, int(math.Round(float64(size)*0.22))))
-		cut := maxInt(findCut(text, end, windowStart), start+1)
-		out = append(out, strings.TrimSpace(text[start:cut]))
+		window := string(runes[start:end])
+		windowStartRunes := maxInt(1, end-start-maxInt(1, int(math.Round(float64(size)*0.22))))
+		windowStartBytes := len(string([]rune(window)[:windowStartRunes]))
+		cutBytes := maxInt(findCut(window, len(window), windowStartBytes), 1)
+		cut := maxInt(utf8.RuneCountInString(window[:cutBytes]), 1)
+		out = append(out, strings.TrimSpace(string(runes[start:start+cut])))
 		next := maxInt(cut-overlap, start+1)
 		if next <= start {
 			break

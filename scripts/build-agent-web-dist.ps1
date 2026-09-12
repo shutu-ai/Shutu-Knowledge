@@ -24,6 +24,7 @@ $config = Join-Path $agentWebRoot "vite.config.ts"
 $navigationBridge = Join-Path $KnowledgeRoot "agent-web\extension-navigation.js"
 $knowledgeLogo = Join-Path $KnowledgeRoot "web\src\new-logo-b.png"
 $output = Join-Path $KnowledgeRoot "agent-web-dist"
+$buildInfo = Join-Path $output "build-info.json"
 
 foreach ($required in @(
     @{ Path = $agentWebRoot; Label = "Agent Web source" },
@@ -35,6 +36,32 @@ foreach ($required in @(
     if (-not (Test-Path -LiteralPath $required.Path)) {
         throw "$($required.Label) not found: $($required.Path)"
     }
+}
+
+# The Agent Web source is a sibling project and is rebuilt into a Knowledge-
+# owned copy. Reuse that copy on ordinary restarts when none of the source or
+# bridge inputs changed; this avoids recreating the startup refusal window for
+# a build that cannot produce different assets.
+$outputIndex = Join-Path $output "index.html"
+$cacheValid = (
+    (Test-Path -LiteralPath $outputIndex -PathType Leaf) -and
+    (Test-Path -LiteralPath $buildInfo -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $output "shutu-knowledge-extension-navigation.js") -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $output "new-logo-b.png") -PathType Leaf)
+)
+if ($cacheValid) {
+    $outputTime = (Get-Item -LiteralPath $buildInfo).LastWriteTimeUtc
+    $inputs = @(
+        (Get-ChildItem -LiteralPath $agentWebRoot -File -Recurse | Where-Object { $_.FullName -notmatch "\\node_modules\\" }),
+        (Get-Item -LiteralPath $navigationBridge),
+        (Get-Item -LiteralPath $knowledgeLogo)
+    )
+    $newestInput = $inputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $cacheValid = $null -eq $newestInput -or $newestInput.LastWriteTimeUtc -le $outputTime
+}
+if ($cacheValid) {
+    Write-Host "Dedicated Agent Web dist unchanged: $output"
+    return
 }
 
 $oldNative = $env:SHUTU_UI_NATIVE

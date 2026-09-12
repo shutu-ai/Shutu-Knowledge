@@ -7,6 +7,7 @@ package chunk
 import (
 	"math"
 	"strings"
+	"unicode/utf8"
 )
 
 // Piece is one chunk: its text plus the markdown heading path introducing it.
@@ -72,20 +73,22 @@ func Chunk(text string, size, overlap int, opts Options) []Piece {
 		}
 	}
 	if len(pieces) == 0 {
-		cut := minInt(safeSize, len(normalized))
-		pieces = []Piece{{Text: normalized[:cut]}}
+		runes := []rune(normalized)
+		cut := minInt(safeSize, len(runes))
+		pieces = []Piece{{Text: string(runes[:cut])}}
 	}
 	return pieces
 }
 
-// CharsPerToken estimates characters per token: CJK-heavy text costs ~1.5
-// chars/token, Latin ~4. Deterministic; mirrors the service and context layers.
+// CharsPerToken estimates Unicode characters per token: CJK-heavy text costs
+// ~1.5 chars/token, Latin ~4. It counts runes rather than bytes because the
+// result is used as a safe string slicing budget.
 func CharsPerToken(text string) float64 {
 	tokens := EstimateTokens(text)
 	if tokens <= 0 {
 		return 1
 	}
-	return float64(len(text)) / float64(tokens)
+	return float64(utf8.RuneCountInString(text)) / float64(tokens)
 }
 
 // EstimateTokens estimates token count: ceil(cjk/1.5 + latin/4).

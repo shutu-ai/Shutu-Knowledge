@@ -205,6 +205,9 @@ func Defaults() Config {
 	c.Chunking.SemanticThreshold = 0.75
 	c.Retrieval.TopK = 4
 	c.Retrieval.Mode = "auto"
+	// MMR remains disabled by default; when explicitly enabled, this is the
+	// relevance weight in the standard MMR formula.
+	c.Retrieval.MMRDiversity = 0.75
 	c.Retrieval.RRFVectorWeight = 1
 	c.Retrieval.SiblingChunks = 1
 	c.Retrieval.ContextTimeoutMS = 4000

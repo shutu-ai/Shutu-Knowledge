@@ -17,6 +17,46 @@ func TestTokenize(t *testing.T) {
 	}
 }
 
+func TestTechnicalTermsKeepLexicalAdvantage(t *testing.T) {
+	text := "Code Agent AI4App AI4Model AI4UI AI4Script AI4Flow AI4Assist DataPipeline DataMold API Fabric"
+	tokens := Tokenize(text)
+	for _, want := range []string{"code", "agent", "ai4app", "ai4flow", "datapipeline", "datamold", "api", "fabric"} {
+		found := false
+		for _, token := range tokens {
+			if token == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("technical term %q missing from tokens %v", want, tokens)
+		}
+	}
+	scorer := BuildBm25([]CorpusDoc{
+		{ID: "technical", Text: text},
+		{ID: "generic", Text: "This document discusses general product behavior."},
+	})
+	if scorer.Score("technical", Tokenize("Code Agent")) <= scorer.Score("generic", Tokenize("Code Agent")) {
+		t.Fatal("BM25 did not give the matching technical document a lexical advantage")
+	}
+}
+
+func TestMMRRelevanceFloorOrdering(t *testing.T) {
+	query := []float32{1, 0}
+	hits := []RankedHit{
+		{ID: "answer", Score: 0.95, Embedding: []float32{1, 0}},
+		{ID: "related", Score: 0.90, Embedding: []float32{0.99, 0.1}},
+		{ID: "noise", Score: 0.20, Embedding: []float32{0, 1}},
+	}
+	out := MaximalMarginalRelevance(hits, query, 0.75, 3)
+	if len(out) != 3 || out[0].ID != "answer" || out[1].ID != "related" {
+		t.Fatalf("MMR reordered a weak candidate ahead of relevant hits: %+v", out)
+	}
+	if out[0].MMRScore <= out[1].MMRScore {
+		t.Fatalf("MMR scores not recorded: %+v", out)
+	}
+}
+
 func TestReciprocalRankFusionWeightsAndDeterminism(t *testing.T) {
 	fused := ReciprocalRankFusion([][]string{{"a", "b"}, {"b", "c"}}, []float64{2, 1})
 	if math.Abs(fused["a"]-(2.0/61.0)) > 1e-9 {

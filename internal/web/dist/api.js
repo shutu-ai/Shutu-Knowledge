@@ -88,11 +88,14 @@ export const api = {
   deleteOllama: (model) => post("/api/ollama/delete", { model }),
 };
 
-export function fileToBase64(file) {
+export function fileToBase64(file, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
     reader.onerror = () => reject(reader.error ?? new Error(`Cannot read ${file.name}`));
+    reader.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded, event.total);
+    };
     reader.readAsDataURL(file);
   });
 }

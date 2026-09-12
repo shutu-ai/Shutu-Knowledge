@@ -63,6 +63,7 @@ func Run(ctx context.Context, app *app.App, in io.Reader, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("start extension web service: %w", err)
 	}
+	app.StartBackgroundRecovery()
 	webBaseURL := "http://" + addr.String()
 	stop := make(chan struct{})
 	go func() {
@@ -82,7 +83,7 @@ func Run(ctx context.Context, app *app.App, in io.Reader, out io.Writer) error {
 			return webBaseURL
 		},
 		Health: func(ctx context.Context) (extension.HealthResult, error) {
-			report := app.Health.Snapshot(ctx)
+			report := app.HealthSnapshot(ctx)
 			detail := ""
 			for i, c := range report.Components {
 				if i > 0 {

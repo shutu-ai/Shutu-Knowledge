@@ -29,9 +29,6 @@ if (-not (Test-Path -LiteralPath $agentWebBuilder -PathType Leaf)) {
 }
 $agentDist = Join-Path $KnowledgeRoot "agent-web-dist"
 & $agentWebBuilder -AgentRoot $AgentRoot -KnowledgeRoot $KnowledgeRoot
-if ($LASTEXITCODE -ne 0) {
-    throw "Knowledge-owned Agent Web build failed"
-}
 if (-not (Test-Path -LiteralPath $agentDist -PathType Container)) {
     throw "Knowledge-owned Agent Web assets not found: $agentDist"
 }
@@ -139,17 +136,42 @@ Set-Content -LiteralPath $tempConfig -Value $config -Encoding UTF8
 $oldPath = $env:Path
 $oldLocation = Get-Location
 $exitCode = 0
+$browserWaiter = $null
 try {
     $env:Path = "$knowledgeBinDir;$KnowledgeRoot;$oldPath"
     Set-Location $AgentRoot
     Write-Host "Agent integration entry: http://127.0.0.1:18099"
     Write-Host "Knowledge manifest: $manifest"
     if ($OpenBrowser) {
-        Start-Process "http://127.0.0.1:18099"
+        # Agent initializes extensions before it binds the native Web listener.
+        # Opening the URL immediately produces a misleading browser-level
+        # ERR_CONNECTION_REFUSED during that normal startup window. Poll from
+        # a short-lived background job and open only after HTTP is ready.
+        $browserWaiter = Start-Job -ArgumentList "http://127.0.0.1:18099/" -ScriptBlock {
+            param($url)
+            $ErrorActionPreference = "SilentlyContinue"
+            for ($attempt = 0; $attempt -lt 240; $attempt++) {
+                try {
+                    $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 1
+                    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                        Start-Process $url
+                        return
+                    }
+                } catch {
+                    # The listener is expected to be absent while Agent starts.
+                }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        Write-Host "Waiting for Agent Web to become ready before opening the browser..."
     }
     & $agentExe --web-only --config $tempConfig
     $exitCode = $LASTEXITCODE
 } finally {
+    if ($null -ne $browserWaiter) {
+        Stop-Job -Job $browserWaiter -ErrorAction SilentlyContinue
+        Remove-Job -Job $browserWaiter -Force -ErrorAction SilentlyContinue
+    }
     $env:Path = $oldPath
     Set-Location $oldLocation
     Remove-Item -LiteralPath $tempConfig -Force -ErrorAction SilentlyContinue

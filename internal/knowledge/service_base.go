@@ -1,11 +1,15 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"strings"
 	"sync"
 	"time"
@@ -175,28 +179,128 @@ func (s *Service) primaryOCR() parser.HelperRunner {
 // applyConfiguredProviders builds providers from config (tests override via
 // SetProviders).
 func (s *Service) applyConfiguredProviders() {
-	if s.global.Embedding.Provider == "local" && s.runtime != nil && s.runtime.Configured(runtime.CapabilityEmbedding) {
-		s.embedder = embedding.NewLocal(embedding.LocalConfig{Runtime: s.runtime, Model: s.global.Embedding.Model})
-	} else {
-		s.embedder = embedding.New(embedding.Config{
-			Provider: s.global.Embedding.Provider,
-			BaseURL:  s.global.Embedding.BaseURL,
-			Model:    s.global.Embedding.Model,
-			APIKey:   s.global.Embedding.APIKey,
-		})
-	}
-	rerankModel := strings.TrimSpace(s.global.Rerank.Model)
-	if s.global.Rerank.Enabled && rerankModel != "" && s.runtime != nil && s.runtime.Configured(runtime.CapabilityRerank) {
-		s.reranker = rerank.NewLocal(s.runtime, strings.TrimPrefix(rerankModel, "local:"))
-	} else if s.global.Rerank.Enabled && s.global.Rerank.Model != "" && s.global.Rerank.BaseURL != "" {
-		s.reranker = rerank.New(rerank.Config{
-			BaseURL: s.global.Rerank.BaseURL,
-			Model:   s.global.Rerank.Model,
-			APIKey:  s.global.Rerank.APIKey,
-			Timeout: time.Duration(s.global.Rerank.TimeoutMS) * time.Millisecond,
-		})
-	}
+	providers := s.providersForConfig(BaseConfig{
+		EmbeddingProvider: s.global.Embedding.Provider,
+		EmbeddingBaseURL:  s.global.Embedding.BaseURL,
+		EmbeddingModel:    s.global.Embedding.Model,
+		EmbeddingAPIKey:   s.global.Embedding.APIKey,
+		RerankEnabled:     boolOverride(s.global.Rerank.Enabled),
+		RerankModel:       s.global.Rerank.Model,
+		RerankBaseURL:     s.global.Rerank.BaseURL,
+		RerankAPIKey:      s.global.Rerank.APIKey,
+	})
+	s.embedder = providers.embedder
+	s.reranker = providers.reranker
 }
+
+type providerSet struct {
+	embedder        embedding.Provider
+	reranker        rerank.Provider
+	embeddingActive bool
+	rerankerActive  bool
+}
+
+func (s *Service) providersForConfig(cfg BaseConfig) providerSet {
+	provider := strings.TrimSpace(cfg.EmbeddingProvider)
+	var embedder embedding.Provider
+	embeddingActive := provider != "" && provider != "none"
+	if provider == "local" {
+		if s.runtime != nil && s.runtime.Configured(runtime.CapabilityEmbedding) {
+			embedder = embedding.NewLocal(embedding.LocalConfig{Runtime: s.runtime, Model: strings.TrimPrefix(strings.TrimSpace(cfg.EmbeddingModel), "local:")})
+		} else {
+			embeddingActive = false
+			embedder = embedding.New(embedding.Config{Provider: "none"})
+		}
+	} else {
+		embedder = embedding.New(embedding.Config{
+			Provider: provider,
+			BaseURL:  cfg.EmbeddingBaseURL,
+			Model:    cfg.EmbeddingModel,
+			APIKey:   cfg.EmbeddingAPIKey,
+		})
+	}
+
+	rerankActive := cfg.RerankEnabled != nil && *cfg.RerankEnabled && strings.TrimSpace(cfg.RerankModel) != ""
+	var reranker rerank.Provider
+	if rerankActive {
+		model := strings.TrimPrefix(strings.TrimSpace(cfg.RerankModel), "local:")
+		if strings.TrimSpace(cfg.RerankBaseURL) == "" && s.runtime != nil && s.runtime.Configured(runtime.CapabilityRerank) {
+			reranker = rerank.NewLocal(s.runtime, model)
+		} else if strings.TrimSpace(cfg.RerankBaseURL) != "" {
+			reranker = rerank.New(rerank.Config{
+				BaseURL: cfg.RerankBaseURL, Model: cfg.RerankModel, APIKey: cfg.RerankAPIKey,
+				Timeout: time.Duration(s.global.Rerank.TimeoutMS) * time.Millisecond,
+			})
+		} else {
+			rerankActive = false
+		}
+	}
+	return providerSet{embedder: embedder, reranker: reranker, embeddingActive: embeddingActive, rerankerActive: rerankActive}
+}
+
+func (s *Service) providersForBase(baseID string) (providerSet, error) {
+	base, err := s.store.getBase(baseID)
+	if err != nil {
+		return providerSet{}, err
+	}
+	cfg := ResolveBaseConfig(s.global, base.Config)
+	// Start with the injected/global providers, then replace only the
+	// dimensions explicitly overridden by this base. Besides avoiding needless
+	// provider construction, this preserves injected providers for callers that
+	// configure only reranking (and vice versa).
+	providers := providerSet{
+		embedder:        s.embedder,
+		reranker:        s.reranker,
+		embeddingActive: s.global.Embedding.Provider != "none" && s.embedder != nil && s.embedder.ModelKey() != "none",
+		rerankerActive:  s.reranker != nil,
+	}
+	configured := s.providersForConfig(cfg)
+	if hasEmbeddingOverride(base.Config) {
+		providers.embedder = configured.embedder
+		providers.embeddingActive = configured.embeddingActive
+	}
+	if hasRerankOverride(base.Config) {
+		providers.reranker = configured.reranker
+		providers.rerankerActive = configured.rerankerActive
+	}
+	return providers, nil
+}
+
+func (s *Service) searchProviders(baseIDs []string) ([]string, map[string]providerSet, bool, error) {
+	ids := baseIDs
+	if ids == nil {
+		bases, err := s.store.listBases()
+		if err != nil {
+			return nil, nil, false, err
+		}
+		ids = make([]string, 0, len(bases))
+		for _, base := range bases {
+			ids = append(ids, base.ID)
+		}
+	}
+	providers := make(map[string]providerSet, len(ids))
+	active := false
+	for _, id := range ids {
+		set, err := s.providersForBase(id)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		providers[id] = set
+		active = active || set.embeddingActive
+	}
+	return ids, providers, active, nil
+}
+
+func hasEmbeddingOverride(cfg BaseConfig) bool {
+	return strings.TrimSpace(cfg.EmbeddingProvider) != "" || strings.TrimSpace(cfg.EmbeddingBaseURL) != "" ||
+		strings.TrimSpace(cfg.EmbeddingModel) != "" || cfg.EmbeddingAPIKey != ""
+}
+
+func hasRerankOverride(cfg BaseConfig) bool {
+	return cfg.RerankEnabled != nil || strings.TrimSpace(cfg.RerankModel) != "" || strings.TrimSpace(cfg.RerankBaseURL) != "" || cfg.RerankAPIKey != ""
+}
+
+func boolOverride(value bool) *bool { return &value }
 
 // SetProviders overrides the model providers (tests, future local helpers).
 func (s *Service) SetProviders(embedder embedding.Provider, reranker rerank.Provider) {
@@ -300,6 +404,123 @@ func (s *Service) ProbeEmbeddingDimensions(ctx context.Context, provider, baseUR
 	return len(vectors[0]), nil
 }
 
+// ProbeRerank verifies that a reranker accepts a small representative request
+// and returns one score per candidate. It never changes the active provider or
+// persists any self-test state.
+func (s *Service) ProbeRerank(ctx context.Context, baseURL, model, apiKey string) ([]float64, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, fmt.Errorf("rerank model is empty")
+	}
+	var provider rerank.Provider
+	if strings.TrimSpace(baseURL) == "" && s.runtime != nil && s.runtime.Configured(runtime.CapabilityRerank) {
+		provider = rerank.NewLocal(s.runtime, strings.TrimPrefix(model, "local:"))
+	} else if strings.TrimSpace(baseURL) != "" {
+		provider = rerank.New(rerank.Config{
+			BaseURL: baseURL, Model: model, APIKey: apiKey,
+			Timeout: 30 * time.Second,
+		})
+	} else {
+		return nil, fmt.Errorf("rerank runtime or base URL is not configured")
+	}
+	scores, err := provider.Rerank(ctx, "knowledge configuration probe", []string{
+		"This candidate discusses knowledge retrieval configuration.",
+		"This candidate discusses an unrelated topic.",
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(scores) != 2 {
+		return nil, fmt.Errorf("rerank returned %d scores for 2 candidates", len(scores))
+	}
+	return scores, nil
+}
+
+// ProbeCaption sends a tiny valid PNG to the configured vision endpoint. The
+// probe is deliberately independent from document ingestion and does not save
+// the returned caption.
+func (s *Service) ProbeCaption(ctx context.Context, provider, baseURL, model, apiKey string) (string, error) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		provider = s.global.Captioning.Provider
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = s.global.Captioning.BaseURL
+	}
+	if strings.TrimSpace(model) == "" {
+		model = s.global.Captioning.Model
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		apiKey = s.global.Captioning.APIKey
+	}
+	if provider == "off" {
+		return "", fmt.Errorf("caption provider is disabled")
+	}
+	// Use a small but meaningful chart instead of a blank 1x1 pixel. A blank
+	// probe makes a healthy vision endpoint look broken because the model can
+	// only truthfully answer that there is nothing to describe.
+	png := sampleCaptionPNG()
+	return caption.CaptionImage(ctx, png, caption.Config{
+		Provider: provider, Model: model, BaseURL: baseURL, APIKey: apiKey,
+		EmbeddingBaseURL: s.global.Embedding.BaseURL,
+	}, caption.Options{})
+}
+
+// sampleCaptionPNG creates a deterministic chart-like image for the caption
+// probe. It must contain visible content so a successful vision call does not
+// look like a failure merely because the probe image is blank.
+func sampleCaptionPNG() []byte {
+	const width, height = 512, 320
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.White)
+		}
+	}
+	setRect := func(x0, y0, x1, y1 int, c color.Color) {
+		for y := y0; y < y1; y++ {
+			for x := x0; x < x1; x++ {
+				img.Set(x, y, c)
+			}
+		}
+	}
+	grid := color.RGBA{R: 220, G: 225, B: 232, A: 255}
+	axis := color.RGBA{R: 70, G: 80, B: 95, A: 255}
+	for _, y := range []int{60, 110, 160, 210, 260} {
+		setRect(55, y, 470, y+2, grid)
+	}
+	setRect(55, 55, 58, 270, axis)
+	setRect(55, 267, 470, 270, axis)
+	for _, bar := range []struct {
+		x0, x1, y int
+		c         color.RGBA
+	}{
+		{90, 145, 185, color.RGBA{R: 65, G: 132, B: 244, A: 255}},
+		{175, 230, 145, color.RGBA{R: 52, G: 168, B: 83, A: 255}},
+		{260, 315, 105, color.RGBA{R: 245, G: 166, B: 35, A: 255}},
+		{345, 400, 75, color.RGBA{R: 217, G: 72, B: 72, A: 255}},
+	} {
+		setRect(bar.x0, bar.y, bar.x1, 267, bar.c)
+	}
+	trend := color.RGBA{R: 31, G: 41, B: 55, A: 255}
+	points := [][2]int{{90, 220}, {145, 205}, {175, 180}, {230, 155}, {260, 135}, {315, 115}, {345, 95}, {400, 70}}
+	for _, point := range points {
+		setRect(point[0]-3, point[1]-3, point[0]+4, point[1]+4, trend)
+	}
+	for i := 0; i < len(points)-1; i++ {
+		a, b := points[i], points[i+1]
+		for x := a[0]; x <= b[0]; x++ {
+			y := a[1] + (b[1]-a[1])*(x-a[0])/(b[0]-a[0])
+			setRect(x, y-1, x+2, y+2, trend)
+		}
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, img); err != nil {
+		return nil
+	}
+	return out.Bytes()
+}
+
 // GlobalConfig returns the effective runtime configuration.
 func (s *Service) GlobalConfig() config.Config { return s.global }
 
@@ -330,6 +551,36 @@ func newID() (string, error) { return jobs.NewID() }
 // runtime resolution and is never used as stored API state.
 func ResolveBaseConfig(global config.Config, cfg BaseConfig) BaseConfig {
 	resolved := cfg
+	if strings.TrimSpace(resolved.EmbeddingProvider) == "" {
+		resolved.EmbeddingProvider = global.Embedding.Provider
+	}
+	if strings.TrimSpace(resolved.EmbeddingBaseURL) == "" && resolved.EmbeddingProvider != "local" {
+		resolved.EmbeddingBaseURL = global.Embedding.BaseURL
+	}
+	if strings.TrimSpace(resolved.EmbeddingModel) == "" {
+		resolved.EmbeddingModel = global.Embedding.Model
+	}
+	if resolved.EmbeddingAPIKey == "" {
+		resolved.EmbeddingAPIKey = global.Embedding.APIKey
+	}
+	if resolved.RerankEnabled == nil {
+		enabled := global.Rerank.Enabled
+		// Older model-page saves had no enabled field. A stored model selection
+		// is an explicit opt-in and must remain active after this field exists.
+		if strings.TrimSpace(resolved.RerankModel) != "" || strings.TrimSpace(resolved.RerankBaseURL) != "" {
+			enabled = true
+		}
+		resolved.RerankEnabled = &enabled
+	}
+	if strings.TrimSpace(resolved.RerankModel) == "" {
+		resolved.RerankModel = global.Rerank.Model
+	}
+	if strings.TrimSpace(resolved.RerankBaseURL) == "" && strings.TrimSpace(cfg.RerankModel) == "" {
+		resolved.RerankBaseURL = global.Rerank.BaseURL
+	}
+	if resolved.RerankAPIKey == "" {
+		resolved.RerankAPIKey = global.Rerank.APIKey
+	}
 	if strings.TrimSpace(resolved.Processor) == "" {
 		resolved.Processor = global.Processing.Provider
 	}
@@ -538,7 +789,19 @@ func (s *Service) Stats(baseID string) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
+	// The global overview only needs document/chunk aggregates. Do not scan
+	// every vector blob just to render the home page: large local indexes can
+	// contain millions of chunks, and the vector diagnostics below are meant
+	// for a specific base where they can be inspected on demand.
+	if baseID == "" {
+		return stats, nil
+	}
 	modelKey := s.EmbeddingModelKey()
+	if providers, providerErr := s.providersForBase(baseID); providerErr == nil && providers.embeddingActive && providers.embedder != nil {
+		modelKey = providers.embedder.ModelKey()
+	} else {
+		modelKey = ""
+	}
 	if modelKey == "" {
 		return stats, nil
 	}

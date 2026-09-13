@@ -191,6 +191,11 @@ type helperProcess struct {
 	mu        sync.Mutex
 }
 
+var (
+	errHelperBusy       = errors.New("runtime helper is busy")
+	errHelperNotStarted = errors.New("runtime helper is not running")
+)
+
 // captureBuffer is safe for a helper process to write while the supervisor
 // is synchronously reading stdout. Keeping stderr bounded preserves the
 // actionable cause of a failure without allowing a noisy child to consume
@@ -458,7 +463,7 @@ func (m *Manager) Status(ctx context.Context) map[string]Health {
 			}
 			continue
 		}
-		health, err := m.Probe(ctx, capability)
+		health, err := m.probeStatus(ctx, capability)
 		if err != nil {
 			health.Capability = capability
 			health.Ready = false
@@ -482,6 +487,56 @@ func (m *Manager) Status(ctx context.Context) map[string]Health {
 		status[capability] = health
 	}
 	return status
+}
+
+// probeStatus is the non-blocking health path used by status pages and
+// readiness summaries. A long embedding or reranking call must not make a
+// Web UI request wait on the helper's serialized protocol lock.
+func (m *Manager) probeStatus(ctx context.Context, capability string) (Health, error) {
+	command := m.commandFor(capability)
+	health := Health{Capability: capability, Path: command}
+	m.mu.Lock()
+	helper := m.processes[command]
+	m.mu.Unlock()
+	if helper == nil {
+		health.Status = "not_installed"
+		health.Lifecycle = "NOT_INSTALLED"
+		return health, &Error{Code: "runtime_not_started", Message: fmt.Sprintf("%s runtime is not started", capability)}
+	}
+
+	var result Health
+	acquired, err := helper.tryCall(ctx, "health", capability, healthParams{Capability: capability}, &result, m.startupTimeout, m.requestTimeout)
+	if !acquired {
+		health.Status = "loading"
+		health.Lifecycle = "LOADING"
+		return health, err
+	}
+	if err != nil {
+		health.Status = "failed"
+		health.Lifecycle = "FAILED"
+		health.LastError = err.Error()
+		return health, err
+	}
+	result.Capability = capability
+	if result.Path == "" {
+		result.Path = command
+	}
+	if result.Status == "" {
+		switch {
+		case result.Ready:
+			result.Status = "ready"
+		case result.Lifecycle == "FAILED":
+			result.Status = "failed"
+		case result.Lifecycle == "LOADING":
+			result.Status = "loading"
+		default:
+			result.Status = "not_installed"
+		}
+	}
+	if !result.Ready {
+		return result, &Error{Code: "runtime_not_ready", Message: fmt.Sprintf("%s runtime is not ready", capability)}
+	}
+	return result, nil
 }
 
 func remediation(capability string) string {
@@ -604,7 +659,26 @@ func (m *Manager) commandFor(capability string) string {
 func (p *helperProcess) call(parent context.Context, method, capability string, params, out any, progress func(ModelProgress), startupTimeout, requestTimeout time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.callLocked(parent, method, capability, params, out, progress, startupTimeout, requestTimeout)
+}
 
+// tryCall is used only by status probes. It never waits for an active helper
+// request and never starts a helper just to answer a health summary.
+func (p *helperProcess) tryCall(parent context.Context, method, capability string, params, out any, startupTimeout, requestTimeout time.Duration) (bool, error) {
+	if !p.mu.TryLock() {
+		return false, errHelperBusy
+	}
+	defer p.mu.Unlock()
+	if err := parent.Err(); err != nil {
+		return true, err
+	}
+	if !p.runningLocked() {
+		return true, errHelperNotStarted
+	}
+	return true, p.callLocked(parent, method, capability, params, out, nil, startupTimeout, requestTimeout)
+}
+
+func (p *helperProcess) callLocked(parent context.Context, method, capability string, params, out any, progress func(ModelProgress), startupTimeout, requestTimeout time.Duration) error {
 	if err := parent.Err(); err != nil {
 		return err
 	}

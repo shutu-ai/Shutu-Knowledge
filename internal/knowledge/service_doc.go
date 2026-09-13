@@ -7,7 +7,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/caption"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
+	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
@@ -75,13 +78,28 @@ func (s *Service) chunkOptions(cfg BaseConfig) ChunkOptions {
 
 // ListDocuments returns summaries for one base.
 func (s *Service) ListDocuments(baseID string) ([]DocumentSummary, error) {
-	docs, err := s.store.listDocumentMetadata(baseID)
+	return s.ListDocumentsContext(context.Background(), baseID)
+}
+
+// ListDocumentsContext is the cancellable API path used by Web requests.
+// Large databases must not leave an abandoned reader occupying the pool after
+// the browser navigates away or its request times out.
+func (s *Service) ListDocumentsContext(ctx context.Context, baseID string) ([]DocumentSummary, error) {
+	docs, err := s.store.listDocumentMetadataContext(ctx, baseID)
 	if err != nil {
 		return nil, err
 	}
+	modelKey := ""
+	if providers, providerErr := s.providersForBase(baseID); providerErr != nil {
+		return nil, providerErr
+	} else if providers.embeddingActive && providers.embedder != nil {
+		modelKey = providers.embedder.ModelKey()
+	}
 	out := make([]DocumentSummary, 0, len(docs))
 	for _, doc := range docs {
-		out = append(out, summarize(doc))
+		summary := summarize(doc)
+		summary.EmbeddingReady = modelKey != "" && doc.EmbeddingReady && doc.EmbeddingModel == modelKey
+		out = append(out, summary)
 	}
 	return out, nil
 }
@@ -555,6 +573,15 @@ func (s *Service) ReindexDocument(ctx context.Context, id string) (Document, err
 				return Document{}, err
 			}
 		}
+		// Older directory-import failures could lose RawFilePath while the
+		// source path remained tracked. Fall back to that live source so those
+		// documents can be recovered without another directory rescan.
+		if len(data) == 0 && doc.SourcePath != "" {
+			data, err = readBoundedSourceFile(doc.SourcePath)
+			if err != nil {
+				return Document{}, err
+			}
+		}
 		if len(data) == 0 {
 			return Document{}, fmt.Errorf("raw source is missing; reindex requires the stored source")
 		}
@@ -565,6 +592,22 @@ func (s *Service) ReindexDocument(ctx context.Context, id string) (Document, err
 		return Document{}, err
 	}
 	return doc, nil
+}
+
+func readBoundedSourceFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read live source: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, MaxIngestFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read live source: %w", err)
+	}
+	if len(data) > MaxIngestFileBytes {
+		return nil, fmt.Errorf("file exceeds %d MB limit", MaxIngestFileBytes>>20)
+	}
+	return data, nil
 }
 
 // ReindexBase reindexes every document of a base as one background job.
@@ -629,6 +672,11 @@ func (s *Service) newDocument(baseID, title, sourceType string) Document {
 // are persisted to the raw store first ("import means copy"); a failure in
 // later steps leaves the raw copy for recovery.
 func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fileBytes []byte) error {
+	cfg = ResolveBaseConfig(s.global, cfg)
+	providers, err := s.providersForBase(doc.BaseID)
+	if err != nil {
+		return err
+	}
 	if s.ingestSlots != nil {
 		select {
 		case s.ingestSlots <- struct{}{}:
@@ -650,6 +698,8 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.Incomplete = true
 	doc.ErrorCode = ""
 	doc.ErrorMessage = ""
+	doc.EmbeddingReady = false
+	doc.EmbeddingModel = ""
 	doc.UpdatedAt = now()
 	if err := s.store.putDocument(*doc); err != nil {
 		return err
@@ -689,7 +739,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 
 	opts := s.chunkOptions(cfg)
 	embeddingStarted := Now()
-	pieces, inlineVectors := s.buildPieces(ctx, text, doc, opts)
+	pieces, inlineVectors := s.buildPieces(ctx, text, doc, opts, providers.embedder)
 	s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += durationMS(embeddingStarted) })
 
 	// Build chunks with retrieval context (title + heading path) and the
@@ -715,7 +765,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		if inlineVectors != nil {
 			if vector, ok := inlineVectors[i]; ok {
 				c.EmbeddingVec = vector
-				c.EmbeddingModel = s.EmbeddingModelKey()
+				c.EmbeddingModel = providers.embedder.ModelKey()
 			}
 		}
 		rows = append(rows, c)
@@ -733,7 +783,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	// lexical-only instead of dropping the imported text. Degradation is a
 	// successful import with a recorded error code (reference behavior);
 	// only a cancellation leaves the document resumable.
-	if s.global.Embedding.Provider != "none" {
+	if providers.embeddingActive {
 		doc.Status = StatusProcessing
 		doc.Phase = PhaseEmbedding
 		doc.Progress = 0
@@ -742,7 +792,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			return err
 		}
 		embeddingStarted = Now()
-		code, cause := s.embedChunks(ctx, doc, rows)
+		code, cause := s.embedChunks(ctx, doc, rows, providers.embedder)
 		embeddingElapsed := durationMS(embeddingStarted)
 		s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += embeddingElapsed })
 		if code != "" {
@@ -768,6 +818,10 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	}
 
 	doc.ChunkCount = len(rows)
+	if providers.embeddingActive && providers.embedder != nil {
+		doc.EmbeddingReady = true
+		doc.EmbeddingModel = providers.embedder.ModelKey()
+	}
 	doc.Status = StatusReady
 	doc.Phase = ""
 	doc.Progress = 100
@@ -1034,8 +1088,12 @@ func (s *Service) resolveOCRMode(cfg BaseConfig) string {
 // buildPieces chunks the text; the semantic path merges adjacent embedded
 // segments and returns per-piece mean vectors. Any provider failure falls
 // back to the structural chunker (semantic chunking must never block import).
-func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, opts ChunkOptions) ([]chunk.Piece, map[int][]float64) {
-	if !opts.Semantic || s.global.Embedding.Provider == "none" {
+func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, opts ChunkOptions, providers ...embedding.Provider) ([]chunk.Piece, map[int][]float64) {
+	embedder := s.embedder
+	if len(providers) > 0 && providers[0] != nil {
+		embedder = providers[0]
+	}
+	if !opts.Semantic || embedder == nil || embedder.ModelKey() == "none" {
 		return s.structuralPieces(text, opts), nil
 	}
 	segments := chunk.SemanticSegments(text, opts.Separator)
@@ -1050,7 +1108,7 @@ func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, o
 		}
 		texts = append(texts, strings.TrimSpace(contextText+" "+segment.Text))
 	}
-	vectors, err := s.embedder.Embed(ctx, texts)
+	vectors, err := embedder.Embed(ctx, texts)
 	if err != nil || len(vectors) != len(segments) {
 		return s.structuralPieces(text, opts), nil
 	}
@@ -1074,8 +1132,15 @@ func (s *Service) structuralPieces(text string, opts ChunkOptions) []chunk.Piece
 // embedChunks embeds the stored chunks in batches, reusing stored vectors by
 // embedding-text hash, and persists each landed batch (crash-safe). Returns
 // a stable error code when the document degrades to lexical-only.
-func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk) (string, error) {
-	modelKey := s.embedder.ModelKey()
+func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, providers ...embedding.Provider) (string, error) {
+	embedder := s.embedder
+	if len(providers) > 0 && providers[0] != nil {
+		embedder = providers[0]
+	}
+	if embedder == nil || embedder.ModelKey() == "none" {
+		return "", nil
+	}
+	modelKey := embedder.ModelKey()
 	hashes := make([]string, 0, len(rows))
 	textByHash := map[string]string{}
 	for _, row := range rows {
@@ -1116,7 +1181,7 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk) 
 		for _, hash := range batch {
 			texts = append(texts, textByHash[hash])
 		}
-		vectors, err := s.embedder.Embed(ctx, texts)
+		vectors, err := embedder.Embed(ctx, texts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ErrInterrupted, ctx.Err()

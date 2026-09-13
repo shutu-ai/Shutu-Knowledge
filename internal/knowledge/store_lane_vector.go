@@ -8,20 +8,27 @@ import (
 	"sort"
 )
 
-// VectorSearch brute-force scans scoped embeddings and ranks by cosine
-// similarity (normalized vectors, so dot == cosine). Vectors with a
-// mismatched dimension are skipped, never mixed.
-func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, limit int) ([]LaneHit, error) {
+// VectorSearch brute-force scans scoped embeddings for one model space and
+// ranks by cosine similarity (normalized vectors, so dot == cosine). Vectors
+// with a mismatched dimension are skipped, never mixed.
+func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, limit int, modelKey string) ([]LaneHit, error) {
 	if len(queryVector) == 0 {
 		return nil, nil
 	}
-	scope, args, err := scopeSQL(baseIDs, docIDs)
+	scope, scopeArgs, err := scopeSQL(baseIDs, docIDs)
 	if err != nil {
 		return nil, err
 	}
 	querySQL := laneSelect + `
-		FROM chunks c WHERE c.embedding IS NOT NULL` + scope
-	rows, err := s.db.Query(querySQL, args...)
+		FROM chunks c WHERE c.embedding IS NOT NULL`
+	queryArgs := []any{}
+	if modelKey != "" {
+		querySQL += ` AND c.embedding_model = ?`
+		queryArgs = append(queryArgs, modelKey)
+	}
+	querySQL += scope
+	queryArgs = append(queryArgs, scopeArgs...)
+	rows, err := s.db.Query(querySQL, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("vector lane: %w", err)
 	}

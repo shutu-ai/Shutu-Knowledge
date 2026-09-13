@@ -62,11 +62,12 @@ type persistedProgress struct {
 }
 
 type task struct {
-	job     Job
-	ctx     context.Context
-	run     func(ctx context.Context, report func(ProgressUpdate)) error
-	cancel  context.CancelFunc
-	ioHeavy bool
+	job       Job
+	ctx       context.Context
+	run       func(ctx context.Context, report func(ProgressUpdate)) error
+	cancel    context.CancelFunc
+	ioHeavy   bool
+	persisted chan error
 }
 
 // Manager owns the worker pool and the job registry.
@@ -121,6 +122,15 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // Stop waits for in-flight tasks (best effort) and drains workers.
 func (m *Manager) Stop() {
+	// A task context is independent from the process context so that a request
+	// cancellation cannot accidentally cancel accepted work. Shutdown must
+	// therefore cancel all accepted tasks before waiting for workers; otherwise
+	// a parser or model call can keep the process alive indefinitely.
+	m.mu.Lock()
+	for _, t := range m.tasks {
+		t.cancel()
+	}
+	m.mu.Unlock()
 	close(m.queue)
 	close(m.ioQueue)
 	m.wg.Wait()
@@ -156,11 +166,7 @@ func (m *Manager) submitWithProgress(kind, baseID string, total int, ioHeavy boo
 		job.Phase = "queued"
 	}
 	taskCtx, cancel := context.WithCancel(context.Background())
-	t := &task{job: job, ctx: taskCtx, run: run, cancel: cancel, ioHeavy: ioHeavy}
-	if err := m.persist(job); err != nil {
-		cancel()
-		return "", err
-	}
+	t := &task{job: job, ctx: taskCtx, run: run, cancel: cancel, ioHeavy: ioHeavy, persisted: make(chan error, 1)}
 	m.mu.Lock()
 	m.tasks[id] = t
 	m.mu.Unlock()
@@ -178,6 +184,15 @@ func (m *Manager) submitWithProgress(kind, baseID string, total int, ioHeavy boo
 		m.mu.Unlock()
 		return "", fmt.Errorf("job queue is full")
 	}
+	// Do not make an HTTP caller wait for SQLite's single writer connection.
+	// The in-memory task is visible to Status immediately; the worker waits for
+	// the durable pending row before it starts work, preserving ordering while
+	// allowing a second task to be admitted behind a long write transaction.
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		t.persisted <- m.persist(job)
+	}()
 	return id, nil
 }
 
@@ -198,6 +213,20 @@ func (m *Manager) worker(ctx context.Context, queue <-chan *task) {
 }
 
 func (m *Manager) runTask(t *task) {
+	select {
+	case err := <-t.persisted:
+		if err != nil {
+			m.finishTask(t, fmt.Errorf("persist job: %w", err))
+			return
+		}
+	case <-t.ctx.Done():
+		if err := <-t.persisted; err != nil {
+			m.finishTask(t, fmt.Errorf("persist job: %w", err))
+			return
+		}
+		m.finishTask(t, t.ctx.Err())
+		return
+	}
 	if err := t.ctx.Err(); err != nil {
 		m.finishTask(t, err)
 		return

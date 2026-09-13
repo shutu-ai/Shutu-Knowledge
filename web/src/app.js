@@ -13,12 +13,13 @@ const navigation = [
 
 const state = {
   route: "overview", bases: [], selectedBaseId: localStorage.getItem("knowledge-base") ?? "", docFolder: "",
-  modelJobs: {}, documentJobs: {}, chunkExpansionAll: false, expandedChunks: new Set(),
+  modelJobs: {}, documentJobs: {}, chunkExpansionAll: false, expandedChunks: new Set(), docExpandedFolders: new Set(),
 };
 const screen = document.getElementById("screen");
 const toastNode = document.getElementById("toast");
 let toastTimer;
 let documentRefreshPromise;
+let routeGeneration = 0;
 const MAX_IMPORT_FILES = 20;
 const SUPPORTED_IMPORT_EXTENSIONS = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.epub";
 
@@ -144,6 +145,8 @@ function documentJobPhaseText(job) {
   if (job.phase === "parsing") return localized("Parsing file");
   if (job.phase === "embedding") return localized("Embedding file");
   if (job.phase === "reindexing") return localized("Reindexing file");
+  if (job.phase === "deleting") return localized("Deleting document");
+  if (job.kind === "delete_directory") return localized("Deleting directory");
   if (job.kind === "rescan_directory") return localized("Rescanning directory");
   if (job.kind === "import_directory") return localized("Importing directory");
   if (job.kind === "reindex_documents") return localized("Reindexing files");
@@ -325,23 +328,53 @@ function table(headers, rows) {
   ));
 }
 
-async function render(initialQuery = "") {
+function isCurrentRoute(generation) {
+  return generation === routeGeneration;
+}
+
+function showRouteLoading() {
+  setHeader(localized("Loading"));
+  showContentLoading();
+}
+
+function showContentLoading() {
+  screen.replaceChildren(h("section", { class: "section loading-state", "aria-live": "polite" }, [
+    h("div", { class: "loading-state-mark", "aria-hidden": "true" }, "···"),
+    h("h2", {}, localized("Loading")),
+    h("p", { class: "muted" }, localized("Loading page data")),
+  ]));
+}
+
+function showRouteError(error) {
+  screen.replaceChildren(h("section", { class: "section", role: "alert" }, [
+    h("h2", {}, localized("Unable to load page")),
+    h("p", { class: "muted" }, error?.message || localized("Request failed")),
+  ]));
+}
+
+async function render(initialQuery = "", generation = routeGeneration) {
   const status = await api.status();
+  if (!isCurrentRoute(generation)) return;
   const healthChip = chip(status.ready ? "Ready" : "Degraded");
   const searchButton = state.route !== "recall"
     ? h("a", { class: "button", href: "#/recall" }, [icon(icons.search), "Recall Test"]) : null;
   setHeader(`${localized(status.status)} · v${status.version}`, [healthChip, searchButton].filter(Boolean));
-  if (state.route === "models") {
-    await renderModels();
-    return;
+  showContentLoading();
+  try {
+    if (state.route === "models") {
+      await renderModels();
+      return;
+    }
+    if (state.route === "overview") await renderOverview();
+    if (state.route === "bases") await renderBases();
+    if (state.route === "documents") await renderDocuments(generation);
+    if (state.route === "import") await renderImport();
+    if (state.route === "recall") await renderRecall(initialQuery);
+    if (state.route === "settings") await renderSettings();
+  } catch (error) {
+    if (isCurrentRoute(generation)) showRouteError(error);
+    throw error;
   }
-  screen.replaceChildren();
-  if (state.route === "overview") await renderOverview();
-  if (state.route === "bases") await renderBases();
-  if (state.route === "documents") await renderDocuments();
-  if (state.route === "import") await renderImport();
-  if (state.route === "recall") await renderRecall(initialQuery);
-  if (state.route === "settings") await renderSettings();
 }
 
 async function renderOverview() {
@@ -453,7 +486,7 @@ async function renderBases() {
   ]));
 }
 
-async function renderDocuments() {
+async function renderDocuments(generation = routeGeneration) {
   if (!state.selectedBaseId || !state.bases.some((base) => base.id === state.selectedBaseId)) {
     screen.append(h("section", { class: "section" }, [
       h("div", { class: "section-head" }, [
@@ -469,14 +502,44 @@ async function renderDocuments() {
     ]));
     return;
   }
+  screen.append(h("section", { class: "section loading-state", "aria-live": "polite" }, [
+    h("div", { class: "section-head" }, [h("h2", {}, localized("Documents")), chip("loading")]),
+    h("p", { class: "muted" }, localized("Loading document list")),
+  ]));
   const documents = await api.documents(state.selectedBaseId);
+  if (!isCurrentRoute(generation)) return;
+  screen.replaceChildren();
   if (state.docFolder && !documents.some((doc) => doc.id === state.docFolder)) state.docFolder = "";
   const current = documents.find((doc) => doc.id === state.docFolder);
-  const childFiles = documents.filter((doc) => (doc.parentDirectoryId ?? "") === state.docFolder && doc.sourceType !== "directory");
-  const childFolders = documents.filter((doc) => (doc.parentDirectoryId ?? "") === state.docFolder && doc.sourceType === "directory");
-  const topLevelFiles = documents.filter((doc) => !doc.parentDirectoryId && doc.sourceType !== "directory" && doc.sourceType !== "url");
-  const rows = current ? [...childFolders, ...childFiles] : [...childFolders, ...topLevelFiles];
-
+  const childrenByParent = new Map();
+  documents.forEach((doc) => {
+    const parentID = doc.parentDirectoryId ?? "";
+    if (!childrenByParent.has(parentID)) childrenByParent.set(parentID, []);
+    childrenByParent.get(parentID).push(doc);
+  });
+  const directoryChildren = (folderID) => childrenByParent.get(folderID) ?? [];
+  const sortRows = (items) => [...items].sort((left, right) => {
+    if (left.sourceType === right.sourceType) return 0;
+    return left.sourceType === "directory" ? -1 : 1;
+  });
+  const rows = sortRows((childrenByParent.get(state.docFolder) ?? []).filter((doc) => current || doc.sourceType !== "url"));
+  const flattenRows = (items, depth = 0, ancestry = new Set()) => items.flatMap((doc) => {
+    const row = { doc, depth };
+    if (doc.sourceType !== "directory" || !state.docExpandedFolders.has(doc.id) || ancestry.has(doc.id)) return [row];
+    const nextAncestry = new Set(ancestry).add(doc.id);
+    return [row, ...flattenRows(sortRows(directoryChildren(doc.id)), depth + 1, nextAncestry)];
+  });
+  const visibleRows = flattenRows(rows);
+  const openFolder = (folderID) => {
+    state.docFolder = folderID;
+    state.docPreview = null;
+    let item = documents.find((doc) => doc.id === folderID);
+    while (item) {
+      state.docExpandedFolders.add(item.id);
+      item = documents.find((doc) => doc.id === item.parentDirectoryId);
+    }
+    render();
+  };
   const breadcrumbs = [h("button", { class: "button small", onclick: () => { state.docFolder = ""; state.docPreview = null; render(); } }, "Root")];
   if (current) {
     const trail = [];
@@ -490,17 +553,39 @@ async function renderDocuments() {
 
   const statusText = (doc) => h("div", {}, [
     chip(doc.status),
+    doc.sourceType !== "directory" ? chip(doc.embeddingReady
+      ? "Embedding ready"
+      : (doc.status === "processing" && doc.phase === "embedding" ? "Embedding pending" : "Lexical only")) : null,
     h("div", { class: "muted mono" }, `${doc.sourceType === "directory" && doc.status === "processing" ? localized("Scanning directory") : (doc.phase || doc.status)}${doc.status === "processing" ? ` · ${doc.progress}%` : ""}`),
   ]);
-  const documentTitle = (doc) => h("div", { class: "truncate" }, [
-    h("strong", {}, doc.title),
-    h("div", { class: "muted" }, doc.sourcePath || doc.fileName || doc.url || `${number(doc.charCount)} chars`),
-    doc.errorMessage ? h("div", { class: "muted" }, `${doc.errorCode || "error"}: ${doc.errorMessage}`) : null,
-  ]);
+  const documentTitle = (doc, depth) => {
+    const children = directoryChildren(doc.id);
+    const expanded = state.docExpandedFolders.has(doc.id);
+    return h("div", { class: "document-tree-title", style: `--tree-depth:${depth}` }, [
+      doc.sourceType === "directory" && children.length ? h("button", {
+        class: "document-tree-toggle",
+        type: "button",
+        "aria-label": localized(expanded ? "Collapse folder" : "Expand folder"),
+        "aria-expanded": String(expanded),
+        onclick: (event) => {
+          event.stopPropagation();
+          if (expanded) state.docExpandedFolders.delete(doc.id);
+          else state.docExpandedFolders.add(doc.id);
+          render();
+        },
+      }, expanded ? "⌄" : "›") : h("span", { class: "document-tree-toggle", "aria-hidden": "true" }),
+      h("span", { class: "document-tree-glyph", "aria-hidden": "true" }, doc.sourceType === "directory" ? "▰" : ""),
+      h("div", { class: "truncate" }, [
+        h("strong", {}, doc.title),
+        h("div", { class: "muted" }, doc.sourcePath || doc.fileName || doc.url || `${number(doc.charCount)} chars`),
+        doc.errorMessage ? h("div", { class: "muted" }, `${doc.errorCode || "error"}: ${doc.errorMessage}`) : null,
+      ]),
+    ]);
+  };
   const previewPanel = h("section", { class: "section", "aria-live": "polite" });
   const setPreview = (doc, mode) => { state.docPreview = { id: doc.id, mode }; renderPreview(previewPanel, doc, mode); };
   const documentActions = (doc) => h("div", { class: "toolbar" }, [
-    doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => { state.docFolder = doc.id; state.docPreview = null; render(); } }, "Open") : null,
+    doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => openFolder(doc.id) }, "Open") : null,
     doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => guard(async () => {
       const job = await api.rescanDirectory(doc.id);
       await trackDocumentJob(job.jobId, `rescan ${doc.title}`, { kind: "rescan_directory", documentId: doc.id });
@@ -522,8 +607,13 @@ async function renderDocuments() {
     h("button", { class: "button small danger", onclick: () => guard(async () => {
       const message = doc.sourceType === "directory" ? `Delete folder "${doc.title}" and all nested documents?` : `Delete "${doc.title}"?`;
       if (!window.confirm(message)) return;
-      if (doc.sourceType === "directory") await api.deleteDirectory(doc.id); else await api.deleteDocument(doc.id);
-      await render();
+      if (doc.sourceType === "directory") {
+        const job = await api.deleteDirectoryJob(doc.id);
+        await trackDocumentJob(job.jobId, `delete ${doc.title}`, { kind: "delete_directory", documentId: doc.id });
+        return;
+      }
+      const job = await api.deleteDocumentJob(doc.id);
+      await trackDocumentJob(job.jobId, `delete ${doc.title}`, { kind: "delete_document", documentId: doc.id });
     }, "Document deleted") }, "Delete"),
   ]);
 
@@ -543,9 +633,9 @@ async function renderDocuments() {
         const result = await api.deleteDocuments(ids); showToast(`${result.deleted} documents deleted`); await render();
       }) }, "Delete selected"),
     ]),
-    h("section", { class: "section" }, table(["", "Title", "Status", "Source", "Chunks", "Updated", "Actions"], rows.map((doc) => h("tr", {},
+    h("section", { class: "section" }, table(["", "Title", "Status", "Source", "Chunks", "Updated", "Actions"], visibleRows.map(({ doc, depth }) => h("tr", {},
       h("td", {}, doc.sourceType !== "directory" ? h("input", { name: "select", type: "checkbox", value: doc.id }) : null),
-      h("td", { class: "truncate" }, documentTitle(doc)),
+      h("td", {}, documentTitle(doc, depth)),
       h("td", {}, statusText(doc)),
       h("td", {}, doc.sourceType),
       h("td", {}, number(doc.chunkCount)),
@@ -1111,7 +1201,7 @@ function urlField(slot, name, current, local, kind) {
 async function renderModels() {
   const base = selectedBase();
   const config = base?.config ?? {};
-  const localModels = await api.localModels();
+  const localModels = await api.localModels(state.selectedBaseId);
   const localEmbeddingModels = installedLocalModelChoices(localModels.models, "embedding");
   const localRerankModels = installedLocalModelChoices(localModels.models, "rerank");
   const ocrModel = await api.ocrModel();
@@ -1140,6 +1230,51 @@ async function renderModels() {
   const embeddingURLSlot = h("div", { class: "model-config-slot" });
   const rerankModelSlot = h("div", { class: "model-config-slot" });
   const rerankURLSlot = h("div", { class: "model-config-slot" });
+  const embeddingTestStatus = h("span", { class: "model-test-status muted", "aria-live": "polite" });
+  const rerankTestStatus = h("span", { class: "model-test-status muted", "aria-live": "polite" });
+  const embeddingTestButton = h("button", { class: "button small", type: "button", onclick: async (event) => {
+    const button = event.currentTarget;
+    const form = button.closest("form");
+    button.disabled = true;
+    embeddingTestStatus.className = "model-test-status muted testing";
+    embeddingTestStatus.textContent = localized("Testing configuration");
+    try {
+      const result = await api.probeEmbedding({
+        provider: form.provider.value,
+        baseUrl: form.elements.embeddingBaseUrl?.value ?? "",
+        model: form.elements.embeddingModel?.value ?? "",
+        apiKey: form.elements.embeddingApiKey?.value ?? "",
+      });
+      embeddingTestStatus.className = "model-test-status success";
+      embeddingTestStatus.textContent = `${localized("Test passed")} · ${result.dimensions} ${localized("dimensions")}`;
+    } catch (error) {
+      embeddingTestStatus.className = "model-test-status error";
+      embeddingTestStatus.textContent = `${localized("Test failed")}: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  } }, localized("Test configuration"));
+  const rerankTestButton = h("button", { class: "button small", type: "button", onclick: async (event) => {
+    const button = event.currentTarget;
+    const form = button.closest("form");
+    button.disabled = true;
+    rerankTestStatus.className = "model-test-status muted testing";
+    rerankTestStatus.textContent = localized("Testing configuration");
+    try {
+      const result = await api.probeRerank({
+        baseUrl: form.elements.rerankBaseUrl?.value ?? "",
+        model: form.elements.rerankModel?.value ?? "",
+        apiKey: form.elements.rerankApiKey?.value ?? "",
+      });
+      rerankTestStatus.className = "model-test-status success";
+      rerankTestStatus.textContent = `${localized("Test passed")} · ${result.scores.length} ${localized("scores")}`;
+    } catch (error) {
+      rerankTestStatus.className = "model-test-status error";
+      rerankTestStatus.textContent = `${localized("Test failed")}: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  } }, localized("Test configuration"));
   const providerForm = h("form", { class: "panel panel-body model-config-form", onsubmit: (event) => { event.preventDefault(); guard(async () => {
     const form = event.target;
     const embeddingIsLocal = form.provider.value === "local";
@@ -1149,6 +1284,7 @@ async function renderModels() {
       embeddingProvider: form.provider.value,
       embeddingBaseUrl: embeddingIsLocal ? "" : (form.elements.embeddingBaseUrl?.value ?? ""),
       embeddingModel: embeddingIsLocal ? normalizeLocalModelId(form.elements.embeddingModel?.value) : (form.elements.embeddingModel?.value ?? ""),
+      rerankEnabled: true,
       rerankModel: rerankIsLocal ? normalizeLocalModelId(form.elements.rerankModel?.value) : (form.elements.rerankModel?.value ?? ""),
       rerankBaseUrl: rerankIsLocal ? "" : (form.elements.rerankBaseUrl?.value ?? ""),
     } });
@@ -1160,12 +1296,14 @@ async function renderModels() {
         h("label", { class: "field" }, [h("span", { class: "field-label" }, localized("Provider")), embeddingProvider]),
         embeddingModelSlot,
         embeddingURLSlot,
+        h("div", { class: "model-test-row" }, [embeddingTestButton, embeddingTestStatus]),
       ]),
       h("section", { class: "model-provider-card" }, [
         h("div", { class: "model-provider-card-head" }, [h("div", { class: "eyebrow" }, "RERANK"), h("h3", {}, localized("Rerank model"))]),
         h("label", { class: "field" }, [h("span", { class: "field-label" }, localized("Source")), rerankMode]),
         rerankModelSlot,
         rerankURLSlot,
+        h("div", { class: "model-test-row" }, [rerankTestButton, rerankTestStatus]),
       ]),
     ]),
     h("div", { class: "model-config-actions" }, [
@@ -1367,8 +1505,39 @@ async function trackJob(id, label, metadata = {}) {
 
 async function renderSettings() {
   const numberField = (name, label, value) => h("label", { class: "field" }, label, h("input", { name, type: "number", value: value ?? "" }));
+  const settingsGroup = (title, description, fields) => h("section", { class: "settings-group" }, [
+    h("div", { class: "settings-group-head" }, [
+      h("div", {}, h("h3", {}, title), h("p", { class: "settings-group-description" }, description)),
+    ]),
+    h("div", { class: "settings-group-body form-grid" }, fields),
+  ]);
   const settings = await api.config();
   const config = settings.config;
+  const suggestions = await api.suggestions();
+  const captionTestStatus = h("span", { class: "model-test-status muted", "aria-live": "polite" });
+  const captionTestButton = h("button", { class: "button small", type: "button", onclick: async (event) => {
+    const button = event.currentTarget;
+    const form = button.closest("form");
+    button.disabled = true;
+    captionTestStatus.className = "model-test-status muted testing";
+    captionTestStatus.textContent = localized("Testing configuration");
+    try {
+      const result = await api.probeCaption({
+        provider: form.elements.captionProvider.value,
+        baseUrl: form.elements.captionBaseUrl.value,
+        model: form.elements.captionModel.value,
+        apiKey: form.elements.captionApiKey.value,
+      });
+      captionTestStatus.className = "model-test-status success";
+      const preview = String(result.caption || "").replace(/\s+/g, " ").trim();
+      captionTestStatus.textContent = `${localized("Test passed")}${preview ? ` · ${preview.slice(0, 90)}` : ""}`;
+    } catch (error) {
+      captionTestStatus.className = "model-test-status error";
+      captionTestStatus.textContent = `${localized("Test failed")}: ${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  } }, localized("Test configuration"));
   const globalForm = h("form", { class: "section panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
     const form = event.target;
     const next = {
@@ -1397,8 +1566,12 @@ async function renderSettings() {
     if (form.clearCaptionApiKey.checked) body.clearCaptionApiKey = true;
     await api.updateConfig(body); await render();
   }, "Global settings saved"); } }, [
-    h("h2", {}, "Global settings"),
-    h("div", { class: "form-grid" }, [
+    h("div", { class: "settings-intro" }, [
+      h("div", {}, [h("div", { class: "eyebrow" }, "KNOWLEDGE DEFAULTS"), h("h2", {}, "Global settings"), h("p", {}, "These defaults apply to every knowledge base unless a base has its own override.")]),
+      h("span", { class: "chip" }, "Global"),
+    ]),
+    h("div", { class: "settings-groups" }, [
+      settingsGroup("Models & AI", "Embedding and reranking providers used by default for new imports and retrieval.", [
       h("label", { class: "field" }, "Embedding provider", h("select", { name: "embeddingProvider" },
         ["none", "openai", "ollama", "local"].map((value) => h("option", { value, selected: config.embedding.provider === value }, value)))),
       h("label", { class: "field" }, "Embedding base URL", h("input", { name: "embeddingBaseUrl", value: config.embedding.baseUrl ?? "" })),
@@ -1410,12 +1583,16 @@ async function renderSettings() {
       h("label", { class: "field" }, "Rerank base URL", h("input", { name: "rerankBaseUrl", value: config.rerank.baseUrl ?? "" })),
       h("label", { class: "field" }, "Rerank API key", h("input", { name: "rerankApiKey", type: "password", placeholder: settings.rerankApiKeySet ? "Configured" : "" })),
       h("label", { class: "switch" }, h("input", { name: "clearRerankApiKey", type: "checkbox" }), "Clear rerank key"),
+      ]),
+      settingsGroup("Chunking & indexing", "Control how source text is split and prepared for the index.", [
       h("label", { class: "switch" }, h("input", { name: "smartChunk", type: "checkbox", checked: config.chunking.smart }), "Smart chunking"),
       h("label", { class: "field" }, "Chunk separator", h("input", { name: "chunkSeparator", value: config.chunking.separator ?? "" })),
       numberField("chunkSize", "Chunk size", config.chunking.size), numberField("chunkOverlap", "Chunk overlap", config.chunking.overlap),
       h("label", { class: "switch" }, h("input", { name: "semanticChunk", type: "checkbox", checked: config.chunking.semantic }), "Semantic chunking"),
       numberField("semanticThreshold", "Semantic threshold", config.chunking.semanticThreshold),
       numberField("chunkTokenLimit", "Chunk token limit", config.chunking.tokenLimit),
+      ]),
+      settingsGroup("Retrieval", "Tune result count, vector search, hybrid fusion, and diversity behavior.", [
       numberField("topK", "Top K", config.retrieval.topK),
       h("label", { class: "field" }, "Search mode", h("select", { name: "searchMode" },
         ["auto", "hybrid", "vector", "lexical"].map((value) => h("option", { value, selected: config.retrieval.mode === value }, value)))),
@@ -1424,34 +1601,49 @@ async function renderSettings() {
       numberField("mmrDiversity", "MMR diversity", config.retrieval.mmrDiversity),
       numberField("rrfWeight", "RRF vector weight", config.retrieval.rrfVectorWeight),
       numberField("siblingChunks", "Sibling chunks", config.retrieval.siblingChunks),
+      ]),
+      settingsGroup("Document processing", "Choose the parser used for difficult files and configure MinerU when enabled.", [
       h("label", { class: "field" }, "Document processor", h("select", { name: "processor" },
         ["builtin", "mineru"].map((value) => h("option", { value, selected: config.processing.provider === value }, value)))),
       h("label", { class: "field" }, "MinerU API host", h("input", { name: "mineruHost", value: config.processing.apiHost ?? "" })),
       h("label", { class: "field" }, "MinerU API key", h("input", { name: "mineruApiKey", type: "password", placeholder: settings.mineruApiKeySet ? "Configured" : "" })),
       h("label", { class: "switch" }, h("input", { name: "clearMineruApiKey", type: "checkbox" }), "Clear MinerU key"),
+      ]),
+      settingsGroup("Workflow & automatic retrieval", "Set conflict handling, URL refresh, and whether the Agent may retrieve automatically.", [
       h("label", { class: "field" }, "Conflict strategy", h("select", { name: "workflowConflict" },
         ["rename", "replace", "keep"].map((value) => h("option", { value, selected: config.workflow.conflictStrategy === value }, value)))),
       numberField("workflowRefreshHours", "URL refresh hours", config.workflow.urlRefreshHours),
       h("label", { class: "switch" }, h("input", { name: "autoRetrieve", type: "checkbox", checked: config.autoRetrieve.enabled }), "Automatic retrieval"),
       numberField("autoRetrieveWeight", "Auto-retrieve weight", config.autoRetrieve.weight),
+      ]),
+      settingsGroup("Image captioning", "Optional image-to-text enrichment for documents that contain figures.", [
       h("label", { class: "field" }, "Caption provider", h("select", { name: "captionProvider" },
         ["off", "openai", "ollama"].map((value) => h("option", { value, selected: config.captioning.provider === value }, value)))),
       h("label", { class: "field" }, "Caption model", h("input", { name: "captionModel", value: config.captioning.model ?? "" })),
       h("label", { class: "field" }, "Caption base URL", h("input", { name: "captionBaseUrl", value: config.captioning.baseUrl ?? "" })),
       h("label", { class: "field" }, "Caption API key", h("input", { name: "captionApiKey", type: "password", placeholder: settings.captionApiKeySet ? "Configured" : "" })),
       h("label", { class: "switch" }, h("input", { name: "clearCaptionApiKey", type: "checkbox" }), "Clear caption key"),
+      h("div", { class: "settings-test-row" }, [captionTestButton, captionTestStatus]),
+      ]),
+      settingsGroup("Runtime & performance", "Manage local model cache and the amount of background import concurrency.", [
       h("label", { class: "field" }, "Model cache directory", h("input", { name: "modelCacheDir", value: config.models.cacheDir ?? "" })),
       h("label", { class: "field" }, "Hugging Face endpoint", h("input", { name: "hfEndpoint", value: config.models.hfEndpoint ?? "" })),
       numberField("importWorkers", "Import workers", config.jobs.importWorkers),
       h("label", { class: "switch" }, h("input", { name: "resumeInterrupt", type: "checkbox", checked: config.jobs.resumeInterrupt }), "Resume interrupted imports"),
+      ]),
+      settingsGroup("External helpers", "Optional command templates for Office conversion, PDF extraction, image decoding, and rendering.", [
       h("label", { class: "field" }, "Legacy office helper", h("input", { name: "legacyOffice", value: config.helpers?.legacyOffice ?? "", placeholder: "converter {input} {format}" })),
       h("label", { class: "field" }, "PDF content helper", h("input", { name: "contentConverter", value: config.helpers?.contentConverter ?? "", placeholder: "anydoc {input} {format}" })),
       h("label", { class: "field" }, "Image decoder helper", h("input", { name: "imageDecoder", value: config.helpers?.imageDecoder ?? "", placeholder: "image-decode {input} {format}" })),
       h("label", { class: "field" }, "Image renderer helper", h("input", { name: "ocrRenderHelper", value: config.ocr?.renderHelper ?? "", placeholder: "pdf-render {input} {format}" })),
+      ]),
     ]),
-    h("datalist", { id: "embedding-suggestions" }, (await api.suggestions()).embedding.map((value) => h("option", { value }))),
-    h("datalist", { id: "rerank-suggestions" }, (await api.suggestions()).rerank.map((value) => h("option", { value }))),
-    h("button", { class: "button primary" }, [icon(icons.save), "Save global settings"]),
+    h("div", { class: "settings-form-footer" }, [
+      h("p", { class: "model-config-note" }, "Save global defaults here; a knowledge-base override takes precedence. Existing vectors may need rebuilding after model changes."),
+      h("button", { class: "button primary" }, [icon(icons.save), "Save global settings"]),
+    ]),
+    h("datalist", { id: "embedding-suggestions" }, suggestions.embedding.map((value) => h("option", { value }))),
+    h("datalist", { id: "rerank-suggestions" }, suggestions.rerank.map((value) => h("option", { value }))),
   ]);
   screen.append(globalForm);
 
@@ -1462,25 +1654,53 @@ async function renderSettings() {
     const form = event.target;
     const next = {
       ...baseConfig,
-      chunkSize: Number(form.chunkSize.value || 0),
-      chunkOverlap: Number(form.chunkOverlap.value || 0),
       topK: Number(form.topK.value || 0),
       urlRefreshHours: Number(form.refreshHours.value || 0),
       conflictStrategy: form.conflict.value,
       ocrMode: form.ocr.value,
       autoRetrieve: form.autoRetrieve.checked,
       autoRetrieveWeight: Number(form.autoRetrieveWeight.value || 0),
+      chunkSeparator: form.chunkSeparator.value.trim(),
+      chunkSize: Number(form.chunkSize.value || 0),
+      chunkOverlap: Number(form.chunkOverlap.value || 0),
+      semanticChunkThreshold: Number(form.semanticThreshold.value || 0),
+      chunkTokenLimit: Number(form.chunkTokenLimit.value || 0),
     };
+    if (form.smartMode.value === "global") delete next.smartChunk;
+    else next.smartChunk = form.smartMode.value === "smart";
+    if (form.semanticMode.value === "global") delete next.semanticChunk;
+    else next.semanticChunk = form.semanticMode.value === "enabled";
     await api.updateBase(state.selectedBaseId, { config: next }); await loadBases(); await render();
   }, "Base settings saved"); } }, [
     h("div", { class: "section-head" }, [h("h2", {}, `Base settings · ${base.name}`), basePicker(async (value) => { syncBasePicker(value); await render(); })]),
     h("div", { class: "form-grid" }, [
-      numberField("chunkSize", "Chunk size", baseConfig.chunkSize), numberField("chunkOverlap", "Chunk overlap", baseConfig.chunkOverlap),
       numberField("topK", "Top K", baseConfig.topK), numberField("refreshHours", "URL refresh hours", baseConfig.urlRefreshHours),
       h("label", { class: "field" }, "Conflict strategy", h("select", { name: "conflict" }, ["rename", "replace", "keep"].map((value) => h("option", { value, selected: baseConfig.conflictStrategy === value }, value)))),
       h("label", { class: "switch" }, h("input", { name: "autoRetrieve", type: "checkbox", checked: baseConfig.autoRetrieve !== false }), "Automatic retrieval"),
       numberField("autoRetrieveWeight", "Auto-retrieve weight", baseConfig.autoRetrieveWeight),
       h("label", { class: "field" }, "OCR mode", h("select", { name: "ocr" }, ["auto", "forced", "off"].map((value) => h("option", { value, selected: baseConfig.ocrMode === value }, value)))),
+    ]),
+    h("section", { class: "settings-group base-analysis-group" }, [
+      h("div", { class: "settings-group-head" }, [
+        h("div", {}, [
+          h("h3", {}, "Analysis method"),
+          h("p", { class: "settings-group-description" }, "Configure document analysis and chunking for this knowledge base. Reindex existing documents after changing these settings."),
+        ]),
+      ]),
+      h("div", { class: "settings-group-body form-grid" }, [
+        h("label", { class: "field" }, "Structural analysis", h("select", { name: "smartMode" }, [
+          ["global", "Inherit global setting"], ["smart", "Smart structural"], ["fixed", "Fixed separator"],
+        ].map(([value, label]) => h("option", { value, selected: (baseConfig.smartChunk == null ? "global" : baseConfig.smartChunk ? "smart" : "fixed") === value }, label)))),
+        h("label", { class: "field" }, "Semantic chunking", h("select", { name: "semanticMode" }, [
+          ["global", "Inherit global setting"], ["enabled", "Enabled"], ["disabled", "Disabled"],
+        ].map(([value, label]) => h("option", { value, selected: (baseConfig.semanticChunk == null ? "global" : baseConfig.semanticChunk ? "enabled" : "disabled") === value }, label)))),
+        h("label", { class: "field" }, "Chunk separator", h("input", { name: "chunkSeparator", value: baseConfig.chunkSeparator ?? "", placeholder: "\n\n" })),
+        numberField("chunkSize", "Chunk size", baseConfig.chunkSize),
+        numberField("chunkOverlap", "Chunk overlap", baseConfig.chunkOverlap),
+        numberField("semanticThreshold", "Semantic threshold", baseConfig.semanticChunkThreshold),
+        numberField("chunkTokenLimit", "Chunk token limit", baseConfig.chunkTokenLimit),
+        h("p", { class: "model-config-note" }, "Leave numeric fields blank or 0 to inherit the global value. Semantic chunking requires an available embedding model."),
+      ]),
     ]),
     h("button", { class: "button primary" }, [icon(icons.save), "Save base settings"]),
   ]));
@@ -1498,14 +1718,20 @@ function renderNavigation() {
 
 async function route() {
   const [route, query = ""] = (location.hash.replace("#/", "") || "overview").split("?");
+  const generation = ++routeGeneration;
   state.route = route;
   renderNavigation();
+  showRouteLoading();
   try {
     await loadBases();
-    await render(new URLSearchParams(query).get("q") ?? "");
+    if (!isCurrentRoute(generation)) return;
+    await render(new URLSearchParams(query).get("q") ?? "", generation);
     applyI18n(document);
   } catch (error) {
-    showToast(error.message, true);
+    if (isCurrentRoute(generation)) {
+      showRouteError(error);
+      showToast(error.message, true);
+    }
   }
 }
 

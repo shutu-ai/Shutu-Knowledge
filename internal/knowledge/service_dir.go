@@ -343,7 +343,12 @@ func (s *Service) importChildFile(ctx context.Context, baseID, containerID strin
 	doc.SourcePath = entry.absPath
 	doc.FileName = entry.fileName
 	if err := s.ingest(ctx, &doc, s.baseConfigOrEmpty(baseID), data); err != nil {
-		return nil, err
+		// ingest persists the raw source before parsing. Keep that failed
+		// document in the sync index so recordChildFailure updates the same
+		// row instead of creating a source-less duplicate placeholder. This
+		// preserves a recovery path for a later reindex after a parser fix.
+		index.add(doc)
+		return &doc, err
 	}
 	index.add(doc)
 	return &doc, nil
@@ -436,6 +441,16 @@ func (s *Service) RepointSource(sourceID, path string) (Document, error) {
 // DeleteDirectoryRecursive removes a directory, nested containers, files,
 // chunks, and raw copies. It refuses to treat a non-directory as a subtree.
 func (s *Service) DeleteDirectoryRecursive(directoryID string) (int, error) {
+	return s.DeleteDirectoryRecursiveWithProgress(context.Background(), directoryID, nil)
+}
+
+// DeleteDirectoryRecursiveWithProgress is the cancellable directory-delete
+// path used by the Web job queue. The callback runs after each document has
+// been removed, allowing callers to report real document-level progress.
+func (s *Service) DeleteDirectoryRecursiveWithProgress(ctx context.Context, directoryID string, onDeleted func()) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	doc, err := s.store.getDocument(directoryID)
 	if err != nil {
 		return 0, err
@@ -452,14 +467,22 @@ func (s *Service) DeleteDirectoryRecursive(directoryID string) (int, error) {
 		if child.ParentDirectoryID != directoryID {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
 		var childErr error
 		if child.SourceType == "directory" {
 			var childRemoved int
-			childRemoved, childErr = s.DeleteDirectoryRecursive(child.ID)
+			childRemoved, childErr = s.DeleteDirectoryRecursiveWithProgress(ctx, child.ID, onDeleted)
 			removed += childRemoved
 		} else {
 			childErr = s.DeleteDocument(child.ID)
-			removed++
+			if childErr == nil {
+				removed++
+				if onDeleted != nil {
+					onDeleted()
+				}
+			}
 		}
 		if childErr != nil && !errors.Is(childErr, ErrNotFound) {
 			return removed, childErr
@@ -467,6 +490,9 @@ func (s *Service) DeleteDirectoryRecursive(directoryID string) (int, error) {
 	}
 	if err := s.DeleteDocument(doc.ID); err != nil && err != ErrNotFound {
 		return removed, err
+	}
+	if onDeleted != nil {
+		onDeleted()
 	}
 	return removed + 1, nil
 }

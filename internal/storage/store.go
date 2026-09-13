@@ -55,8 +55,12 @@ func Open(path string) (*DB, error) {
 		_ = handle.Close()
 		return nil, fmt.Errorf("open sqlite read connection: %w", err)
 	}
-	readHandle.SetMaxOpenConns(1)
-	readHandle.SetMaxIdleConns(1)
+	// Keep several read connections available. Startup recovery and large
+	// document-list queries can legitimately take time; one shared reader lets
+	// either operation starve every HTTP request even though WAL supports
+	// concurrent readers.
+	readHandle.SetMaxOpenConns(4)
+	readHandle.SetMaxIdleConns(4)
 	if err := readHandle.Ping(); err != nil {
 		_ = readHandle.Close()
 		_ = handle.Close()

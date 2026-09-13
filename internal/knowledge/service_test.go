@@ -1,9 +1,11 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,19 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
+
+func TestSampleCaptionPNGIsMeaningful(t *testing.T) {
+	img, err := png.Decode(bytes.NewReader(sampleCaptionPNG()))
+	if err != nil {
+		t.Fatalf("decode sample caption PNG: %v", err)
+	}
+	if got := img.Bounds().Size(); got.X != 512 || got.Y != 320 {
+		t.Fatalf("unexpected sample caption dimensions: %v", got)
+	}
+	if img.At(110, 200) == img.At(10, 10) {
+		t.Fatal("sample caption PNG is blank")
+	}
+}
 
 type concurrencyEmbedder struct {
 	mu      sync.Mutex
@@ -223,6 +238,60 @@ func TestFileImportReindexAndDeleteCascade(t *testing.T) {
 	}
 	if stored, err := f.raw.Read(doc.RawFilePath); err != nil || stored != nil {
 		t.Fatalf("raw read after delete should be nil,nil: %v", err)
+	}
+}
+
+func TestDirectoryParseFailureRetainsSourceForReindex(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "broken.md")
+	if err := os.WriteFile(path, []byte("   "), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	jobID, err := f.service.ImportDirectoryTree(context.Background(), base.ID, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitJobAllowFailed(t, f.service, jobID)
+	docs, err := f.service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failed DocumentSummary
+	for _, doc := range docs {
+		if doc.Title == "broken.md" {
+			failed = doc
+			break
+		}
+	}
+	if failed.ID == "" {
+		t.Fatalf("failed document not tracked: %+v", docs)
+	}
+	full, _, err := f.service.GetDocument(failed.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.RawFilePath == "" {
+		t.Fatalf("failed directory import lost raw source: %+v", full)
+	}
+
+	// Simulate a parser becoming able to read the same source after the
+	// original failed import. Reindex must use the preserved source rather
+	// than the source-less failure placeholder created by the old flow.
+	if _, err := f.raw.Write(base.ID, failed.ID, ".md", []byte("recovered content")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.service.ReindexDocument(context.Background(), failed.ID); err != nil {
+		t.Fatalf("reindex recovered source: %v", err)
+	}
+	reindexed, _, err := f.service.GetDocument(failed.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reindexed.Status != StatusReady || reindexed.ErrorCode != "" || reindexed.RawText != "recovered content" {
+		t.Fatalf("reindexed document: %+v", reindexed)
 	}
 }
 

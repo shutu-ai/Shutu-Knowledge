@@ -13,19 +13,32 @@ const extensionPrefix = window.location.pathname.match(/^(.*\/extensions\/[^/]+)
 const endpoint = (path) => `${extensionPrefix}${path}`;
 
 async function request(path, options = {}) {
-  const response = await fetch(endpoint(path), {
-    ...options,
-    headers: { "content-type": "application/json", ...(options.headers ?? {}) },
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (payload.ok === undefined) return payload;
-  if (!payload.ok) {
-    throw new ApiError(payload.error?.message ?? `HTTP ${response.status}`, response.status, payload.error?.code);
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(endpoint(path), {
+      ...fetchOptions,
+      signal: controller.signal,
+      headers: { "content-type": "application/json", ...(fetchOptions.headers ?? {}) },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (payload.ok === undefined) return payload;
+    if (!payload.ok) {
+      throw new ApiError(payload.error?.message ?? `HTTP ${response.status}`, response.status, payload.error?.code);
+    }
+    return payload.value;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new ApiError(`Request timed out: ${path}`, 408, "request_timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return payload.value;
 }
 
-const post = (path, body) => request(path, { method: "POST", body: JSON.stringify(body) });
+const post = (path, body, options = {}) => request(path, { ...options, method: "POST", body: JSON.stringify(body) });
 
 export const api = {
   request,
@@ -53,6 +66,8 @@ export const api = {
   reindexDocument: (id) => post(`/api/documents/${id}/reindex`, {}),
   reindexBase: (id) => post(`/api/bases/${id}/reindex`, {}),
   deleteDocument: (id) => request(`/api/documents/${id}`, { method: "DELETE" }),
+  deleteDocumentJob: (id) => post(`/api/documents/${id}/delete`, {}),
+  deleteDirectoryJob: (id) => post(`/api/documents/${id}/delete-tree-job`, {}),
   deleteDocuments: (ids) => post("/api/documents/delete", { ids }),
   reindexDocuments: (ids) => post("/api/documents/reindex", { ids }),
   deleteDirectory: (id) => post(`/api/documents/${id}/delete-tree`, {}),
@@ -71,8 +86,11 @@ export const api = {
   updateScope: (body) => request("/api/scope", { method: "PUT", body: JSON.stringify(body) }),
   config: () => request("/api/config"),
   updateConfig: (body) => request("/api/config", { method: "PUT", body: JSON.stringify(body) }),
+  probeEmbedding: (body) => post("/api/probe-embedding-dimensions", body, { timeoutMs: 120000 }),
+  probeRerank: (body) => post("/api/probe-rerank", body, { timeoutMs: 120000 }),
+  probeCaption: (body) => post("/api/probe-caption", body, { timeoutMs: 180000 }),
   suggestions: () => request("/api/model-suggestions"),
-  localModels: () => request("/api/local-models"),
+  localModels: (baseID = "") => request(baseID ? `/api/local-models?baseId=${encodeURIComponent(baseID)}` : "/api/local-models"),
   ocrModel: () => request("/api/ocr/model"),
   downloadOCRModel: () => post("/api/ocr/model/download", {}),
   removeOCRModel: () => post("/api/ocr/model/remove", {}),

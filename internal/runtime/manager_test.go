@@ -100,6 +100,22 @@ func TestManagerHonorsCallDeadlineAndClose(t *testing.T) {
 	}
 }
 
+func TestManagerStatusDoesNotWaitForBusyHelper(t *testing.T) {
+	command := "busy-helper"
+	helper := &helperProcess{}
+	helper.mu.Lock()
+	manager := &Manager{command: command, requestTimeout: time.Second, processes: map[string]*helperProcess{command: helper}}
+	started := time.Now()
+	status := manager.Status(context.Background())
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("status waited for busy helper: %s", elapsed)
+	}
+	if status[CapabilityEmbedding].Lifecycle != "LOADING" {
+		t.Fatalf("busy embedding status: %+v", status[CapabilityEmbedding])
+	}
+	helper.mu.Unlock()
+}
+
 func TestManagerUsesModelLoadBudgetOnlyForFirstModelInference(t *testing.T) {
 	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
 	manager := NewManager(Options{

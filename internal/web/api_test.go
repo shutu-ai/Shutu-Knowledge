@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
+	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
+	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 	"os"
@@ -136,6 +138,52 @@ func TestKnowledgeAPIRoundTrip(t *testing.T) {
 	code, payload = call(t, s, "GET", "/api/bases/does-not-exist", nil)
 	if code != http.StatusNotFound {
 		t.Fatalf("missing base: %d %v", code, payload)
+	}
+}
+
+func TestDocumentDeleteJobRemovesDocumentWithoutBlockingRequest(t *testing.T) {
+	s := newTestServer(t)
+	code, payload := call(t, s, "POST", "/api/bases", map[string]any{"name": "Delete job"})
+	if code != http.StatusOK {
+		t.Fatalf("create base: %d %v", code, payload)
+	}
+	baseID := valueMap(t, payload)["id"].(string)
+	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/documents", map[string]any{
+		"title": "SmartCare product dictionary.xlsx", "content": "delete job marker",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("create document: %d %v", code, payload)
+	}
+	docID := valueMap(t, payload)["id"].(string)
+
+	code, payload = call(t, s, "POST", "/api/documents/"+docID+"/delete", nil)
+	if code != http.StatusOK {
+		t.Fatalf("submit delete job: %d %v", code, payload)
+	}
+	jobID := valueMap(t, payload)["jobId"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job, ok := s.app.Jobs.Status(jobID)
+		if !ok {
+			t.Fatalf("delete job missing: %s", jobID)
+		}
+		if job.Status == jobs.StatusDone {
+			if job.Progress != 1 || job.Total != 1 || job.Phase != "deleting" {
+				t.Fatalf("delete job result: %+v", job)
+			}
+			break
+		}
+		if job.Status == jobs.StatusFailed {
+			t.Fatalf("delete job failed: %+v", job)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delete job timeout: %+v", job)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	code, payload = call(t, s, "GET", "/api/documents/"+docID+"?includeChunks=false", nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("deleted document still available: %d %v", code, payload)
 	}
 }
 
@@ -340,9 +388,30 @@ func TestDocumentTreeAndGroupAPI(t *testing.T) {
 		t.Fatalf("delete group: %d", code)
 	}
 
-	code, payload = call(t, s, "POST", "/api/documents/"+rootID+"/delete-tree", nil)
-	if code != http.StatusOK || valueMap(t, payload)["deleted"].(float64) != 3 {
-		t.Fatalf("delete document tree: %d %v", code, payload)
+	code, payload = call(t, s, "POST", "/api/documents/"+rootID+"/delete-tree-job", nil)
+	if code != http.StatusOK {
+		t.Fatalf("submit delete document tree job: %d %v", code, payload)
+	}
+	deleteJobID := valueMap(t, payload)["jobId"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job, ok := s.app.Jobs.Status(deleteJobID)
+		if !ok {
+			t.Fatalf("delete tree job missing: %s", deleteJobID)
+		}
+		if job.Status == jobs.StatusDone {
+			if job.Progress != 3 || job.Total != 3 || job.Phase != "deleting" {
+				t.Fatalf("delete tree job result: %+v", job)
+			}
+			break
+		}
+		if job.Status == jobs.StatusFailed {
+			t.Fatalf("delete tree job failed: %+v", job)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delete tree job timeout: %+v", job)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	_, payload = call(t, s, "GET", "/api/bases/"+baseID+"/documents", nil)
 	if len(payload["value"].([]any)) != 0 {
@@ -452,6 +521,40 @@ func TestManagedRuntimeModelAppearsInLocalModelList(t *testing.T) {
 	}
 	if !application.Runtime.(*fakeManagedModelRuntime).removed {
 		t.Fatal("managed runtime remove was not called")
+	}
+}
+
+func TestBaseConfiguredManagedModelAppearsAsInstalledNotLoaded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", home)
+	application, err := app.New(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	modelID := "onnx-community/base-embedding"
+	base, err := application.Knowledge.CreateBase("Base override", "", "", knowledge.BaseConfig{
+		EmbeddingProvider: "local",
+		EmbeddingModel:    modelID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(application.Models.Root(), filepath.FromSlash(modelID)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	application.Runtime = &fakeManagedModelRuntime{}
+	application.ManagedRuntime = true
+
+	s := New(application)
+	_, payload := call(t, s, "GET", "/api/local-models?baseId="+base.ID, nil)
+	items := valueMap(t, payload)["models"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("base model list: %v", items)
+	}
+	item := items[0].(map[string]any)
+	if item["id"] != modelID || item["kind"] != models.KindEmbedding || item["status"] != "installed" || item["lifecycle"] != models.LifecycleInstalled || item["ready"] != false {
+		t.Fatalf("base model state: %v", item)
 	}
 }
 

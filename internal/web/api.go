@@ -42,6 +42,8 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /api/documents/{id}", s.getDocument)
 	mux.HandleFunc("PATCH /api/documents/{id}", s.patchDocument)
 	mux.HandleFunc("DELETE /api/documents/{id}", s.deleteDocument)
+	mux.HandleFunc("POST /api/documents/{id}/delete", s.deleteDocumentJob)
+	mux.HandleFunc("POST /api/documents/{id}/delete-tree-job", s.deleteDocumentTreeJob)
 	mux.HandleFunc("POST /api/documents/delete", s.deleteDocuments)
 	mux.HandleFunc("POST /api/documents/reindex", s.reindexDocuments)
 	mux.HandleFunc("POST /api/documents/{id}/delete-tree", s.deleteDocumentTree)
@@ -60,6 +62,8 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("PUT /api/config", s.putConfig)
 	mux.HandleFunc("GET /api/model-suggestions", s.modelSuggestions)
 	mux.HandleFunc("POST /api/probe-embedding-dimensions", s.probeEmbeddingDimensions)
+	mux.HandleFunc("POST /api/probe-rerank", s.probeRerank)
+	mux.HandleFunc("POST /api/probe-caption", s.probeCaption)
 	mux.HandleFunc("GET /api/indexing-status", s.indexingStatus)
 	mux.HandleFunc("GET /api/local-models", s.listLocalModels)
 	mux.HandleFunc("GET /api/ocr/model", s.ocrModel)
@@ -293,6 +297,41 @@ func (s *Server) probeEmbeddingDimensions(w http.ResponseWriter, r *http.Request
 	writeOK(w, map[string]int{"dimensions": dimensions})
 }
 
+func (s *Server) probeRerank(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody[struct {
+		BaseURL string `json:"baseUrl"`
+		Model   string `json:"model"`
+		APIKey  string `json:"apiKey"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	scores, err := s.app.Knowledge.ProbeRerank(r.Context(), body.BaseURL, body.Model, body.APIKey)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"scores": scores})
+}
+
+func (s *Server) probeCaption(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeBody[struct {
+		Provider string `json:"provider"`
+		BaseURL  string `json:"baseUrl"`
+		Model    string `json:"model"`
+		APIKey   string `json:"apiKey"`
+	}](w, r)
+	if !ok {
+		return
+	}
+	captionText, err := s.app.Knowledge.ProbeCaption(r.Context(), body.Provider, body.BaseURL, body.Model, body.APIKey)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"caption": captionText})
+}
+
 func (s *Server) rawDocument(w http.ResponseWriter, r *http.Request) {
 	raw, err := s.app.Knowledge.GetRawFile(r.PathValue("id"))
 	if err != nil {
@@ -399,7 +438,7 @@ func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
-	docs, err := s.app.Knowledge.ListDocuments(r.PathValue("id"))
+	docs, err := s.app.Knowledge.ListDocumentsContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -590,6 +629,33 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]bool{"deleted": true})
 }
 
+// deleteDocumentJob keeps a potentially large chunk/FTS delete out of the
+// HTTP request. The document page can show the queued/running state and the IO
+// dispatcher serializes it with imports and reindexes.
+func (s *Server) deleteDocumentJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	doc, _, err := s.app.Knowledge.GetDocument(id, false)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	jobID, err := s.app.Jobs.SubmitIOWithProgress("delete_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.app.Knowledge.DeleteDocument(id); err != nil {
+			return err
+		}
+		report(jobs.ProgressUpdate{Phase: "deleting", Completed: 1, Total: 1, File: doc.Title})
+		return nil
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]string{"jobId": jobID})
+}
+
 func (s *Server) deleteDocumentTree(w http.ResponseWriter, r *http.Request) {
 	deleted, err := s.app.Knowledge.DeleteDirectoryRecursive(r.PathValue("id"))
 	if err != nil {
@@ -597,6 +663,59 @@ func (s *Server) deleteDocumentTree(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, map[string]int{"deleted": deleted})
+}
+
+func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	doc, _, err := s.app.Knowledge.GetDocument(id, false)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if doc.SourceType != "directory" {
+		writeErr(w, errors.New("document is not a directory"))
+		return
+	}
+	docs, err := s.app.Knowledge.ListDocuments(doc.BaseID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	total := directoryTreeSize(docs, id)
+	jobID, err := s.app.Jobs.SubmitIOWithProgress("delete_directory", doc.BaseID, total, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
+		completed := 0
+		report(jobs.ProgressUpdate{Phase: "deleting", Total: total, File: doc.Title})
+		_, err := s.app.Knowledge.DeleteDirectoryRecursiveWithProgress(ctx, id, func() {
+			completed++
+			report(jobs.ProgressUpdate{Phase: "deleting", Completed: completed, Total: total, File: doc.Title})
+		})
+		return err
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]string{"jobId": jobID})
+}
+
+func directoryTreeSize(docs []knowledge.DocumentSummary, rootID string) int {
+	children := make(map[string][]string)
+	for _, doc := range docs {
+		children[doc.ParentDirID] = append(children[doc.ParentDirID], doc.ID)
+	}
+	var count func(string, map[string]bool) int
+	count = func(id string, seen map[string]bool) int {
+		if seen[id] {
+			return 0
+		}
+		seen[id] = true
+		total := 1
+		for _, childID := range children[id] {
+			total += count(childID, seen)
+		}
+		return total
+	}
+	return count(rootID, make(map[string]bool))
 }
 
 type deleteDocumentsRequest struct {
@@ -853,8 +972,12 @@ func (s *Server) modelSuggestions(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) listLocalModels(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) listLocalModels(w http.ResponseWriter, r *http.Request) {
+	baseID := r.URL.Query().Get("baseId")
 	list, err := s.app.ListLocalModels()
+	if baseID != "" {
+		list, err = s.app.ListLocalModelsForBase(baseID)
+	}
 	if err != nil {
 		writeErr(w, err)
 		return

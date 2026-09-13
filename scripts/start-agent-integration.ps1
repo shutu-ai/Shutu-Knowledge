@@ -46,6 +46,41 @@ $knowledgeInputs = @(
     (Join-Path $KnowledgeRoot "web\src"),
     (Join-Path $KnowledgeRoot "extension.yaml")
 )
+
+function Remove-OrphanKnowledgeExtensions([string] $Executable) {
+    $processes = Get-CimInstance Win32_Process -Filter "Name='shutu-knowledge.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $commandLine = [string] $_.CommandLine
+            $commandLine.IndexOf($Executable, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $commandLine.TrimEnd().EndsWith(" extension", [StringComparison]::OrdinalIgnoreCase)
+        }
+    foreach ($process in $processes) {
+        if (-not (Get-Process -Id $process.ParentProcessId -ErrorAction SilentlyContinue)) {
+            Write-Host "Removing orphan Knowledge extension process $($process.ProcessId)..."
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Assert-AgentWebPortAvailable([int] $Port) {
+    $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if ($listeners.Count -eq 0) {
+        return
+    }
+    $owners = foreach ($listener in $listeners) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+        if ($null -ne $process) {
+            "PID $($process.ProcessId) $($process.Name): $($process.CommandLine)"
+        } else {
+            "PID $($listener.OwningProcess)"
+        }
+    }
+    $ownerText = $owners -join "; "
+    throw "Agent Web port $Port is already in use. Close the existing Agent Web instance before retrying. Current listener: $ownerText"
+}
+
+Remove-OrphanKnowledgeExtensions $knowledgeExe
+Assert-AgentWebPortAvailable 18099
 $needsKnowledgeBuild = -not (Test-Path -LiteralPath $knowledgeExe -PathType Leaf)
 if (-not $needsKnowledgeBuild) {
     $binaryTime = (Get-Item -LiteralPath $knowledgeExe).LastWriteTimeUtc

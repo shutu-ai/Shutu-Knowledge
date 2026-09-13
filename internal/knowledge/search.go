@@ -221,12 +221,16 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 	if docIDs != nil && len(docIDs) == 0 {
 		return SearchResult{Query: query, Mode: s.resolveMode(req.Mode, s.embedderActive()), Hits: []SearchHit{}}, nil
 	}
+	searchBaseIDs, providersByBase, embeddingActive, err := s.searchProviders(baseIDs)
+	if err != nil {
+		return SearchResult{}, err
+	}
 
 	topK := req.TopK
 	if topK <= 0 {
 		topK = s.global.Retrieval.TopK
 	}
-	mode := s.resolveMode(req.Mode, s.embedderActive())
+	mode := s.resolveMode(req.Mode, embeddingActive)
 	poolSize := topK * 3
 	if poolSize < 12 {
 		poolSize = 12
@@ -245,6 +249,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 	vectorOrderSeen := map[string]bool{}
 	var queryVector []float32
 	vectorAvailable := false
+	queryVectorsByModel := map[string][]float64{}
 
 	for _, variant := range variants {
 		lexicalHits, err := s.store.LexicalSearch(variant, baseIDs, docIDs, poolSize)
@@ -270,18 +275,31 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 		}
 		var vectorOrder []string
 		if mode == "hybrid" || mode == "vector" {
-			queryVectors, err := s.embedder.Embed(ctx, []string{variant})
-			if err != nil {
-				// Query embedding failure degrades this variant to lexical.
-				mode = "lexical"
-			} else if len(queryVectors) == 1 {
-				if variant == query {
-					queryVector = toFloat32(queryVectors[0])
+			vectorQuerySucceeded := false
+			for _, baseID := range searchBaseIDs {
+				providers := providersByBase[baseID]
+				if !providers.embeddingActive || providers.embedder == nil {
+					continue
 				}
-				vectorHits, err := s.store.VectorSearch(queryVectors[0], baseIDs, docIDs, poolSize)
+				modelKey := providers.embedder.ModelKey()
+				cacheKey := modelKey + "\x00" + variant
+				queryVectorForModel, ok := queryVectorsByModel[cacheKey]
+				if !ok {
+					vectors, embedErr := providers.embedder.Embed(ctx, []string{variant})
+					if embedErr != nil || len(vectors) != 1 {
+						continue
+					}
+					queryVectorForModel = vectors[0]
+					queryVectorsByModel[cacheKey] = queryVectorForModel
+				}
+				if variant == query && queryVector == nil {
+					queryVector = toFloat32(queryVectorForModel)
+				}
+				vectorHits, err := s.store.VectorSearch(queryVectorForModel, []string{baseID}, docIDs, poolSize, modelKey)
 				if err != nil {
 					return SearchResult{}, err
 				}
+				vectorQuerySucceeded = true
 				vectorAvailable = vectorAvailable || len(vectorHits) > 0
 				for rank, hit := range vectorHits {
 					if previous, ok := vectorRanks[hit.ID]; !ok || rank+1 < previous {
@@ -299,10 +317,16 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 					}
 					vectorOrder = append(vectorOrder, hit.ID)
 				}
-				if mode == "vector" {
-					variantOrders = append(variantOrders, vectorOrder)
-					continue
-				}
+			}
+			if !vectorQuerySucceeded {
+				// Query embedding failure degrades this variant to lexical search.
+				mode = "lexical"
+				variantOrders = append(variantOrders, lexicalOrder)
+				continue
+			}
+			if mode == "vector" {
+				variantOrders = append(variantOrders, vectorOrder)
+				continue
 			}
 		}
 		if mode == "hybrid" {
@@ -345,14 +369,20 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 	// Rerank stage (optional): strict validation upstream; any failure keeps
 	// the current order and reports degraded.
 	var rerankScores map[string]float64
-	if s.reranker != nil && len(ordered) > 1 {
+	reranker := commonReranker(ordered, providersByBase)
+	if reranker != nil && len(ordered) > 1 {
 		rerankStart := Now()
 		texts := make([]string, 0, len(ordered))
 		for _, c := range ordered {
 			texts = append(texts, clipToTokens(c.EmbeddingText, 352))
 		}
-		status := RerankStatus{Provider: "remote", Model: s.reranker.ModelKey(), Attempted: true, CandidateCount: len(ordered)}
-		scores, err := s.reranker.Rerank(ctx, clipToTokens(query, 128), texts)
+		modelKey := reranker.ModelKey()
+		providerName := "remote"
+		if strings.HasPrefix(modelKey, "local-rerank:") {
+			providerName = "local"
+		}
+		status := RerankStatus{Provider: providerName, Model: modelKey, Attempted: true, CandidateCount: len(ordered)}
+		scores, err := reranker.Rerank(ctx, clipToTokens(query, 128), texts)
 		status.ElapsedMS = Now().UnixMilli() - rerankStart.UnixMilli()
 		if err != nil {
 			status.Status = "degraded"
@@ -557,6 +587,26 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResult, 
 
 func (s *Service) embedderActive() bool {
 	return s.global.Embedding.Provider != "none"
+}
+
+func commonReranker(ordered []Chunk, providersByBase map[string]providerSet) rerank.Provider {
+	var selected rerank.Provider
+	for _, candidate := range ordered {
+		providers := providersByBase[candidate.BaseID]
+		if !providers.rerankerActive || providers.reranker == nil {
+			return nil
+		}
+		if selected == nil {
+			selected = providers.reranker
+			continue
+		}
+		if selected.ModelKey() != providers.reranker.ModelKey() {
+			// A single reranker cannot safely score candidates from bases that
+			// explicitly selected different model spaces.
+			return nil
+		}
+	}
+	return selected
 }
 
 func (s *Service) resolveMode(requested string, vectorAvailable bool) string {

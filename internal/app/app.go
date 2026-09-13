@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/url"
@@ -120,9 +121,12 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 	return application, nil
 }
 
-// StartBackgroundRecovery defers document recovery and storage reconciliation
-// until after the HTTP listener is available. This is important for Agent
-// extension startup when the database contains many documents or a large WAL.
+// StartBackgroundRecovery defers lightweight document recovery until after the
+// HTTP listener is available. Full storage reconciliation is intentionally not
+// part of startup: it walks every raw file and counts chunks for every
+// document, which can monopolize disk and the SQLite read pool for a large
+// knowledge base. Reconciliation remains available as an explicit service
+// operation for maintenance workflows.
 func (a *App) StartBackgroundRecovery() {
 	a.startupOnce.Do(func() {
 		a.startupDone = make(chan struct{})
@@ -138,11 +142,6 @@ func (a *App) runStartupRecovery(ctx context.Context) {
 		a.Logger.Warn("startup recovery incomplete", "error", err)
 	} else if resumed > 0 || failed > 0 {
 		a.Logger.Info("startup recovery", "resumed", resumed, "failed", failed)
-	}
-	if removedRaw, fixedCounts, err := a.Knowledge.ReconcileStorage(); err != nil {
-		a.Logger.Warn("storage reconciliation incomplete", "error", err)
-	} else if removedRaw > 0 || fixedCounts > 0 {
-		a.Logger.Info("storage reconciliation", "removedRaw", removedRaw, "fixedChunkCounts", fixedCounts)
 	}
 }
 
@@ -567,9 +566,84 @@ type LocalModelView struct {
 	SelfTest *knowledge.RerankSelfTest `json:"selfTest,omitempty"`
 }
 
-// ListLocalModels augments artifact state with custom registrations and
-// reranker self-test status. Registration and artifact readiness remain distinct.
+type managedRuntimeState struct {
+	Components map[string]managedRuntimeComponent `json:"components"`
+}
+
+type managedRuntimeComponent struct {
+	Lifecycle string `json:"lifecycle"`
+	Ready     bool   `json:"ready"`
+	Model     string `json:"model"`
+	Runtime   string `json:"runtime"`
+	LastError string `json:"lastError"`
+}
+
+// cachedManagedModels restores model entries before the managed helper starts.
+// Transformers.js stores managed artifacts below <model>/<revision> and does
+// not create the manifest consumed by models.Manager, so the persisted runtime
+// state is the durable catalog while the cache directory proves it is local.
+func cachedManagedModels(home, cacheDir string) []LocalModelView {
+	data, err := os.ReadFile(filepath.Join(home, "runtime", "runtime-state.json"))
+	if err != nil {
+		return nil
+	}
+	var state managedRuntimeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil
+	}
+	views := make([]LocalModelView, 0, 2)
+	for capability, component := range state.Components {
+		kind := ""
+		switch capability {
+		case runtime.CapabilityEmbedding:
+			kind = models.KindEmbedding
+		case runtime.CapabilityRerank:
+			kind = models.KindRerank
+		default:
+			continue
+		}
+		id := strings.TrimPrefix(strings.TrimSpace(component.Model), "local:")
+		if id == "" || !safeModelCachePath(cacheDir, id) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(cacheDir, filepath.FromSlash(id))); err != nil {
+			continue
+		}
+		lifecycle := strings.ToUpper(strings.TrimSpace(component.Lifecycle))
+		if lifecycle == "" {
+			lifecycle = models.LifecycleInstalled
+		}
+		status := "installed"
+		if lifecycle == models.LifecycleFailed {
+			status = "incomplete"
+		}
+		views = append(views, LocalModelView{Model: models.Model{
+			ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
+			Ready: component.Ready, Runtime: "RUNTIME_CACHED", LastError: component.LastError,
+		}})
+	}
+	return views
+}
+
+func safeModelCachePath(root, id string) bool {
+	root = filepath.Clean(root)
+	candidate := filepath.Join(root, filepath.FromSlash(id))
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
 func (a *App) ListLocalModels() ([]LocalModelView, error) {
+	return a.listLocalModels("")
+}
+
+// ListLocalModelsForBase includes the selected base's effective model
+// configuration. Base overrides must be visible to the model picker even when
+// the global model configuration points at a different model.
+func (a *App) ListLocalModelsForBase(baseID string) ([]LocalModelView, error) {
+	return a.listLocalModels(baseID)
+}
+
+func (a *App) listLocalModels(baseID string) ([]LocalModelView, error) {
 	items, err := a.Models.List()
 	if err != nil {
 		return nil, err
@@ -602,6 +676,21 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 				Artifacts: []string{}, Downloaded: 0,
 			}})
 		}
+	}
+	configuredEmbeddingModel := a.Config.Embedding.Model
+	configuredRerankModel := a.Config.Rerank.Model
+	embeddingLocal := a.Config.Embedding.Provider == "local"
+	rerankEnabled := a.Config.Rerank.Enabled
+	if baseID != "" {
+		base, baseErr := a.Knowledge.GetBase(baseID)
+		if baseErr != nil {
+			return nil, baseErr
+		}
+		effective := knowledge.ResolveBaseConfig(a.Config, base.Config)
+		configuredEmbeddingModel = effective.EmbeddingModel
+		configuredRerankModel = effective.RerankModel
+		embeddingLocal = effective.EmbeddingProvider == "local"
+		rerankEnabled = effective.RerankEnabled != nil && *effective.RerankEnabled
 	}
 	if a.Runtime != nil {
 		runtimeStatus := a.Runtime.Status(context.Background())
@@ -650,18 +739,55 @@ func (a *App) ListLocalModels() ([]LocalModelView, error) {
 			}, SelfTest: selfTest})
 			seen[id] = true
 		}
-		addManagedCandidate := func(configuredID string, kind, capability string, useConfigured bool) {
-			health := runtimeStatus[capability]
-			if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
-				addManaged(health.Model, kind, capability)
+		addConfiguredManaged := func(configuredID, kind, capability string, useConfigured bool) {
+			if !useConfigured {
 				return
 			}
-			if useConfigured {
-				addManaged(configuredID, kind, capability)
+			id := strings.TrimPrefix(strings.TrimSpace(configuredID), "local:")
+			if id == "" || !a.ManagedRuntime || seen[id] {
+				return
+			}
+			health := runtimeStatus[capability]
+			healthModel := strings.TrimPrefix(strings.TrimSpace(health.Model), "local:")
+			if healthModel == id && health.Lifecycle != models.LifecycleNotInstalled {
+				addManaged(id, kind, capability)
+				return
+			}
+			status := "not-downloaded"
+			lifecycle := models.LifecycleNotInstalled
+			runtimeStatusValue := models.LifecycleRuntimeMiss
+			if _, statErr := os.Stat(filepath.Join(a.modelCacheDir(), filepath.FromSlash(id))); statErr == nil {
+				status = "installed"
+				lifecycle = models.LifecycleInstalled
+				runtimeStatusValue = "RUNTIME_CACHED"
+			}
+			views = append(views, LocalModelView{Model: models.Model{
+				ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
+				Runtime: runtimeStatusValue,
+			}})
+			seen[id] = true
+		}
+		// The currently loaded runtime model is useful even when the selected
+		// base points at another cached model. Add both entries so the picker can
+		// distinguish a loaded model from an installed-but-not-loaded one.
+		health := runtimeStatus[runtime.CapabilityEmbedding]
+		if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
+			addManaged(health.Model, models.KindEmbedding, runtime.CapabilityEmbedding)
+		}
+		health = runtimeStatus[runtime.CapabilityRerank]
+		if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
+			addManaged(health.Model, models.KindRerank, runtime.CapabilityRerank)
+		}
+		addConfiguredManaged(configuredEmbeddingModel, models.KindEmbedding, runtime.CapabilityEmbedding, embeddingLocal)
+		addConfiguredManaged(configuredRerankModel, models.KindRerank, runtime.CapabilityRerank, rerankEnabled)
+		if a.ManagedRuntime {
+			for _, cached := range cachedManagedModels(a.Home, a.modelCacheDir()) {
+				if !seen[cached.ID] {
+					views = append(views, cached)
+					seen[cached.ID] = true
+				}
 			}
 		}
-		addManagedCandidate(a.Config.Embedding.Model, models.KindEmbedding, runtime.CapabilityEmbedding, a.Config.Embedding.Provider == "local")
-		addManagedCandidate(a.Config.Rerank.Model, models.KindRerank, runtime.CapabilityRerank, a.Config.Rerank.Enabled)
 	}
 	return views, nil
 }

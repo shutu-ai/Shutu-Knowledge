@@ -14,6 +14,7 @@ type BaseConfig struct {
 	EmbeddingAPIKey      string `json:"embeddingApiKey,omitempty"`
 	EmbeddingAPIKeySet   bool   `json:"embeddingApiKeySet,omitempty"`
 	ClearEmbeddingAPIKey bool   `json:"clearEmbeddingApiKey,omitempty"`
+	RerankEnabled        *bool  `json:"rerankEnabled,omitempty"`
 	RerankModel          string `json:"rerankModel,omitempty"`
 	RerankBaseURL        string `json:"rerankBaseUrl,omitempty"`
 	RerankAPIKey         string `json:"rerankApiKey,omitempty"`
@@ -118,18 +119,20 @@ type Document struct {
 	RawText           string `json:"-"`
 	// TitleLocked is internal state: user-named titles survive source
 	// refresh, while source-derived titles follow metadata changes.
-	TitleLocked  bool   `json:"-"`
-	CharCount    int    `json:"charCount"`
-	TokenCount   int    `json:"tokenCount,omitempty"`
-	ChunkCount   int    `json:"chunkCount"`
-	Status       string `json:"status"`
-	Phase        string `json:"phase,omitempty"`
-	Progress     int    `json:"progress"`
-	Incomplete   bool   `json:"incomplete,omitempty"`
-	ErrorCode    string `json:"errorCode,omitempty"`
-	ErrorMessage string `json:"errorMessage,omitempty"`
-	CreatedAt    int64  `json:"createdAt"`
-	UpdatedAt    int64  `json:"updatedAt,omitempty"`
+	TitleLocked    bool   `json:"-"`
+	CharCount      int    `json:"charCount"`
+	TokenCount     int    `json:"tokenCount,omitempty"`
+	ChunkCount     int    `json:"chunkCount"`
+	EmbeddingReady bool   `json:"-"`
+	EmbeddingModel string `json:"-"`
+	Status         string `json:"status"`
+	Phase          string `json:"phase,omitempty"`
+	Progress       int    `json:"progress"`
+	Incomplete     bool   `json:"incomplete,omitempty"`
+	ErrorCode      string `json:"errorCode,omitempty"`
+	ErrorMessage   string `json:"errorMessage,omitempty"`
+	CreatedAt      int64  `json:"createdAt"`
+	UpdatedAt      int64  `json:"updatedAt,omitempty"`
 }
 
 // Chunk is one stored chunk. Phase 2 stores text + metadata; embedding and
@@ -154,24 +157,25 @@ type Chunk struct {
 
 // DocumentSummary is the list view of a document.
 type DocumentSummary struct {
-	ID           string `json:"id"`
-	BaseID       string `json:"baseId"`
-	Title        string `json:"title"`
-	SourceType   string `json:"sourceType"`
-	FileName     string `json:"fileName,omitempty"`
-	URL          string `json:"url,omitempty"`
-	ParentDirID  string `json:"parentDirectoryId,omitempty"`
-	SourcePath   string `json:"sourcePath,omitempty"`
-	CharCount    int    `json:"charCount"`
-	TokenCount   int    `json:"tokenCount,omitempty"`
-	ChunkCount   int    `json:"chunkCount"`
-	Status       string `json:"status"`
-	Phase        string `json:"phase,omitempty"`
-	Progress     int    `json:"progress"`
-	ErrorCode    string `json:"errorCode,omitempty"`
-	ErrorMessage string `json:"errorMessage,omitempty"`
-	CreatedAt    int64  `json:"createdAt"`
-	UpdatedAt    int64  `json:"updatedAt,omitempty"`
+	ID             string `json:"id"`
+	BaseID         string `json:"baseId"`
+	Title          string `json:"title"`
+	SourceType     string `json:"sourceType"`
+	FileName       string `json:"fileName,omitempty"`
+	URL            string `json:"url,omitempty"`
+	ParentDirID    string `json:"parentDirectoryId,omitempty"`
+	SourcePath     string `json:"sourcePath,omitempty"`
+	CharCount      int    `json:"charCount"`
+	TokenCount     int    `json:"tokenCount,omitempty"`
+	ChunkCount     int    `json:"chunkCount"`
+	EmbeddingReady bool   `json:"embeddingReady"`
+	Status         string `json:"status"`
+	Phase          string `json:"phase,omitempty"`
+	Progress       int    `json:"progress"`
+	ErrorCode      string `json:"errorCode,omitempty"`
+	ErrorMessage   string `json:"errorMessage,omitempty"`
+	CreatedAt      int64  `json:"createdAt"`
+	UpdatedAt      int64  `json:"updatedAt,omitempty"`
 }
 
 // BaseSummary is the list view of a base.

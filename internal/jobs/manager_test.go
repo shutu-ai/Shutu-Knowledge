@@ -150,3 +150,62 @@ func TestIOJobsAreSerializedWithoutBlockingNormalJobs(t *testing.T) {
 		t.Fatal("second IO job did not start after the first released")
 	}
 }
+
+func TestSubmitDoesNotWaitForSQLiteWriter(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "knowledge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	manager := New(db, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO kv (key, value) VALUES (?, ?)`, "submit-lock", "held"); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	submitDone := make(chan struct{})
+	var id string
+	var submitErr error
+	go func() {
+		id, submitErr = manager.SubmitIOWithProgress("reindex_document", "base", 1, func(context.Context, func(ProgressUpdate)) error {
+			close(started)
+			return nil
+		})
+		close(submitDone)
+	}()
+
+	select {
+	case <-submitDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("job submission waited for the SQLite writer")
+	}
+	if submitErr != nil {
+		t.Fatal(submitErr)
+	}
+	job, ok := manager.Status(id)
+	if !ok || job.Status != StatusPending {
+		t.Fatalf("pending in-memory job was not visible: %+v %v", job, ok)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not start after the SQLite writer was released")
+	}
+}

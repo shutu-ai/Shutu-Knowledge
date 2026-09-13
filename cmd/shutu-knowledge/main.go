@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -72,13 +73,20 @@ func cmdServe(ctx context.Context) error {
 	server := web.New(application)
 	addr, err := server.Listen(application.Config.Server.Addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", application.Config.Server.Addr, err)
+		return formatListenError(application.Config.Server.Addr, err)
 	}
 	application.StartBackgroundRecovery()
 	application.StartBackgroundMaintenance()
 	application.Logger.Info("serve started", "addr", addr.String(), "home", application.Home)
 	<-ctx.Done()
 	return server.Shutdown(context.Background())
+}
+
+func formatListenError(addr string, err error) error {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return fmt.Errorf("listen %s: address already in use; stop the existing Knowledge server or configure a different server.addr: %w", addr, err)
+	}
+	return fmt.Errorf("listen %s: %w", addr, err)
 }
 
 func cmdExtension(ctx context.Context) error {

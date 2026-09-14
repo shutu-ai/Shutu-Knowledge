@@ -922,6 +922,14 @@ Validation after the fixed-generation search snapshot:
   web contract, targeted Web API test, and full browser lifecycle suite passed.
 
 ## Remaining Gates
+- C13 import empty-state follow-up: when no knowledge base was selected, the
+  Import route returned only the "select a knowledge base" message and omitted
+  the shared base picker, leaving no way to choose a base from that page. The
+  empty state now renders the base picker; when no bases exist it also offers a
+  navigation action to the base-creation page. Chrome/CDP E2E now enters Import
+  with a clean browser profile before creating a base and asserts that both the
+  selector and guidance are visible. Web contract and the full browser
+  lifecycle suite passed.
 
 The architecture plan is not complete until the following are evidenced:
 

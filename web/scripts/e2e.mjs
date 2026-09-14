@@ -308,6 +308,11 @@ async function run() {
     const evaluateWithArgs = async (args, body, awaitPromise = true) =>
       evaluate(page, `(() => { const args = ${JSON.stringify(args)}; return (async () => { ${body} })(); })()`, awaitPromise);
 
+    await navigate("import");
+    await waitForPageValue(page, "import without selected base", 10_000, `
+      document.querySelector('select[aria-label="Knowledge base"]') &&
+      document.body.innerText.includes("Select a knowledge base before importing.")
+    `);
     await navigate("bases");
     await waitForPageValue(page, "base creation form", 10_000,
       `[...document.querySelectorAll("#screen form h2")].some((item) => item.textContent === "New knowledge base")`);

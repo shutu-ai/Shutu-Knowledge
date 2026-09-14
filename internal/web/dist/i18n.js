@@ -97,6 +97,7 @@ const zh = {
   "Document deleted": "文档已删除",
   "Selected documents reindexed": "所选文档已重建索引",
   "Select a knowledge base before importing.": "导入前请先选择知识库。",
+  "No knowledge bases are available yet.": "还没有可用知识库。",
   "Content": "内容",
   "Import text": "导入文本",
   "Page URL": "页面 URL",

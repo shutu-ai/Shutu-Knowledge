@@ -898,7 +898,29 @@ async function renderPreview(container, doc, mode) {
 }
 
 async function renderImport() {
-  if (!state.selectedBaseId) { screen.append(h("div", { class: "empty panel" }, "Select a knowledge base before importing.")); return; }
+  if (!state.selectedBaseId) {
+    screen.append(h("section", { class: "section" }, [
+      h("div", { class: "section-head" }, [
+        h("h2", {}, localized("Import")),
+        basePicker(async (value) => {
+          syncBasePicker(value);
+          await render();
+        }),
+      ]),
+      h("div", { class: "empty panel" }, localized("Select a knowledge base before importing.")),
+    ]));
+    if (!state.bases.length) {
+      screen.append(h("section", { class: "section" }, h("div", { class: "empty panel" }, [
+        h("p", {}, localized("No knowledge bases are available yet.")),
+        h("button", {
+          class: "button primary",
+          type: "button",
+          onclick: () => { location.hash = "#/bases"; },
+        }, [icon(icons.plus), localized("Create base")]),
+      ])));
+    }
+    return;
+  }
   const base = selectedBase();
   screen.append(h("section", { class: "section toolbar" }, [basePicker(async (value) => { syncBasePicker(value); await render(); })]));
   screen.append(documentJobSection());

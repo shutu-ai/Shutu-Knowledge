@@ -2,6 +2,7 @@
 param(
     [string] $AgentRoot = "",
     [string] $KnowledgeRoot = "",
+    [switch] $SkipKnowledgeBuild,
     [switch] $OpenBrowser
 )
 
@@ -40,12 +41,6 @@ if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
 
 $knowledgeBinDir = Join-Path $KnowledgeRoot ".tmp"
 $knowledgeExe = Join-Path $knowledgeBinDir "shutu-knowledge.exe"
-$knowledgeInputs = @(
-    (Join-Path $KnowledgeRoot "cmd"),
-    (Join-Path $KnowledgeRoot "internal"),
-    (Join-Path $KnowledgeRoot "web\src"),
-    (Join-Path $KnowledgeRoot "extension.yaml")
-)
 
 function Remove-OrphanKnowledgeExtensions([string] $Executable) {
     $processes = Get-CimInstance Win32_Process -Filter "Name='shutu-knowledge.exe'" -ErrorAction SilentlyContinue |
@@ -81,16 +76,11 @@ function Assert-AgentWebPortAvailable([int] $Port) {
 
 Remove-OrphanKnowledgeExtensions $knowledgeExe
 Assert-AgentWebPortAvailable 18099
-$needsKnowledgeBuild = -not (Test-Path -LiteralPath $knowledgeExe -PathType Leaf)
-if (-not $needsKnowledgeBuild) {
-    $binaryTime = (Get-Item -LiteralPath $knowledgeExe).LastWriteTimeUtc
-    $newestInput = Get-ChildItem -LiteralPath $knowledgeInputs -File -Recurse |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    $needsKnowledgeBuild = $null -ne $newestInput -and $newestInput.LastWriteTimeUtc -gt $binaryTime
-}
+$needsKnowledgeBuild = -not $SkipKnowledgeBuild
 if ($needsKnowledgeBuild) {
     New-Item -ItemType Directory -Force -Path $knowledgeBinDir | Out-Null
+    $previousGoCache = $env:GOCACHE
+    $env:GOCACHE = Join-Path $KnowledgeRoot ".gocache"
     Push-Location $KnowledgeRoot
     try {
         & go build -trimpath -o $knowledgeExe ./cmd/shutu-knowledge
@@ -98,6 +88,11 @@ if ($needsKnowledgeBuild) {
             throw "Knowledge binary build failed"
         }
     } finally {
+        if ($null -eq $previousGoCache) {
+            Remove-Item Env:GOCACHE -ErrorAction SilentlyContinue
+        } else {
+            $env:GOCACHE = $previousGoCache
+        }
         Pop-Location
     }
 }

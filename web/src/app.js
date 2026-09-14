@@ -347,7 +347,7 @@ async function trackOperation(operation, label) {
 
 async function recoverOperations() {
   const { operations } = await api.operations({ states: ["queued", "running", "cancelling"] });
-  for (const operation of operations) {
+  for (const operation of operations ?? []) {
     trackOperation(operation, operation.type).catch((error) => showToast(error.message, true));
   }
 }
@@ -754,12 +754,12 @@ async function renderDocuments(generation = routeGeneration, baseId = state.sele
   ]);
   const documentTable = table(["", "Title", "Status", "Source", "Chunks", "Updated", "Actions"], visibleRows.map(({ doc, depth }) => h("tr", {},
       h("td", {}, doc.sourceType !== "directory" ? h("input", { name: "select", type: "checkbox", value: doc.id }) : null),
-      h("td", {}, documentTitle(doc, depth)),
-      h("td", {}, statusText(doc)),
-      h("td", {}, doc.sourceType),
-      h("td", {}, number(doc.chunkCount)),
-      h("td", { class: "muted" }, date(doc.updatedAt || doc.createdAt)),
-      h("td", {}, documentActions(doc)),
+      h("td", { "data-label": localized("Title") }, documentTitle(doc, depth)),
+      h("td", { "data-label": localized("Status") }, statusText(doc)),
+      h("td", { "data-label": localized("Source") }, doc.sourceType),
+      h("td", { "data-label": localized("Chunks") }, number(doc.chunkCount)),
+      h("td", { class: "muted", "data-label": localized("Updated") }, date(doc.updatedAt || doc.createdAt)),
+      h("td", { "data-label": localized("Actions") }, documentActions(doc)),
     )));
   documentTable.setAttribute("data-document-table", "");
   const documentRows = documentTable.querySelector("tbody");
@@ -785,12 +785,12 @@ async function renderDocuments(generation = routeGeneration, baseId = state.sele
       h("td", {}, doc.sourceType !== "directory" ? h("input", {
         name: "select", type: "checkbox", value: doc.id, checked: selected.has(doc.id),
       }) : null),
-      h("td", {}, documentTitle(doc, 0)),
-      h("td", {}, statusText(doc)),
-      h("td", {}, doc.sourceType),
-      h("td", {}, number(doc.chunkCount)),
-      h("td", { class: "muted" }, date(doc.updatedAt || doc.createdAt)),
-      h("td", {}, documentActions(doc)),
+      h("td", { "data-label": localized("Title") }, documentTitle(doc, 0)),
+      h("td", { "data-label": localized("Status") }, statusText(doc)),
+      h("td", { "data-label": localized("Source") }, doc.sourceType),
+      h("td", { "data-label": localized("Chunks") }, number(doc.chunkCount)),
+      h("td", { class: "muted", "data-label": localized("Updated") }, date(doc.updatedAt || doc.createdAt)),
+      h("td", { "data-label": localized("Actions") }, documentActions(doc)),
     )));
     documentPageSummary.textContent =
       `${number(next.offset + 1)}–${number(next.offset + next.documents.length)} / ${number(next.total)}`;

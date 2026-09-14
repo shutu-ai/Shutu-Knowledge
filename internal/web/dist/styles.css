@@ -282,6 +282,23 @@ tr.selected { background: #f5f7fb; box-shadow: inset 2px 0 0 var(--accent); }
   .sidebar { flex-wrap: wrap; gap: 10px; }
   .nav { flex-wrap: wrap; overflow: visible; }
   .settings-intro, .settings-form-footer { align-items: stretch; flex-direction: column; }
+  [data-document-table] thead { display: none; }
+  [data-document-table], [data-document-table] tbody { display: block; }
+  [data-document-table] tr {
+    display: grid; gap: 10px; margin: 0 10px 10px; padding: 12px;
+    border: 1px solid var(--border); border-radius: 10px;
+  }
+  [data-document-table] tr:last-child { margin-bottom: 0; }
+  [data-document-table] td {
+    display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px;
+    padding: 0; border: 0; white-space: normal;
+  }
+  [data-document-table] td::before {
+    content: attr(data-label); color: var(--muted); font-size: 12px; font-weight: 650;
+  }
+  [data-document-table] td:first-child::before { display: none; }
+  [data-document-table] .toolbar { align-items: flex-start; flex-direction: column; }
+  [data-document-table] .toolbar .button { width: 100%; justify-content: center; }
 }
 @media (prefers-color-scheme: dark) {
   :root {

@@ -612,6 +612,12 @@ async function run() {
       document.documentElement.scrollWidth <= window.innerWidth &&
       document.body.innerText.includes("检索范围")
     `);
+    await navigate("documents");
+    await waitForPageValue(page, "Chinese documents", 10_000,
+      `document.body.innerText.includes("Browser lifecycle document")`);
+    await navigate("import");
+    await waitForPageValue(page, "Chinese import", 10_000,
+      `document.body.innerText.includes("导入文本")`);
     await navigate("settings");
     await waitForPageValue(page, "Chinese settings", 10_000,
       `[...document.querySelectorAll("#screen h2")].some((item) => item.textContent === "全局设置")`);
@@ -623,6 +629,18 @@ async function run() {
     await waitForPageValue(page, "English settings", 10_000,
       `[...document.querySelectorAll("#screen h2")].some((item) => item.textContent === "Global settings")`);
 
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width: 390, height: 844, deviceScaleFactor: 2, mobile: true,
+    });
+    await navigate("documents");
+    await waitForPageValue(page, "mobile documents", 10_000,
+      `document.body.innerText.includes("Browser lifecycle document")`);
+    await navigate("import");
+    await waitForPageValue(page, "mobile import", 10_000,
+      `document.body.innerText.includes("Import text")`);
+    await page.send("Emulation.setDeviceMetricsOverride", {
+      width: 1440, height: 900, deviceScaleFactor: 1, mobile: false,
+    });
     await screenshot("lifecycle.png");
     const listedBases = await apiValue(apiPort, "/api/bases");
     const cleanupBase = listedBases.find((item) => item.name === "E2E Operations");

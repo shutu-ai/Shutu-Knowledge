@@ -910,6 +910,17 @@ Validation after the fixed-generation search snapshot:
   now asserts after every navigation that `#screen .loading-state` is absent;
   the web contract and full browser lifecycle suite passed.
 
+- C13 documents/import display follow-up: browser desktop and mobile screenshots
+  exposed `operations is not iterable` when the active-operation list was
+  empty, because the API serialized an absent Go slice as JSON `null`. The
+  list endpoint now emits `[]`, and startup recovery also tolerates a null
+  client payload. A new empty-list API contract test gates the JSON shape. The
+  same review found that mobile documents hid source, chunks, timestamps, and
+  actions behind horizontal table scrolling; at 640px the table now becomes a
+  labeled card per document with every field and action visible. Chrome/CDP
+  E2E adds Chinese and 390px-wide documents/import navigation checks, and the
+  web contract, targeted Web API test, and full browser lifecycle suite passed.
+
 ## Remaining Gates
 
 The architecture plan is not complete until the following are evidenced:

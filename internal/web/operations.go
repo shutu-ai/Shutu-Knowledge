@@ -440,6 +440,9 @@ func (s *Server) listOperations(w http.ResponseWriter, r *http.Request) {
 		writeOperationErr(w, err)
 		return
 	}
+	if operationsList == nil {
+		operationsList = []operations.Operation{}
+	}
 	writeOK(w, map[string]any{"operations": operationsList, "nextCursor": cursor})
 }
 

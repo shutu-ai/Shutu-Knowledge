@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -11,6 +12,39 @@ import (
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
+
+// Current storage-format envelope. Future migrations must update the persisted
+// singleton and these constants in the same release that changes the format.
+// These are compatibility contract versions, not migration counts.
+const (
+	CurrentStorageFormatVersion = 2
+	CurrentStorageReaderVersion = 6
+	CurrentStorageWriterVersion = 6
+	MinStorageReaderVersion     = 6
+	MinStorageWriterVersion     = 6
+)
+
+var (
+	// ErrSchemaTooNew means the database contains a migration this binary does
+	// not know. It must never be auto-downgraded or opened for recovery.
+	ErrSchemaTooNew = errors.New("storage schema is newer than this binary")
+	// ErrStorageTooNew means the persisted compatibility envelope requires a
+	// newer reader or writer than this binary provides.
+	ErrStorageTooNew = errors.New("storage format is newer than this binary")
+	// ErrStorageUnavailable means metadata is absent or not at a consistent
+	// migration state, so the database is not a safe rollback point.
+	ErrStorageUnavailable = errors.New("storage format is unavailable")
+)
+
+// StorageFormatInfo is the persisted rollback and compatibility envelope.
+type StorageFormatInfo struct {
+	FormatVersion       int    `json:"formatVersion"`
+	MinReaderVersion    int    `json:"minReaderVersion"`
+	MinWriterVersion    int    `json:"minWriterVersion"`
+	MigrationStatus     string `json:"migrationStatus"`
+	SchemaVersion       int    `json:"schemaVersion"`
+	SupportedMigrations int    `json:"supportedMigrations"`
+}
 
 type migration struct {
 	version int
@@ -58,6 +92,14 @@ func Migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	supported := len(migrations)
+	var currentVersion int
+	if err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&currentVersion); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if currentVersion > supported {
+		return fmt.Errorf("%w: database version %d, supported version %d", ErrSchemaTooNew, currentVersion, supported)
+	}
 	for _, m := range migrations {
 		var applied int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, m.version).Scan(&applied); err != nil {
@@ -82,7 +124,7 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("commit migration %d: %w", m.version, err)
 		}
 	}
-	return nil
+	return validateStorageFormat(db)
 }
 
 // SchemaVersion reports the highest applied migration version (0 when none).
@@ -90,4 +132,47 @@ func SchemaVersion(db *sql.DB) (int, error) {
 	var v int
 	err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
 	return v, err
+}
+
+// StorageFormat returns the persisted compatibility envelope and the highest
+// applied migration for startup, health, doctor, and rollback drills.
+func StorageFormat(db *sql.DB) (StorageFormatInfo, error) {
+	var info StorageFormatInfo
+	err := db.QueryRow(`SELECT format_version, min_reader_version, min_writer_version,
+		migration_status FROM storage_format WHERE id = 1`).Scan(
+		&info.FormatVersion, &info.MinReaderVersion, &info.MinWriterVersion,
+		&info.MigrationStatus)
+	if err != nil {
+		return StorageFormatInfo{}, fmt.Errorf("%w: %s", ErrStorageUnavailable, err)
+	}
+	info.SchemaVersion, err = SchemaVersion(db)
+	if err != nil {
+		return StorageFormatInfo{}, err
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		return StorageFormatInfo{}, err
+	}
+	info.SupportedMigrations = len(migrations)
+	return info, nil
+}
+
+func validateStorageFormat(db *sql.DB) error {
+	info, err := StorageFormat(db)
+	if err != nil {
+		return err
+	}
+	if info.MigrationStatus != "ready" {
+		return fmt.Errorf("%w: migration status %q", ErrStorageUnavailable, info.MigrationStatus)
+	}
+	if info.FormatVersion > CurrentStorageFormatVersion ||
+		info.MinReaderVersion > CurrentStorageReaderVersion || info.MinWriterVersion > CurrentStorageWriterVersion {
+		return fmt.Errorf("%w: format=%d min_reader=%d min_writer=%d",
+			ErrStorageTooNew, info.FormatVersion, info.MinReaderVersion, info.MinWriterVersion)
+	}
+	if info.SchemaVersion > info.SupportedMigrations {
+		return fmt.Errorf("%w: database version %d, supported version %d",
+			ErrSchemaTooNew, info.SchemaVersion, info.SupportedMigrations)
+	}
+	return nil
 }

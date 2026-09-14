@@ -21,8 +21,10 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/logging"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
+	"github.com/shutu-ai/shutu-knowledge/internal/scheduler"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -31,17 +33,20 @@ type Logger = logging.Logger
 
 // App owns the shared runtime components.
 type App struct {
-	Home      string
-	Config    config.Config
-	Logger    *Logger
-	DB        *storage.DB
-	RawStore  *storage.RawFileStore
-	Health    *health.Registry
-	Jobs      *jobs.Manager
-	Knowledge *knowledge.Service
-	Models    *models.Manager
-	Ollama    *models.Ollama
-	Runtime   runtime.Controller
+	Home           string
+	Config         config.Config
+	Logger         *Logger
+	DB             *storage.DB
+	RawStore       *storage.RawFileStore
+	Health         *health.Registry
+	Jobs           *jobs.Manager
+	Operations     *operations.Service
+	Knowledge      *knowledge.Service
+	Models         *models.Manager
+	Ollama         *models.Ollama
+	Runtime        runtime.Controller
+	instanceLock   *storage.InstanceLock
+	modelAdmission scheduler.Admission
 	// ManagedRuntime reports whether Knowledge prepared its own pinned runtime
 	// rather than using an explicitly configured deployment helper.
 	ManagedRuntime  bool
@@ -49,6 +54,9 @@ type App struct {
 	startupDone     chan struct{}
 	maintenanceOnce sync.Once
 	maintenanceDone chan struct{}
+	// deleteDocumentBoundary is a test-only synchronization point at the
+	// durable fence/cleanup boundary. Production leaves it nil.
+	deleteDocumentBoundary func()
 }
 
 // New resolves config, opens storage, and registers core health checkers.
@@ -79,23 +87,44 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 	}
 	logger := logging.New(cfg.Logging.Level)
 
+	instanceLock, err := storage.AcquireInstanceLock(filepath.Join(home, "instance.lock.db"))
+	if err != nil {
+		return nil, err
+	}
+
 	db, err := storage.Open(cfg.DatabasePath(home))
 	if err != nil {
+		_ = instanceLock.Release()
 		return nil, fmt.Errorf("open storage: %w", err)
 	}
 	raw, err := storage.NewRawFileStore(cfg.RawStoreDir(home))
 	if err != nil {
 		_ = db.Close()
+		_ = instanceLock.Release()
 		return nil, err
 	}
 
-	application := &App{Home: home, Config: cfg, Logger: logger, DB: db, RawStore: raw, Health: health.NewRegistry()}
+	application := &App{Home: home, Config: cfg, Logger: logger, DB: db, RawStore: raw, Health: health.NewRegistry(), instanceLock: instanceLock}
 	application.registerHealth()
 	application.Jobs = jobs.New(db, cfg.Jobs.ImportWorkers)
 	application.Knowledge = knowledge.NewService(db, raw, cfg, application.Jobs)
+	application.modelAdmission = scheduler.NewSemaphore(cfg.Scheduler.Model)
+	application.Knowledge.SetSharedModelAdmission(application.modelAdmission)
 	application.Jobs.SetFailureObserver(application.Knowledge.ObserveJobFailure)
+	application.Operations, err = application.newOperationService()
+	if err != nil {
+		_ = db.Close()
+		_ = instanceLock.Release()
+		return nil, err
+	}
 	if err := application.Jobs.Start(ctx); err != nil {
 		_ = db.Close()
+		_ = instanceLock.Release()
+		return nil, err
+	}
+	if err := application.Operations.Start(ctx); err != nil {
+		_ = db.Close()
+		_ = instanceLock.Release()
 		return nil, err
 	}
 	application.Models = models.NewManager(application.modelCacheDir(), cfg.Models.HFEndpoint, nil)
@@ -498,6 +527,14 @@ func (a *App) registerHealth() {
 			return os.Remove(probe)
 		},
 	})
+	a.Health.Register(health.CheckerFunc{
+		CheckName: "storage-format",
+		Level:     health.Critical,
+		Fn: func(context.Context) error {
+			_, err := storage.StorageFormat(a.DB.DB)
+			return err
+		},
+	})
 	// Index and model subsystems register in their own phases; optional
 	// checks degrade without flipping readiness.
 }
@@ -528,6 +565,12 @@ func (a *App) UpdateConfig(cfg config.Config) error {
 
 func (a *App) modelCacheDir() string {
 	return a.resolveModelCacheDir(a.Config.Models.CacheDir)
+}
+
+// ResolveModelCacheDir lets transport adapters persist an absolute migration
+// target so recovery does not reinterpret it after configuration changes.
+func (a *App) ResolveModelCacheDir(path string) string {
+	return a.resolveModelCacheDir(path)
 }
 
 func (a *App) resolveModelCacheDir(path string) string {
@@ -910,7 +953,13 @@ func (a *App) Close() {
 	if a.Jobs != nil {
 		a.Jobs.Stop()
 	}
+	if a.Operations != nil {
+		a.Operations.Stop()
+	}
 	if a.DB != nil {
 		_ = a.DB.Close()
+	}
+	if a.instanceLock != nil {
+		_ = a.instanceLock.Release()
 	}
 }

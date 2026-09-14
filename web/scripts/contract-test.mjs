@@ -20,6 +20,10 @@ if (!index.includes('id="return-agent"') || !index.includes('href="/"') || !inde
 }
 const app = await readFile(new URL("../../internal/web/dist/app.js", import.meta.url), "utf8");
 const api = await readFile(new URL("../../internal/web/dist/api.js", import.meta.url), "utf8");
+const buildInfo = JSON.parse(await readFile(new URL("../../internal/web/dist/build-info.json", import.meta.url), "utf8"));
+if (typeof buildInfo.buildId !== "string" || !/^[0-9a-f]{64}$/.test(buildInfo.buildId)) {
+  throw new Error("web build manifest must contain a SHA-256 buildId");
+}
 if (!api.includes("extensionPrefix") || !api.includes("fetch(endpoint(path)")) {
   throw new Error("extension API requests must preserve the reverse-proxy prefix");
 }

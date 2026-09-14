@@ -18,6 +18,8 @@ type MetricsSnapshot struct {
 	CandidateCount      int64 `json:"candidateCount"`
 	ContextCount        int64 `json:"contextCount"`
 	ModelErrors         int64 `json:"modelErrors"`
+	ModelSchedulerWaits int64 `json:"modelSchedulerWaits"`
+	SearchTimeouts      int64 `json:"searchTimeouts"`
 	JobFailures         int64 `json:"jobFailures"`
 }
 

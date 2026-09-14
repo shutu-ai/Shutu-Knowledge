@@ -83,10 +83,10 @@ func toolDefinitions() []extension.ToolDefinition {
 			"name":        stringProperty("Short base name."),
 			"description": stringProperty("What the base contains."),
 		}, "name"), extension.ToolRiskWrite, false),
-		tool("knowledge_delete_base", "Delete a knowledge base and every document, chunk, and raw source it owns. This is irreversible.", objectSchema(map[string]any{
+		tool("knowledge_delete_base", "Submit durable deletion of a knowledge base and every document, chunk, and raw source it owns. This is irreversible; use the operation status tool to await cleanup.", objectSchema(map[string]any{
 			"baseId": stringProperty("Base id to delete."),
 		}, "baseId"), extension.ToolRiskDestructive, true),
-		tool("knowledge_add_document", "Add a text document to a base; the normal parse/chunk/embed pipeline runs automatically.", objectSchema(map[string]any{
+		tool("knowledge_add_document", "Submit a durable text import; use the operation status tool to await parse/chunk/embed completion.", objectSchema(map[string]any{
 			"baseId":  stringProperty("Target base id."),
 			"title":   stringProperty("Document title."),
 			"content": stringProperty("Full document text."),
@@ -94,16 +94,16 @@ func toolDefinitions() []extension.ToolDefinition {
 		tool("knowledge_list_documents", "List documents in one base, including document ids and counts.", objectSchema(map[string]any{
 			"baseId": stringProperty("Base id."),
 		}, "baseId"), extension.ToolRiskRead, false),
-		tool("knowledge_delete_document", "Delete one document and its chunks and raw source. This is irreversible.", objectSchema(map[string]any{
+		tool("knowledge_delete_document", "Submit a durable document deletion; cleanup continues after the logical delete is accepted.", objectSchema(map[string]any{
 			"baseId":     stringProperty("Owning base id, used to validate the request."),
 			"documentId": stringProperty("Document id to delete."),
 		}, "baseId", "documentId"), extension.ToolRiskDestructive, true),
-		tool("knowledge_import_url", "Fetch a URL, extract its text, and import it as a document.", objectSchema(map[string]any{
+		tool("knowledge_import_url", "Submit a durable URL import; use the operation status tool to await the document result.", objectSchema(map[string]any{
 			"baseId": stringProperty("Target base id."),
 			"url":    stringProperty("HTTP or HTTPS URL to fetch."),
 			"title":  stringProperty("Optional title; defaults to the page title."),
 		}, "baseId", "url"), extension.ToolRiskWrite, false),
-		tool("knowledge_refresh_url", "Re-fetch a URL document and update it only when origin content changed.", objectSchema(map[string]any{
+		tool("knowledge_refresh_url", "Submit a durable URL refresh; use the operation status tool to await the result.", objectSchema(map[string]any{
 			"documentId": stringProperty("URL document id."),
 		}, "documentId"), extension.ToolRiskWrite, false),
 		tool("knowledge_stats", "Report document, chunk, character, token, and embedding statistics for one base or all enabled bases.", objectSchema(map[string]any{
@@ -129,13 +129,26 @@ func toolDefinitions() []extension.ToolDefinition {
 			"maxMatches": integerProperty("Maximum matches returned.", 1, 200),
 			"ignoreCase": map[string]any{"type": "boolean", "description": "Case-insensitive matching; defaults to true."},
 		}, "documentId"), extension.ToolRiskRead, false),
-		tool("knowledge_reindex_document", "Re-parse, re-chunk, and re-embed one document using current configuration.", objectSchema(map[string]any{
+		tool("knowledge_reindex_document", "Submit a durable document re-index using current configuration.", objectSchema(map[string]any{
 			"baseId":     stringProperty("Owning base id, used to validate the request."),
 			"documentId": stringProperty("Document id to reindex."),
 		}, "baseId", "documentId"), extension.ToolRiskWrite, false),
-		tool("knowledge_reindex_base", "Re-parse, re-chunk, and re-embed every document in one base using current configuration.", objectSchema(map[string]any{
+		tool("knowledge_reindex_base", "Submit durable re-parse, re-chunk, and re-embed of every active document in one base using current configuration.", objectSchema(map[string]any{
 			"baseId": stringProperty("Base id to reindex."),
 		}, "baseId"), extension.ToolRiskWrite, false),
+		tool("knowledge_maintenance_storage", "Run a durable storage reconciliation scan. Quarantine unreferenced source files by default; dry-run only reports them, and purge permanently removes the quarantine area.", objectSchema(map[string]any{
+			"dryRun":          map[string]any{"type": "boolean", "description": "Report orphan and quarantine counts without changing files."},
+			"purgeQuarantine": map[string]any{"type": "boolean", "description": "Permanently remove files previously moved to quarantine."},
+		}), extension.ToolRiskDestructive, true),
+		tool("knowledge_operation_status", "Read the durable state, progress, error, and result for one Knowledge operation.", objectSchema(map[string]any{
+			"operationId": stringProperty("Operation id returned by an asynchronous task."),
+		}, "operationId"), extension.ToolRiskRead, false),
+		tool("knowledge_operation_cancel", "Request cancellation of a queued or running Knowledge operation.", objectSchema(map[string]any{
+			"operationId": stringProperty("Operation id to cancel."),
+		}, "operationId"), extension.ToolRiskWrite, false),
+		tool("knowledge_operation_retry", "Retry a failed or interrupted Knowledge operation from its persisted command.", objectSchema(map[string]any{
+			"operationId": stringProperty("Operation id to retry."),
+		}, "operationId"), extension.ToolRiskWrite, false),
 	}
 }
 

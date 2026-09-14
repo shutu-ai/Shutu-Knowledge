@@ -568,6 +568,9 @@ func (m *Manager) Close() {
 	m.mu.Unlock()
 	for _, helper := range helpers {
 		helper.close()
+		if helper.wait != nil {
+			<-helper.wait
+		}
 	}
 	<-m.done
 }

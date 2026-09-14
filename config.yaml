@@ -46,6 +46,7 @@ retrieval:
   rrfVectorWeight: 1
   siblingChunks: 1
   contextTimeoutMs: 4000
+  searchTimeoutMs: 8000
 processing:
   provider: builtin
   apiKey: ""
@@ -63,10 +64,22 @@ models:
   cacheDir: ""
   hfEndpoint: ""
   workerIdleTimeoutMs: 60000
+scheduler:
+  io: 2
+  dbWrite: 1
+  disk: 1
+  network: 2
+  model: 1
+  modelWaitMs: 2000
+  maintenance: 1
+  maxPerBase: 2
+  queueLimit: 1000
+  idempotencyRetentionHours: 168
 maintenance:
   ftsAutoOptimize: true
   vacuum: true
   vacuumThresholdMB: 256
+  quarantineRetentionHours: 168
 runtime:
   helperCommand: ""
   offline: false

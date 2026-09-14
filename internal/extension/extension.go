@@ -25,7 +25,7 @@ func Manifest() extension.Manifest {
 	var m extension.Manifest
 	m.ID = ExtensionID
 	m.Name = "Shutu Knowledge"
-	m.Version = version.Version
+	m.Version = version.ExtensionVersion()
 	m.Description = "Knowledge bases, documents, hybrid retrieval, and model tools for shutu-agent"
 	m.ExtensionAPI = extension.APIVersion
 	m.Capabilities.Lifecycle = true

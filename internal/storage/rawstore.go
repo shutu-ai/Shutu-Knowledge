@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // RawFileStore persists original source bytes: "import means copy". Files
@@ -15,6 +16,16 @@ import (
 type RawFileStore struct {
 	root string
 }
+
+// Publish hooks are test-only fault-injection points for real process-kill
+// drills. Production never installs them.
+var (
+	testRawBeforePublish func()
+	testRawAfterPublish  func()
+
+	testQuarantineBeforeMove func(sourceRel, destinationRel string)
+	testQuarantineAfterMove  func(sourceRel, destinationRel string)
+)
 
 // NewRawFileStore creates the root directory if needed.
 func NewRawFileStore(root string) (*RawFileStore, error) {
@@ -58,6 +69,26 @@ func (s *RawFileStore) Write(baseID, docID, ext string, data []byte) (string, er
 	return rel, s.writeRel(rel, data)
 }
 
+// WriteVersion stores one immutable published source version. Re-indexing
+// writes a new version instead of replacing bytes already named by an old
+// generation citation. Callers still publish metadata by transaction.
+func (s *RawFileStore) WriteVersion(baseID, docID string, sourceVersion int64, ext string, data []byte) (string, error) {
+	if err := validateSegment(baseID); err != nil {
+		return "", err
+	}
+	if err := validateSegment(docID); err != nil {
+		return "", err
+	}
+	if sourceVersion <= 0 {
+		return "", fmt.Errorf("invalid raw source version %d", sourceVersion)
+	}
+	rel := fmt.Sprintf("%s/.generations/%s/v%020d%s", baseID, docID, sourceVersion, sanitizeExt(ext))
+	if _, err := s.pathOf(rel); err != nil {
+		return "", err
+	}
+	return rel, s.writeRel(rel, data)
+}
+
 // WriteRel stores bytes at a caller-chosen base-relative path, preserving a
 // directory import's on-disk tree.
 func (s *RawFileStore) WriteRel(baseID, relativePath string, data []byte) (string, error) {
@@ -79,8 +110,40 @@ func (s *RawFileStore) writeRel(relativePath string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
 		return fmt.Errorf("create raw dir: %w", err)
 	}
-	if err := os.WriteFile(full, data, 0o600); err != nil {
+
+	// Raw bytes are immutable inputs for recovery and reindexing. Stage in the
+	// destination directory and publish with rename so a crash exposes either
+	// the complete previous file or the complete new file, never a truncation.
+	temp, err := os.CreateTemp(filepath.Dir(full), "."+filepath.Base(full)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create raw temp file: %w", err)
+	}
+	tempName := temp.Name()
+	published := false
+	defer func() {
+		_ = temp.Close()
+		if !published {
+			_ = os.Remove(tempName)
+		}
+	}()
+	if _, err := temp.Write(data); err != nil {
 		return fmt.Errorf("write raw file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync raw file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close raw file: %w", err)
+	}
+	if testRawBeforePublish != nil {
+		testRawBeforePublish()
+	}
+	if err := os.Rename(tempName, full); err != nil {
+		return fmt.Errorf("publish raw file: %w", err)
+	}
+	published = true
+	if testRawAfterPublish != nil {
+		testRawAfterPublish()
 	}
 	return nil
 }
@@ -99,6 +162,22 @@ func (s *RawFileStore) Read(relativePath string) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// Size reports one active raw file without reading its bytes.
+func (s *RawFileStore) Size(relativePath string) (int64, error) {
+	full, err := s.pathOf(relativePath)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(full)
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, fmt.Errorf("raw path is a directory: %s", relativePath)
+	}
+	return info.Size(), nil
 }
 
 // Delete removes one raw file (missing = no-op).
@@ -140,10 +219,152 @@ func (s *RawFileStore) ListAll() ([]string, error) {
 		if err != nil {
 			return err
 		}
-		out = append(out, filepath.ToSlash(rel))
+		relSlash := filepath.ToSlash(rel)
+		if relSlash == QuarantineDir || strings.HasPrefix(relSlash+"/", QuarantineDir+"/") {
+			return nil
+		}
+		out = append(out, relSlash)
 		return nil
 	})
 	return out, err
+}
+
+// QuarantineDir is the reserved recovery area. Files here remain on disk for
+// inspection or retention-bound purge, but are never active source bytes.
+const QuarantineDir = "quarantine"
+
+// Quarantine moves a raw source out of the active tree. It returns the
+// quarantine-relative path and original byte size so maintenance results can
+// account for recovered disk space without trusting unbounded listings.
+func (s *RawFileStore) Quarantine(relativePath string) (string, int64, error) {
+	source, err := s.pathOf(relativePath)
+	if err != nil {
+		return "", 0, err
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return "", 0, err
+	}
+	if info.IsDir() {
+		return "", 0, fmt.Errorf("cannot quarantine directory: %s", relativePath)
+	}
+	cleanRelative := filepath.ToSlash(relativePath)
+	destinationRelative := QuarantineDir + "/" + cleanRelative
+	for attempt := 0; ; attempt++ {
+		candidate := destinationRelative
+		if attempt > 0 {
+			candidate = fmt.Sprintf("%s.%d", destinationRelative, attempt)
+		}
+		destination, err := s.pathOf(candidate)
+		if err != nil {
+			return "", 0, err
+		}
+		if _, statErr := os.Stat(destination); statErr == nil {
+			continue
+		} else if !os.IsNotExist(statErr) {
+			return "", 0, statErr
+		}
+		if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+			return "", 0, fmt.Errorf("create quarantine dir: %w", err)
+		}
+		if testQuarantineBeforeMove != nil {
+			testQuarantineBeforeMove(cleanRelative, candidate)
+		}
+		if err := os.Rename(source, destination); err != nil {
+			return "", 0, fmt.Errorf("quarantine raw file: %w", err)
+		}
+		if testQuarantineAfterMove != nil {
+			testQuarantineAfterMove(cleanRelative, candidate)
+		}
+		return candidate, info.Size(), nil
+	}
+}
+
+// QuarantineStats reports the retained recovery area. It is O(quarantine
+// size), never the active raw-store size.
+func (s *RawFileStore) QuarantineStats() (int, int64, error) {
+	root := filepath.Join(s.root, QuarantineDir)
+	var count int
+	var bytes int64
+	err := filepath.WalkDir(root, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		count++
+		bytes += info.Size()
+		return nil
+	})
+	return count, bytes, err
+}
+
+// PurgeQuarantine permanently removes retained recovery copies. Callers must
+// expose this as an explicit operation; reconciliation defaults to quarantine.
+func (s *RawFileStore) PurgeQuarantine() error {
+	if err := os.RemoveAll(filepath.Join(s.root, QuarantineDir)); err != nil {
+		return fmt.Errorf("purge raw quarantine: %w", err)
+	}
+	return nil
+}
+
+// PurgeExpiredQuarantine removes only recovery copies older than the cutoff.
+// This bounds retained disk without forcing every scan into an immediate purge.
+func (s *RawFileStore) PurgeExpiredQuarantine(cutoff time.Time) (int, int64, error) {
+	root := filepath.Join(s.root, QuarantineDir)
+	var count int
+	var bytes int64
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		count++
+		bytes += info.Size()
+		return removeEmptyParentDirs(root, filepath.Dir(path))
+	})
+	return count, bytes, err
+}
+
+func removeEmptyParentDirs(root, current string) error {
+	for {
+		cleanCurrent := filepath.Clean(current)
+		cleanRoot := filepath.Clean(root)
+		if cleanCurrent == cleanRoot || !strings.HasPrefix(cleanCurrent, cleanRoot+string(os.PathSeparator)) {
+			return nil
+		}
+		entries, err := os.ReadDir(cleanCurrent)
+		if err != nil || len(entries) != 0 {
+			return err
+		}
+		if err := os.Remove(cleanCurrent); err != nil {
+			return err
+		}
+		current = filepath.Dir(cleanCurrent)
+	}
 }
 
 func validateSegment(segment string) error {

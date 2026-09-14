@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -95,6 +96,53 @@ func (s *Service) AddUrlDocument(ctx context.Context, baseID, rawURL, title stri
 	return doc, nil
 }
 
+// AddUrlDocumentWithID imports an already captured immutable URL source. A
+// durable operation preallocates the ID so a restart after publish returns the
+// same document instead of fetching and creating a second copy.
+func (s *Service) AddUrlDocumentWithID(ctx context.Context, baseID, id, rawURL, title string, body []byte) (Document, error) {
+	if _, err := s.store.getBase(baseID); err != nil {
+		return Document{}, err
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return Document{}, fmt.Errorf("url is required")
+	}
+	if id == "" {
+		var err error
+		id, err = newID()
+		if err != nil {
+			return Document{}, err
+		}
+	}
+	var doc Document
+	existing, err := s.store.getDocument(id)
+	if err == nil {
+		if doc.Status == StatusReady {
+			return existing, nil
+		}
+		doc = existing
+	} else if !errors.Is(err, ErrNotFound) {
+		return Document{}, err
+	} else {
+		doc = s.newDocument(baseID, strings.TrimSpace(title), "url")
+	}
+	doc.ID = id
+	doc.BaseID = baseID
+	doc.SourceType = "url"
+	doc.Title = strings.TrimSpace(title)
+	doc.TitleLocked = strings.TrimSpace(title) != ""
+	doc.URL = rawURL
+	doc.FileName = fileNameForURL(rawURL)
+	doc.Status = StatusPending
+	if doc.CreatedAt == 0 {
+		doc.CreatedAt = now()
+	}
+	if err := s.ingestFetched(ctx, &doc, body); err != nil {
+		return Document{}, err
+	}
+	return doc, nil
+}
+
 // RefreshUrlDocument re-fetches one URL document; unchanged content skips
 // re-chunking (incremental update).
 func (s *Service) RefreshUrlDocument(ctx context.Context, id string) (bool, Document, error) {
@@ -116,6 +164,30 @@ func (s *Service) RefreshUrlDocument(ctx context.Context, id string) (bool, Docu
 	}
 	if err := s.ingestFetched(ctx, &doc, body); err != nil {
 		return false, doc, err
+	}
+	return true, doc, nil
+}
+
+// RefreshUrlDocumentFromCapture replays a fixed captured source. It is the
+// crash-safe branch used by persistent URL refresh operations.
+func (s *Service) RefreshUrlDocumentFromCapture(ctx context.Context, id, finalURL string, body []byte) (bool, Document, error) {
+	doc, err := s.store.getDocument(id)
+	if err != nil {
+		return false, Document{}, err
+	}
+	if doc.SourceType != "url" {
+		return false, Document{}, fmt.Errorf("document %s is not a url source", id)
+	}
+	sum := sha256.Sum256(body)
+	if doc.ContentHash == hex.EncodeToString(sum[:]) {
+		return false, doc, nil
+	}
+	if strings.TrimSpace(finalURL) != "" {
+		doc.URL = finalURL
+		doc.FileName = fileNameForURL(finalURL)
+	}
+	if err := s.ingestFetched(ctx, &doc, body); err != nil {
+		return false, Document{}, err
 	}
 	return true, doc, nil
 }

@@ -12,7 +12,7 @@ release gates, and
 [shutu_knowledge_implementation_report.md](shutu_knowledge_implementation_report.md)
 records the current evidence-backed conclusion.
 
-Release version: **0.1.1**.
+Release version: **0.2.0** (candidate build `0.2.0-rc.1+storage.v2`).
 
 Out-of-box runtime status: **ready**. Knowledge automatically manages local ML,
 OCR, PDF rendering, and Office conversion without user-authored helpers. See

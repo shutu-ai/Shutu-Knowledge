@@ -43,7 +43,7 @@ func main() {
 	case "doctor":
 		err = cmdDoctor(ctx)
 	case "version":
-		fmt.Println(version.Version)
+		err = cmdVersion()
 	default:
 		usage()
 		os.Exit(2)
@@ -52,6 +52,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func cmdVersion() error {
+	buildJSON, err := json.MarshalIndent(version.Current(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode version: %w", err)
+	}
+	fmt.Println(string(buildJSON))
+	return nil
 }
 
 func usage() {
@@ -128,6 +137,12 @@ func cmdDoctor(ctx context.Context) error {
 		return err
 	}
 	fmt.Println("schema version:", v)
+	format, err := storage.StorageFormat(application.DB.DB)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("storage format: version=%d min_reader=%d min_writer=%d status=%s\n",
+		format.FormatVersion, format.MinReaderVersion, format.MinWriterVersion, format.MigrationStatus)
 	raws, err := application.RawStore.ListAll()
 	if err != nil {
 		return err

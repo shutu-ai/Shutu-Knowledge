@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"regexp"
@@ -117,12 +118,13 @@ func escapeLike(term string) string {
 }
 
 const laneSelect = `SELECT c.id, c.doc_id, c.base_id, c.idx, c.text, COALESCE(c.heading, ''),
-	COALESCE(c.context, ''), COALESCE(c.embedding_text_hash, ''), c.created_at, c.embedding`
+	COALESCE(c.context, ''), COALESCE(c.embedding_text_hash, ''), c.created_at, c.embedding,
+	c.index_generation, d.source_version`
 
 // LexicalSearch runs the FTS5 trigram BM25 lane. Nil scopes are unrestricted;
 // explicitly empty scopes match nothing. Returns best-first with the score
 // mapped into [0,1).
-func (s *store) LexicalSearch(query string, baseIDs, docIDs []string, limit int) ([]LaneHit, error) {
+func (s *store) LexicalSearch(ctx context.Context, q queryRunner, query string, baseIDs, docIDs []string, limit int) ([]LaneHit, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
@@ -136,7 +138,10 @@ func (s *store) LexicalSearch(query string, baseIDs, docIDs []string, limit int)
 	}
 	querySQL := laneSelect + `, bm25(chunk_fts) AS fts_score
 		FROM chunk_fts JOIN chunks c ON c.rowid = chunk_fts.rowid
-		WHERE 1 = 1` + scope
+		JOIN documents d ON d.id = c.doc_id
+		JOIN bases b ON b.id = c.base_id
+		WHERE d.lifecycle_state = 'active' AND b.lifecycle_state = 'active'
+		AND c.index_generation = d.active_index_generation` + scope
 	if len(matchTerms) > 0 {
 		quoted := make([]string, 0, len(matchTerms))
 		for _, term := range matchTerms {
@@ -151,7 +156,7 @@ func (s *store) LexicalSearch(query string, baseIDs, docIDs []string, limit int)
 	}
 	querySQL += " ORDER BY fts_score LIMIT ?"
 	args = append(args, limit)
-	rows, err := s.db.Query(querySQL, args...)
+	rows, err := q.QueryContext(ctx, querySQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("lexical lane: %w", err)
 	}
@@ -162,7 +167,8 @@ func (s *store) LexicalSearch(query string, baseIDs, docIDs []string, limit int)
 		var ftsScore float64
 		var embedding []byte
 		if err := rows.Scan(&hit.ID, &hit.DocID, &hit.BaseID, &hit.Index, &hit.Text, &hit.Heading,
-			&hit.Context, &hit.EmbeddingHash, &hit.CreatedAt, &embedding, &ftsScore); err != nil {
+			&hit.Context, &hit.EmbeddingHash, &hit.CreatedAt, &embedding,
+			&hit.IndexGeneration, &hit.SourceVersion, &ftsScore); err != nil {
 			return nil, err
 		}
 		if len(embedding) > 0 {

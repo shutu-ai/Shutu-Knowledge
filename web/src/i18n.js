@@ -53,6 +53,7 @@ const zh = {
   "Group": "分组",
   "New name": "新名称",
   "Rename": "重命名",
+  "Retry": "重试",
   "Delete": "删除",
   "Delete group": "删除分组",
   "Ungrouped": "未分组",
@@ -76,7 +77,6 @@ const zh = {
   "Rescan": "重新扫描",
   "Refresh": "刷新",
   "Text": "文本",
-  "Chunks": "块",
   "Rename document": "重命名文档",
   "Reindex": "重建索引",
   "Delete selected": "删除所选",
@@ -328,7 +328,6 @@ const zh = {
   "local": "本地",
   "none": "无",
   "No items yet": "暂无项目",
-  "Delete group": "删除分组",
 };
 
 const patterns = [

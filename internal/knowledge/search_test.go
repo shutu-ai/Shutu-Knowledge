@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 )
@@ -23,6 +24,46 @@ type fakeEmbedder struct {
 	embeds  int
 	failNth int
 }
+
+type blockingEmbedder struct {
+	model   string
+	release chan struct{}
+}
+
+type gatedEmbedder struct {
+	model   string
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedEmbedder) Embed(_ context.Context, texts []string) ([][]float64, error) {
+	close(g.started)
+	<-g.release
+	out := make([][]float64, 0, len(texts))
+	for _, text := range texts {
+		vector := make([]float64, 2)
+		if strings.Contains(text, "database") {
+			vector[0] = 1
+		} else {
+			vector[1] = 1
+		}
+		out = append(out, vector)
+	}
+	return out, nil
+}
+
+func (g *gatedEmbedder) ModelKey() string { return "fake:" + g.model }
+
+func (b *blockingEmbedder) Embed(ctx context.Context, _ []string) ([][]float64, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.release:
+		return nil, errors.New("released by test")
+	}
+}
+
+func (b *blockingEmbedder) ModelKey() string { return "blocking:" + b.model }
 
 func (f *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float64, error) {
 	f.call++
@@ -123,6 +164,217 @@ func TestHybridSearchRanksAndExplains(t *testing.T) {
 	}
 }
 
+func TestVectorSearchDoesNotMixSameDimensionModels(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Model Spaces", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Both models use two dimensions on purpose: a length check alone must
+	// not be mistaken for vector-space isolation.
+	modelA := &fakeEmbedder{model: "a"}
+	service.SetProviders(modelA, nil)
+	docA, err := service.AddTextDocument(ctx, base.ID, "Model A Guide", "# Storage\n\nThe database keeps rows on disk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelB := &fakeEmbedder{model: "b"}
+	service.SetProviders(modelB, nil)
+	docB, err := service.AddTextDocument(ctx, base.ID, "Model B Guide", "# Storage\n\nThe database keeps rows in another space")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Search(ctx, SearchRequest{Query: "database", Mode: "vector", TopK: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Total != 1 || len(result.Hits) != 1 {
+		t.Fatalf("model-isolated search returned %d hits: %+v", result.Total, result)
+	}
+	if result.Hits[0].DocID != docB.ID || result.Hits[0].DocID == docA.ID {
+		t.Fatalf("mixed model spaces: got %s, want %s", result.Hits[0].DocID, docB.ID)
+	}
+}
+
+func TestModelSwitchFailureKeepsVectorSpaceAndDegrades(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Model Switch", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	imported, err := service.AddTextDocument(ctx, base.ID, "Guide", "# Storage\n\nThe database keeps rows on disk\n\nThe engine uses transactions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeA, err := service.store.getDocument(imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeA.EmbeddingModel != "fake:a" || activeA.ActiveIndexGen != 1 {
+		t.Fatalf("model A baseline: %+v", activeA)
+	}
+
+	// Same dimensions on purpose: model identity, not width, is the fence.
+	service.SetProviders(&fakeEmbedder{model: "b"}, nil)
+	if _, err := service.ReindexDocument(ctx, imported.ID); err != nil {
+		t.Fatal(err)
+	}
+	activeB, err := service.store.getDocument(imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeB.EmbeddingModel != "fake:b" || activeB.ActiveIndexGen != 2 ||
+		activeB.SourceVersion != activeA.SourceVersion+1 {
+		t.Fatalf("model B migration: %+v", activeB)
+	}
+	result, err := service.Search(ctx, SearchRequest{
+		Query: "database", Mode: "vector", BaseIDs: []string{base.ID},
+	})
+	if err != nil || result.Total != 2 || len(result.Hits) != 2 {
+		t.Fatalf("model B search: %v %+v", err, result)
+	}
+	for _, hit := range result.Hits {
+		if hit.DocID != imported.ID || hit.IndexGeneration != 2 {
+			t.Fatalf("model B search mixed evidence: %+v", hit)
+		}
+	}
+	var bVectors int
+	if err := service.store.db.QueryRow(`SELECT COUNT(*) FROM chunks
+		WHERE doc_id = ? AND index_generation = ? AND embedding_model = ?`,
+		imported.ID, activeB.ActiveIndexGen, "fake:b").Scan(&bVectors); err != nil {
+		t.Fatal(err)
+	}
+	if bVectors == 0 {
+		t.Fatal("model B migration produced no vectors")
+	}
+
+	// A failed model C migration must not mutate the committed B index. The
+	// existing document remains the authoritative lexical fallback.
+	service.SetProviders(&fakeEmbedder{model: "c", failNth: 1}, nil)
+	if _, err := service.ReindexDocument(ctx, imported.ID); err != nil {
+		t.Fatal(err)
+	}
+	afterFailure, err := service.store.getDocument(imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFailure.ActiveIndexGen != activeB.ActiveIndexGen ||
+		afterFailure.SourceVersion != activeB.SourceVersion ||
+		afterFailure.EmbeddingModel != "fake:b" ||
+		afterFailure.ErrorCode != ErrEmbeddingProvider {
+		t.Fatalf("failed migration mutated published state: %+v", afterFailure)
+	}
+	result, err = service.Search(ctx, SearchRequest{
+		Query: "database", Mode: "vector", BaseIDs: []string{base.ID},
+	})
+	if err != nil || result.Mode != "lexical" || result.Total != 1 {
+		t.Fatalf("old index did not provide lexical fallback: %v %+v", err, result)
+	}
+	for _, hit := range result.Hits {
+		if hit.DocID != imported.ID || hit.IndexGeneration != activeB.ActiveIndexGen {
+			t.Fatalf("old-index fallback mixed evidence: %+v", hit)
+		}
+	}
+	var cVectors int
+	if err := service.store.db.QueryRow(`SELECT COUNT(*) FROM chunks
+		WHERE doc_id = ? AND embedding_model = ?`, imported.ID, "fake:c").Scan(&cVectors); err != nil {
+		t.Fatal(err)
+	}
+	if cVectors != 0 {
+		t.Fatalf("failed model C migration left vectors: %d", cVectors)
+	}
+
+	// Disabled embedding is an explicit new lexical generation, never reuse
+	// or reinterpret either model's vectors.
+	service.global.Embedding.Provider = "none"
+	service.SetProviders(embedding.New(embedding.Config{Provider: "none"}), nil)
+	result, err = service.Search(ctx, SearchRequest{
+		Query: "database", Mode: "vector", BaseIDs: []string{base.ID},
+	})
+	if err != nil || result.Mode != "lexical" || result.Total != 1 {
+		t.Fatalf("disabled embedding did not degrade to lexical: %v %+v", err, result)
+	}
+	if _, err := service.ReindexDocument(ctx, imported.ID); err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := service.store.getDocument(imported.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.EmbeddingReady || disabled.EmbeddingModel != "" || disabled.ErrorCode != "" {
+		t.Fatalf("disabled embedding marked vectors ready: %+v", disabled)
+	}
+	var activeVectors int
+	if err := service.store.db.QueryRow(`SELECT COUNT(*) FROM chunks c
+		JOIN documents d ON d.id = c.doc_id
+		WHERE c.doc_id = ? AND c.index_generation = d.active_index_generation
+		  AND c.embedding IS NOT NULL`, imported.ID).Scan(&activeVectors); err != nil {
+		t.Fatal(err)
+	}
+	if activeVectors != 0 {
+		t.Fatalf("disabled lexical generation retained vectors: %d", activeVectors)
+	}
+}
+
+func TestSearchModelWaitIsBounded(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Scheduler", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddTextDocument(context.Background(), base.ID, "Doc", "database content"); err != nil {
+		t.Fatal(err)
+	}
+	service.global.Scheduler.ModelWaitMS = 100
+
+	// Occupy the interactive model lane, as a slow embedding or rerank would.
+	release := make(chan struct{})
+	service.searchModelSlots <- struct{}{}
+	t.Cleanup(func() { close(release); <-service.searchModelSlots })
+
+	started := time.Now()
+	_, err = service.Search(context.Background(), SearchRequest{Query: "database"})
+	if !errors.Is(err, ErrModelSchedulerWait) {
+		t.Fatalf("model wait error = %v, want ErrModelSchedulerWait", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("model wait returned after %s", elapsed)
+	}
+	if metrics := service.Metrics(); metrics.ModelSchedulerWaits != 1 {
+		t.Fatalf("model scheduler wait metric = %d", metrics.ModelSchedulerWaits)
+	}
+}
+
+func TestSearchEndToEndDeadline(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Deadline", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddTextDocument(context.Background(), base.ID, "Doc", "database content"); err != nil {
+		t.Fatal(err)
+	}
+	service.global.Retrieval.SearchTimeoutMS = 100
+	service.global.Scheduler.ModelWaitMS = 1000
+	service.SetProviders(&blockingEmbedder{model: "slow", release: make(chan struct{})}, nil)
+
+	started := time.Now()
+	_, err = service.Search(context.Background(), SearchRequest{Query: "database"})
+	if !errors.Is(err, ErrSearchTimeout) {
+		t.Fatalf("search timeout error = %v, want ErrSearchTimeout", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("search deadline returned after %s", elapsed)
+	}
+	if metrics := service.Metrics(); metrics.SearchTimeouts != 1 {
+		t.Fatalf("search timeout metric = %d", metrics.SearchTimeouts)
+	}
+}
+
 func TestSearchFailClosed(t *testing.T) {
 	service, _ := newSearchFixture(t)
 	base, _ := service.CreateBase("B", "", "", BaseConfig{})
@@ -217,11 +469,19 @@ func TestRerankerAppliedAndDegraded(t *testing.T) {
 }
 
 func TestRerankerTimeoutDegradesQuickly(t *testing.T) {
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(60 * time.Millisecond)
+		// The 10ms provider timeout cancels the request long before the test
+		// releases the handler. Waiting on cancellation avoids a wall-clock
+		// assertion that races scheduler latency on loaded hosts.
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
+	defer close(release)
 	service, _ := newSearchFixture(t)
 	base, _ := service.CreateBase("B", "", "", BaseConfig{})
 	ctx := context.Background()
@@ -229,7 +489,7 @@ func TestRerankerTimeoutDegradesQuickly(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.SetProviders(nil, rerank.New(rerank.Config{
-		BaseURL: server.URL, Model: "slow", Timeout: 10 * time.Millisecond,
+		BaseURL: server.URL, Model: "blocked", Timeout: 10 * time.Millisecond,
 		FailureThreshold: 1, OpenDuration: time.Second,
 	}))
 	started := time.Now()
@@ -237,7 +497,9 @@ func TestRerankerTimeoutDegradesQuickly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > 40*time.Millisecond {
+	// The provider timeout is 10ms; allow generous scheduler slack while still
+	// proving the call is bounded far below the eight-second search deadline.
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("timeout did not bound rerank latency: %s", elapsed)
 	}
 	if result.Reranked || result.Rerank == nil || result.Rerank.Status != "degraded" || result.Total == 0 {

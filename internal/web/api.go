@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"mime"
 	"net/http"
@@ -16,11 +17,13 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 )
 
 // registerKnowledgeAPI mounts the Knowledge REST surface on the mux.
 func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
+	registerOperationsAPI(mux, s)
 	mux.HandleFunc("GET /api/bases", s.listBases)
 	mux.HandleFunc("POST /api/bases", s.createBase)
 	mux.HandleFunc("GET /api/bases/{id}", s.getBase)
@@ -30,6 +33,7 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /api/bases/{id}/name", s.baseName)
 	mux.HandleFunc("POST /api/bases/{id}/restore", s.restoreBase)
 	mux.HandleFunc("GET /api/bases/{id}/documents", s.listDocuments)
+	mux.HandleFunc("GET /api/bases/{id}/documents/children", s.listDocumentChildren)
 	mux.HandleFunc("POST /api/bases/{id}/documents", s.addDocument)
 	mux.HandleFunc("POST /api/bases/{id}/files", s.addFiles)
 	mux.HandleFunc("POST /api/bases/{id}/reindex", s.reindexBase)
@@ -97,6 +101,13 @@ func writeErr(w http.ResponseWriter, err error) {
 		})
 	case errors.Is(err, knowledge.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": map[string]string{"code": "not-found", "message": err.Error()}})
+	case errors.Is(err, knowledge.ErrModelSchedulerWait):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": map[string]string{"code": "quota_exceeded", "message": err.Error()}})
+	case errors.Is(err, knowledge.ErrSearchTimeout):
+		writeJSON(w, http.StatusRequestTimeout, map[string]any{"ok": false, "error": map[string]string{"code": "request_timeout", "message": err.Error()}})
+	case errors.Is(err, knowledge.ErrHistoricalEvidenceExpired):
+		writeJSON(w, http.StatusGone, map[string]any{"ok": false, "error": map[string]string{"code": "historical_evidence_expired", "message": err.Error()}})
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": map[string]string{"code": "error", "message": err.Error()}})
 	}
@@ -212,11 +223,20 @@ func (s *Server) patchBase(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteBase(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.Knowledge.DeleteBase(r.PathValue("id")); err != nil {
+	baseID := r.PathValue("id")
+	if _, err := s.app.Knowledge.GetBase(baseID); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]bool{"deleted": true})
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_base", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: baseID, Payload: json.RawMessage("{}"), ResourceClass: "io",
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeOperationAccepted(w, operation)
 }
 
 func (s *Server) baseStats(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +353,12 @@ func (s *Server) probeCaption(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rawDocument(w http.ResponseWriter, r *http.Request) {
-	raw, err := s.app.Knowledge.GetRawFile(r.PathValue("id"))
+	opts, err := rawCitationOptions(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	raw, err := s.app.Knowledge.GetRawFileForCitation(r.PathValue("id"), opts)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -352,7 +377,29 @@ func (s *Server) rawDocument(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", disposition+`; filename="download"; filename*=UTF-8''`+url.PathEscape(raw.FileName))
 	w.Header().Set("Content-Length", strconv.Itoa(len(raw.Bytes)))
+	w.Header().Set("X-Index-Generation", strconv.FormatInt(raw.IndexGeneration, 10))
+	w.Header().Set("X-Source-Version", strconv.FormatInt(raw.SourceVersion, 10))
 	_, _ = w.Write(raw.Bytes)
+}
+
+func rawCitationOptions(r *http.Request) (knowledge.RawCitationOptions, error) {
+	generationText := r.URL.Query().Get("indexGeneration")
+	versionText := r.URL.Query().Get("sourceVersion")
+	if generationText == "" && versionText == "" {
+		return knowledge.RawCitationOptions{}, nil
+	}
+	if generationText == "" || versionText == "" {
+		return knowledge.RawCitationOptions{}, errors.New("indexGeneration and sourceVersion must be supplied together")
+	}
+	generation, err := strconv.ParseInt(generationText, 10, 64)
+	if err != nil {
+		return knowledge.RawCitationOptions{}, fmt.Errorf("invalid indexGeneration: %w", err)
+	}
+	version, err := strconv.ParseInt(versionText, 10, 64)
+	if err != nil {
+		return knowledge.RawCitationOptions{}, fmt.Errorf("invalid sourceVersion: %w", err)
+	}
+	return knowledge.RawCitationOptions{IndexGeneration: &generation, SourceVersion: &version}, nil
 }
 
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
@@ -414,6 +461,16 @@ func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
 			opts.AnchorIndex = &index
 		}
 	}
+	if raw := r.URL.Query().Get("sourceVersion"); raw != "" {
+		if version, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			opts.SourceVersion = &version
+		}
+	}
+	if raw := r.URL.Query().Get("indexGeneration"); raw != "" {
+		if generation, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			opts.IndexGeneration = &generation
+		}
+	}
 	if raw := r.URL.Query().Get("before"); raw != "" {
 		if before, err := strconv.Atoi(raw); err == nil {
 			opts.Before = &before
@@ -429,7 +486,7 @@ func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
 			opts.MaxTokens = tokens
 		}
 	}
-	window, err := s.app.Knowledge.GetDocumentContext(r.PathValue("id"), opts)
+	window, err := s.app.Knowledge.GetDocumentContext(r.Context(), r.PathValue("id"), opts)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -444,6 +501,20 @@ func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, docs)
+}
+
+func (s *Server) listDocumentChildren(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	limit, _ := strconv.Atoi(query.Get("limit"))
+	offset, _ := strconv.Atoi(query.Get("offset"))
+	page, err := s.app.Knowledge.ListDocumentChildrenContext(
+		r.Context(), r.PathValue("id"), query.Get("parentId"), limit, offset,
+	)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, page)
 }
 
 type addDocumentRequest struct {
@@ -461,12 +532,26 @@ func (s *Server) addDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("content is required (url imports arrive in the ingestion phase)"))
 		return
 	}
-	doc, err := s.app.Knowledge.AddTextDocument(r.Context(), r.PathValue("id"), body.Title, body.Content)
+	encoded, err := json.Marshal(map[string]string{"title": body.Title, "content": body.Content})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, doc)
+	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "import_text", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: encoded, PreallocateDocument: true,
+		ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeDocumentOperationAccepted(w, operation, "determinate")
 }
 
 type addFilesRequest struct {
@@ -480,25 +565,58 @@ func (s *Server) addFiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.app.Knowledge.AddFiles(r.Context(), r.PathValue("id"), body.Files, body.Conflict, body.ParentDirID)
+	if len(body.Files) == 0 {
+		writeErr(w, errors.New("at least one file is required"))
+		return
+	}
+	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	if result.Status == "conflicts" {
-		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": map[string]any{"code": "conflict", "conflicts": result.Conflicts}})
+	encoded, err := json.Marshal(map[string]any{
+		"files": body.Files, "conflict": body.Conflict, "parentDirectoryId": body.ParentDirID,
+	})
+	if err != nil {
+		writeErr(w, err)
 		return
 	}
-	writeOK(w, result)
+	totalUnits := len(body.Files)
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "import_files", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: encoded, TotalUnits: &totalUnits,
+		ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) reindexBase(w http.ResponseWriter, r *http.Request) {
-	jobID, err := s.app.Knowledge.ReindexBase(r.Context(), r.PathValue("id"))
+	baseID := r.PathValue("id")
+	base, err := s.app.Knowledge.GetBase(baseID)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	documents, err := s.app.Knowledge.ListDocuments(base.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	totalUnits := len(documents)
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "reindex_base", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: json.RawMessage("{}"), ResourceClass: "io",
+		TotalUnits: &totalUnits,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeOperationAccepted(w, operation)
 }
 
 type addURLRequest struct {
@@ -511,12 +629,30 @@ func (s *Server) addURLDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	doc, err := s.app.Knowledge.AddUrlDocument(r.Context(), r.PathValue("id"), body.URL, body.Title)
+	if strings.TrimSpace(body.URL) == "" {
+		writeErr(w, errors.New("url is required"))
+		return
+	}
+	encoded, err := json.Marshal(map[string]string{"url": body.URL, "title": body.Title})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, doc)
+	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "import_url", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: encoded, PreallocateDocument: true,
+		ResourceClass: operations.ResourceNetwork,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeDocumentOperationAccepted(w, operation, "determinate")
 }
 
 type importDirectoryRequest struct {
@@ -528,12 +664,29 @@ func (s *Server) importDirectory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	jobID, err := s.app.Knowledge.ImportDirectoryTree(r.Context(), r.PathValue("id"), body.Path)
+	if strings.TrimSpace(body.Path) == "" {
+		writeErr(w, errors.New("path is required"))
+		return
+	}
+	encoded, err := json.Marshal(map[string]string{"path": body.Path})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"jobId": jobID, "submitted": true})
+	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "import_directory", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: encoded, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 type createDirectoryRequest struct {
@@ -556,12 +709,21 @@ func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rescanDirectory(w http.ResponseWriter, r *http.Request) {
-	jobID, err := s.app.Knowledge.RescanDirectory(r.PathValue("id"))
+	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"jobId": jobID, "submitted": true})
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "rescan_directory", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
+		ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 type repointSourceRequest struct {
@@ -582,12 +744,21 @@ func (s *Server) repointSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) refreshDocument(w http.ResponseWriter, r *http.Request) {
-	changed, doc, err := s.app.Knowledge.RefreshUrlDocument(r.Context(), r.PathValue("id"))
+	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"changed": changed, "document": doc})
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "refresh_url", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
+		ResourceClass: operations.ResourceNetwork,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeDocumentOperationAccepted(w, operation, "determinate")
 }
 
 func (s *Server) getDocument(w http.ResponseWriter, r *http.Request) {
@@ -622,11 +793,22 @@ func (s *Server) patchDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.Knowledge.DeleteDocument(r.PathValue("id")); err != nil {
+	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]bool{"deleted": true})
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_document", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeDocumentOperationAccepted(w, operation, "determinate")
 }
 
 // deleteDocumentJob keeps a potentially large chunk/FTS delete out of the
@@ -639,30 +821,41 @@ func (s *Server) deleteDocumentJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	jobID, err := s.app.Jobs.SubmitIOWithProgress("delete_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := s.app.Knowledge.DeleteDocument(id); err != nil {
-			return err
-		}
-		report(jobs.ProgressUpdate{Phase: "deleting", Completed: 1, Total: 1, File: doc.Title})
-		return nil
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_document", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: id, Payload: json.RawMessage("{}"),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceIO,
 	})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) deleteDocumentTree(w http.ResponseWriter, r *http.Request) {
-	deleted, err := s.app.Knowledge.DeleteDirectoryRecursive(r.PathValue("id"))
+	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]int{"deleted": deleted})
+	docs, err := s.app.Knowledge.ListDocuments(doc.BaseID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	total := directoryTreeSize(docs, doc.ID)
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_directory", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
+		TotalUnits: &total, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeDocumentOperationAccepted(w, operation, "determinate")
 }
 
 func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
@@ -682,20 +875,16 @@ func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	total := directoryTreeSize(docs, id)
-	jobID, err := s.app.Jobs.SubmitIOWithProgress("delete_directory", doc.BaseID, total, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-		completed := 0
-		report(jobs.ProgressUpdate{Phase: "deleting", Total: total, File: doc.Title})
-		_, err := s.app.Knowledge.DeleteDirectoryRecursiveWithProgress(ctx, id, func() {
-			completed++
-			report(jobs.ProgressUpdate{Phase: "deleting", Completed: completed, Total: total, File: doc.Title})
-		})
-		return err
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_directory", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: id, Payload: json.RawMessage("{}"),
+		TotalUnits: &total, ResourceClass: operations.ResourceIO,
 	})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func directoryTreeSize(docs []knowledge.DocumentSummary, rootID string) int {
@@ -727,12 +916,47 @@ func (s *Server) deleteDocuments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	deleted, err := s.app.Knowledge.DeleteDocuments(body.IDs)
+	if len(body.IDs) == 0 {
+		writeErr(w, errors.New("at least one document is required"))
+		return
+	}
+	baseID := ""
+	for _, id := range body.IDs {
+		doc, _, err := s.app.Knowledge.GetDocument(id, false)
+		if errors.Is(err, knowledge.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if baseID == "" {
+			baseID = doc.BaseID
+		} else if doc.BaseID != baseID {
+			writeErr(w, errors.New("documents must belong to one base"))
+			return
+		}
+	}
+	if baseID == "" {
+		writeOK(w, map[string]int{"deleted": 0})
+		return
+	}
+	encoded, err := json.Marshal(map[string]any{"documentIds": body.IDs})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]int{"deleted": deleted})
+	totalUnits := len(body.IDs)
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "delete_documents", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: baseID, Payload: encoded, TotalUnits: &totalUnits,
+		ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
@@ -744,28 +968,36 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("at least one document is required"))
 		return
 	}
-	jobID, err := s.app.Jobs.SubmitIOWithProgress("reindex_documents", "", len(body.IDs), func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-		for index, id := range body.IDs {
-			doc, _, docErr := s.app.Knowledge.GetDocument(id, false)
-			if docErr != nil {
-				if errors.Is(docErr, knowledge.ErrNotFound) {
-					report(jobs.ProgressUpdate{Phase: "reindexing", Completed: index + 1, Total: len(body.IDs), File: id})
-					continue
-				}
-				return docErr
-			}
-			if _, err := s.app.Knowledge.ReindexDocument(ctx, id); err != nil {
-				return err
-			}
-			report(jobs.ProgressUpdate{Phase: "reindexing", Completed: index + 1, Total: len(body.IDs), File: doc.Title})
+	baseID := ""
+	for _, id := range body.IDs {
+		doc, _, err := s.app.Knowledge.GetDocument(id, false)
+		if err != nil {
+			writeErr(w, err)
+			return
 		}
-		return nil
-	})
+		if baseID == "" {
+			baseID = doc.BaseID
+		} else if doc.BaseID != baseID {
+			writeErr(w, errors.New("documents must belong to one base"))
+			return
+		}
+	}
+	encoded, err := json.Marshal(map[string]any{"documentIds": body.IDs})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	totalUnits := len(body.IDs)
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "reindex_documents", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: baseID, Payload: encoded, TotalUnits: &totalUnits,
+		ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
@@ -774,18 +1006,17 @@ func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	jobID, err := s.app.Jobs.SubmitIOWithProgress("reindex_document", doc.BaseID, 1, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-		if _, err := s.app.Knowledge.ReindexDocument(ctx, doc.ID); err != nil {
-			return err
-		}
-		report(jobs.ProgressUpdate{Phase: "reindexing", Completed: 1, Total: 1, File: doc.Title})
-		return nil
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "reindex_document", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceIO,
 	})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
@@ -800,6 +1031,10 @@ func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) jobStatus(w http.ResponseWriter, r *http.Request) {
+	if operation, err := s.app.Operations.Get(r.PathValue("id")); err == nil {
+		writeOK(w, operationJobSnapshot(operation))
+		return
+	}
 	job, ok := s.app.Jobs.Status(r.PathValue("id"))
 	if !ok {
 		writeErr(w, knowledge.ErrNotFound)
@@ -809,11 +1044,51 @@ func (s *Server) jobStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) jobCancel(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.app.Operations.Get(r.PathValue("id")); err == nil {
+		if _, err := s.app.Operations.Cancel(r.PathValue("id")); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		writeOK(w, map[string]bool{"cancelled": true})
+		return
+	}
 	if !s.app.Jobs.Cancel(r.PathValue("id")) {
 		writeErr(w, knowledge.ErrNotFound)
 		return
 	}
 	writeOK(w, map[string]bool{"cancelled": true})
+}
+
+func operationJobSnapshot(op operations.Operation) jobs.Job {
+	status := jobs.StatusFailed
+	switch op.State {
+	case operations.StateQueued:
+		status = jobs.StatusPending
+	case operations.StateRunning, operations.StateCancelling:
+		status = jobs.StatusRunning
+	case operations.StateSucceeded:
+		status = jobs.StatusDone
+	case operations.StateCancelled:
+		status = jobs.StatusCancelled
+	}
+	total := 0
+	if op.TotalUnits != nil {
+		total = *op.TotalUnits
+	}
+	return jobs.Job{
+		ID: op.ID, Kind: op.Type, BaseID: op.BaseID, Status: status,
+		Progress: op.CompletedUnits, Total: total, Phase: op.Phase,
+		CompletedBytes: op.CompletedBytes,
+		TotalBytes:     derefOptionalInt64(op.TotalBytes),
+		Error:          op.ErrorMessage,
+	}
+}
+
+func derefOptionalInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request) {
@@ -995,14 +1270,16 @@ func (s *Server) ocrModel(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) downloadOCRModel(w http.ResponseWriter, _ *http.Request) {
-	jobID, err := s.app.Jobs.Submit("download-ocr-model", models.OCRModelID, 100, func(ctx context.Context, report func(progress int)) error {
-		return s.app.Models.DownloadOCR(ctx, report)
+	totalUnits := 100
+	operation, err := s.app.Operations.Submit(context.Background(), operations.Request{
+		Type: "download_ocr_model", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: json.RawMessage("{}"), TotalUnits: &totalUnits, ResourceClass: "network",
 	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID, "progressMode": "determinate"})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) removeOCRModel(w http.ResponseWriter, _ *http.Request) {
@@ -1043,25 +1320,27 @@ func (s *Server) selfTestLocalReranker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	progressMode := "indeterminate"
-	if s.app.ManagedRuntime {
+	if s.app.ManagedRuntime && s.app.Runtime != nil {
 		if _, ok := s.app.Runtime.(runtime.ProgressiveManagedModelController); ok {
 			progressMode = "determinate"
 		}
 	}
-	jobID, err := s.app.Jobs.SubmitWithProgress("self-test-reranker", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-		_, err := s.app.SelfTestRerankerWithProgress(ctx, body.ID, func(update runtime.ModelProgress) {
-			report(jobs.ProgressUpdate{
-				Percent: int(update.Percent), Phase: update.Phase, File: update.File,
-				CompletedBytes: update.CompletedBytes, TotalBytes: update.TotalBytes,
-			})
-		})
-		return err
+	modelID := strings.TrimPrefix(strings.TrimSpace(body.ID), "local:")
+	encoded, err := json.Marshal(map[string]any{"id": modelID})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	totalUnits := 100
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "self_test_reranker", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "model",
 	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID, "progressMode": progressMode})
+	writeLegacyJobAccepted(w, operation, progressMode)
 }
 
 func (s *Server) runtimeStatus(w http.ResponseWriter, r *http.Request) {
@@ -1097,41 +1376,31 @@ func (s *Server) downloadLocalModel(w http.ResponseWriter, r *http.Request) {
 	}
 	managedModel := s.app.ManagedRuntime && (body.Kind == models.KindEmbedding || body.Kind == models.KindRerank)
 	progressMode := "indeterminate"
-	var jobID string
-	var err error
 	if managedModel {
 		progressMode = "determinate"
-		jobID, err = s.app.Jobs.SubmitIOWithProgress("download-model", body.ID, 100, func(ctx context.Context, report func(jobs.ProgressUpdate)) error {
-			managed, ok := s.app.Runtime.(runtime.ManagedModelController)
-			if !ok {
-				return errors.New("managed runtime model control is unavailable")
-			}
-			if progressive, ok := managed.(runtime.ProgressiveManagedModelController); ok {
-				_, err := progressive.LoadModelWithProgress(ctx, body.Kind, body.ID, func(update runtime.ModelProgress) {
-					report(jobs.ProgressUpdate{
-						Percent: int(update.Percent), Phase: update.Phase, File: update.File,
-						CompletedBytes: update.CompletedBytes, TotalBytes: update.TotalBytes,
-					})
-				})
-				if err != nil {
-					return err
-				}
-			} else if _, err := managed.LoadModel(ctx, body.Kind, body.ID); err != nil {
-				return err
-			}
-			report(jobs.ProgressUpdate{Percent: 100, Phase: "ready"})
-			return nil
-		})
-	} else {
-		jobID, err = s.app.Jobs.Submit("download-model", body.ID, 100, func(ctx context.Context, report func(progress int)) error {
-			return s.app.Models.Download(ctx, models.DownloadRequest(body), report)
-		})
 	}
+	modelID := strings.TrimPrefix(strings.TrimSpace(body.ID), "local:")
+	if modelID == "" || (body.Kind != models.KindEmbedding && body.Kind != models.KindRerank) {
+		writeErr(w, errors.New("model id and embedding/rerank kind are required"))
+		return
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"id": modelID, "kind": body.Kind, "artifacts": body.Artifacts, "managed": managedModel,
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID, "progressMode": progressMode})
+	totalUnits := 100
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "download_model", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "network",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, progressMode)
 }
 
 type localModelRemoveRequest struct {
@@ -1213,12 +1482,26 @@ func (s *Server) migrateModelCache(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.app.MigrateModelCache(body.TargetDir, body.RemoveSource)
+	target := s.app.ResolveModelCacheDir(body.TargetDir)
+	if _, err := s.app.PlanModelCacheMigration(target); err != nil {
+		writeErr(w, err)
+		return
+	}
+	encoded, err := json.Marshal(map[string]any{"targetDir": target, "removeSource": body.RemoveSource})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, result)
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "migrate_model_cache", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "disk",
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "")
 }
 
 func (s *Server) listOllamaModels(w http.ResponseWriter, r *http.Request) {
@@ -1242,14 +1525,22 @@ func (s *Server) pullOllamaModel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	jobID, err := s.app.Jobs.Submit("ollama-pull", body.Model, 100, func(ctx context.Context, report func(progress int)) error {
-		return s.app.Ollama.Pull(ctx, body.Model, report)
+	model := strings.TrimSpace(body.Model)
+	encoded, err := json.Marshal(map[string]any{"model": model})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	totalUnits := 100
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "ollama_pull", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "network",
 	})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]string{"jobId": jobID})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) deleteOllamaModel(w http.ResponseWriter, r *http.Request) {

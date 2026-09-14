@@ -22,6 +22,7 @@ if (-not $versionMatch.Success) {
     throw "could not determine Knowledge version"
 }
 $version = $versionMatch.Groups[1].Value
+$extensionVersion = ($version -split '[-+]', 2)[0]
 $commit = (& git -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
     throw "could not determine candidate commit"
@@ -29,6 +30,11 @@ if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
 $dirtyFiles = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
 if ($dirtyFiles.Count -gt 0) {
     throw "formal packaging requires a clean candidate checkout; uncommitted files: $($dirtyFiles -join '; ')"
+}
+$extensionManifestSource = Get-Content -LiteralPath (Join-Path $RepoRoot "extension.yaml") -Raw
+$extensionManifestVersion = [regex]::Match($extensionManifestSource, '(?m)^version:\s*([^#\r\n]+)\s*$').Groups[1].Value.Trim()
+if ($extensionManifestVersion -ne $extensionVersion) {
+    throw "extension manifest version mismatch: got '$extensionManifestVersion', want '$extensionVersion'"
 }
 
 $goos = "windows"
@@ -55,13 +61,26 @@ function Get-PackageRelativePath([string] $BasePath, [string] $FullPath) {
     return $FullPath.Substring($prefix.Length).Replace("\", "/")
 }
 
+function Invoke-PackagedBinary([string[]] $Arguments) {
+    if ($Platform -ne "linux-amd64") {
+        return @(& $binaryPath @Arguments)
+    }
+
+    # Cross-packaging a Linux ELF on Windows requires an execution context.
+    # Use a non-login WSL environment so packaging never reads user profiles.
+    $drive = $binaryPath.Substring(0, 1).ToLowerInvariant()
+    $linuxBinaryPath = "/mnt/$drive" + $binaryPath.Substring(2).Replace("\", "/")
+    return @(& wsl.exe --exec /bin/env -i HOME=/tmp/shutu-knowledge-package PATH=/usr/bin:/bin $linuxBinaryPath @Arguments)
+}
+
 $binaryPath = Join-Path $stage "bin\$binaryName"
 $previousGOOS = $env:GOOS
 $previousGOARCH = $env:GOARCH
 try {
     $env:GOOS = $goos
     $env:GOARCH = $goarch
-    & go build -trimpath -o $binaryPath (Join-Path $RepoRoot "./cmd/shutu-knowledge")
+    $ldflags = "-X github.com/shutu-ai/shutu-knowledge/internal/version.GitCommit=$commit"
+    & go build -trimpath -ldflags $ldflags -o $binaryPath "github.com/shutu-ai/shutu-knowledge/cmd/shutu-knowledge"
     if ($LASTEXITCODE -ne 0) { throw "Knowledge binary build failed" }
 } finally {
     if ($null -eq $previousGOOS) { Remove-Item Env:GOOS -ErrorAction SilentlyContinue } else { $env:GOOS = $previousGOOS }
@@ -90,9 +109,22 @@ foreach ($fileMapping in @(
     Copy-Item -LiteralPath $sourcePath -Destination $targetPath
 }
 
-$binaryVersion = (& $binaryPath version).Trim()
-if ($LASTEXITCODE -ne 0 -or $binaryVersion -ne $version) {
-    throw "packaged binary version mismatch: got '$binaryVersion', want '$version'"
+$binaryVersionLines = @(Invoke-PackagedBinary @("version"))
+if ($LASTEXITCODE -ne 0) {
+    throw "packaged binary version command failed"
+}
+$binaryBuild = ConvertFrom-Json -InputObject ($binaryVersionLines -join "`n")
+$expectedBuild = @{
+    version = $version
+    gitCommit = $commit
+    storageFormatVersion = 2
+    storageReaderVersion = 6
+    storageWriterVersion = 6
+}
+foreach ($property in $expectedBuild.Keys) {
+    if ($binaryBuild.$property -ne $expectedBuild[$property]) {
+        throw "packaged binary $property mismatch: got '$($binaryBuild.$property)', want '$($expectedBuild[$property])'"
+    }
 }
 
 $binaryHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -102,6 +134,9 @@ $metadata = [ordered]@{
     version = $version
     platform = $Platform
     git_sha = $commit
+    storage_format_version = 2
+    storage_reader_version = 6
+    storage_writer_version = 6
     packaging = "formal-release-zip"
     runtime = "embedded managed runtime assets; Node/model/OCR artifacts are auto-managed in the Knowledge data home"
     binary_sha256 = $binaryHash

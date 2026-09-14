@@ -116,6 +116,37 @@ func TestManagerStatusDoesNotWaitForBusyHelper(t *testing.T) {
 	helper.mu.Unlock()
 }
 
+func TestManagerCloseTerminatesAndReapsBusyHelper(t *testing.T) {
+	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
+	manager := NewManager(Options{
+		Command: helperCommand(t), StartupTimeout: 2 * time.Second,
+		RequestTimeout: 2 * time.Second,
+	})
+	done := make(chan error, 1)
+	go func() {
+		var vectors [][]float64
+		done <- manager.Call(context.Background(), CapabilityEmbedding, map[string]any{"sleepMs": 1000}, &vectors)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for !manager.HasProcess() {
+		if time.Now().After(deadline) {
+			t.Fatal("busy helper did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	started := time.Now()
+	manager.Close()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("close waited %s after terminating helper", elapsed)
+	}
+	if manager.HasProcess() {
+		t.Fatal("process survived close")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("expected terminated busy helper call to fail")
+	}
+}
+
 func TestManagerUsesModelLoadBudgetOnlyForFirstModelInference(t *testing.T) {
 	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
 	manager := NewManager(Options{

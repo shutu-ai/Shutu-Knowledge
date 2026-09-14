@@ -12,6 +12,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 )
 
 // searchToolResult extends the core result without leaking Agent SDK DTOs.
@@ -163,10 +164,14 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := requireEnabledBase(service, args.BaseID); err != nil {
 			return nil, err
 		}
-		if err := service.DeleteBase(args.BaseID); err != nil {
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "delete_base", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: args.BaseID, Payload: json.RawMessage("{}"), ResourceClass: "io",
+		})
+		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"deleted": true}, nil
+		return operationResult(operation), nil
 
 	case "knowledge_add_document":
 		var args struct {
@@ -180,11 +185,22 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := requireEnabledBase(service, args.BaseID); err != nil {
 			return nil, err
 		}
-		doc, err := service.AddTextDocument(ctx, args.BaseID, args.Title, args.Content)
+		if strings.TrimSpace(args.Content) == "" {
+			return nil, fmt.Errorf("document content is empty")
+		}
+		payload, err := json.Marshal(map[string]any{"title": args.Title, "content": args.Content})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"id": doc.ID, "title": doc.Title, "chunkCount": doc.ChunkCount}, nil
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "import_text", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: args.BaseID, Payload: payload,
+			TotalUnits: intPtr(1), ResourceClass: "io", PreallocateDocument: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
 
 	case "knowledge_list_documents":
 		var args struct {
@@ -221,10 +237,19 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if doc.BaseID != args.BaseID {
 			return nil, fmt.Errorf("document %q does not belong to knowledge base %s", doc.Title, args.BaseID)
 		}
-		if err := service.DeleteDocument(doc.ID); err != nil {
+		payload, err := json.Marshal(map[string]any{"documentId": doc.ID})
+		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"deleted": true}, nil
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "delete_document", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: doc.BaseID, DocumentID: doc.ID, Payload: payload,
+			TotalUnits: intPtr(1), ResourceClass: "io",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
 
 	case "knowledge_import_url":
 		var args struct {
@@ -238,11 +263,19 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := requireEnabledBase(service, args.BaseID); err != nil {
 			return nil, err
 		}
-		doc, err := service.AddUrlDocument(ctx, args.BaseID, args.URL, args.Title)
+		payload, err := json.Marshal(map[string]any{"url": args.URL, "title": args.Title})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"id": doc.ID, "title": doc.Title, "chunkCount": doc.ChunkCount}, nil
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "import_url", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: args.BaseID, Payload: payload,
+			TotalUnits: intPtr(1), ResourceClass: "network", PreallocateDocument: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
 
 	case "knowledge_refresh_url":
 		var args struct {
@@ -255,11 +288,19 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err != nil {
 			return nil, err
 		}
-		changed, refreshed, err := service.RefreshUrlDocument(ctx, doc.ID)
+		payload, err := json.Marshal(map[string]any{"documentId": doc.ID})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"changed": changed, "title": refreshed.Title, "chunkCount": refreshed.ChunkCount}, nil
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "refresh_url", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: doc.BaseID, DocumentID: doc.ID, Payload: payload,
+			TotalUnits: intPtr(1), ResourceClass: "network",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
 
 	case "knowledge_stats":
 		var args struct {
@@ -335,7 +376,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			opts.Before = args.Before
 			opts.After = args.After
 			opts.MaxTokens = derefInt(args.MaxTokens)
-			window, err := service.GetDocumentContext(doc.ID, opts)
+			window, err := service.GetDocumentContext(ctx, doc.ID, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -439,11 +480,19 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if doc.BaseID != args.BaseID {
 			return nil, fmt.Errorf("document %q does not belong to knowledge base %s", doc.Title, args.BaseID)
 		}
-		reindexed, err := service.ReindexDocument(ctx, doc.ID)
+		payload, err := json.Marshal(map[string]any{"documentId": doc.ID})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"id": reindexed.ID, "title": reindexed.Title, "chunkCount": reindexed.ChunkCount}, nil
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "reindex_document", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: doc.BaseID, DocumentID: doc.ID, Payload: payload,
+			TotalUnits: intPtr(1), ResourceClass: "io",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
 
 	case "knowledge_reindex_base":
 		var args struct {
@@ -455,11 +504,102 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := requireEnabledBase(service, args.BaseID); err != nil {
 			return nil, err
 		}
-		jobID, err := service.ReindexBase(ctx, args.BaseID)
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "reindex_base", CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: args.BaseID, Payload: json.RawMessage("{}"), ResourceClass: "io",
+		})
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"jobId": jobID, "submitted": true}, nil
+		return operationResult(operation), nil
+
+	case "knowledge_maintenance_storage":
+		var args struct {
+			DryRun          bool `json:"dryRun"`
+			PurgeQuarantine bool `json:"purgeQuarantine"`
+		}
+		if err := decodeArguments(request.Arguments, &args); err != nil {
+			return nil, err
+		}
+		if args.DryRun && args.PurgeQuarantine {
+			return nil, fmt.Errorf("dryRun and purgeQuarantine are mutually exclusive")
+		}
+		payload, err := json.Marshal(map[string]any{
+			"dryRun": args.DryRun, "purgeQuarantine": args.PurgeQuarantine,
+		})
+		if err != nil {
+			return nil, err
+		}
+		operation, err := application.Operations.Submit(ctx, operations.Request{
+			Type: "maintenance_storage", CommandSchemaVersion: operations.CommandSchemaV1,
+			Payload: payload, ResourceClass: operations.ResourceMaintenance,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return operationResult(operation), nil
+
+	case "knowledge_operation_status":
+		var args struct {
+			OperationID string `json:"operationId"`
+		}
+		if err := decodeArguments(request.Arguments, &args); err != nil {
+			return nil, err
+		}
+		op, err := application.Operations.Get(args.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if op.BaseID != "" {
+			if err := requireEnabledBase(service, op.BaseID); err != nil {
+				return nil, err
+			}
+		}
+		return op, nil
+
+	case "knowledge_operation_cancel":
+		var args struct {
+			OperationID string `json:"operationId"`
+		}
+		if err := decodeArguments(request.Arguments, &args); err != nil {
+			return nil, err
+		}
+		op, err := application.Operations.Get(args.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if op.BaseID != "" {
+			if err := requireEnabledBase(service, op.BaseID); err != nil {
+				return nil, err
+			}
+		}
+		cancelled, err := application.Operations.Cancel(args.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		return cancelled, nil
+
+	case "knowledge_operation_retry":
+		var args struct {
+			OperationID string `json:"operationId"`
+		}
+		if err := decodeArguments(request.Arguments, &args); err != nil {
+			return nil, err
+		}
+		op, err := application.Operations.Get(args.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		if op.BaseID != "" {
+			if err := requireEnabledBase(service, op.BaseID); err != nil {
+				return nil, err
+			}
+		}
+		retried, err := application.Operations.Retry(args.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		return retried, nil
 
 	default:
 		return nil, fmt.Errorf("unknown tool %q", request.Name)
@@ -559,6 +699,18 @@ func citations(hits []knowledge.SearchHit) []string {
 		out = append(out, strings.TrimRight(quote.String(), "\n")+fmt.Sprintf("\n> -- %s (baseId=%s; docId=%s; chunkId=%s)", source, hit.BaseID, hit.DocID, hit.ChunkID))
 	}
 	return out
+}
+
+func intPtr(value int) *int { return &value }
+
+func operationResult(operation operations.Operation) map[string]any {
+	return map[string]any{
+		"operationId": operation.ID,
+		"state":       operation.State,
+		"submitted":   operation.State == operations.StateQueued || operation.State == operations.StateRunning,
+		"cancellable": operation.Cancellable,
+		"statusUrl":   "/api/operations/" + operation.ID,
+	}
 }
 
 func derefInt(value *int) int {

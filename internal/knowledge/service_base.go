@@ -21,11 +21,30 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
+	"github.com/shutu-ai/shutu-knowledge/internal/scheduler"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 // ErrNotFound is returned for missing bases/documents.
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound = errors.New("not found")
+	ErrConflict = errors.New("conflict")
+	// ErrHistoricalEvidenceExpired means a caller requested a generation that
+	// never existed, does not match its source version, or aged out of bounded
+	// historical retention. It is never valid to substitute current evidence.
+	ErrHistoricalEvidenceExpired = errors.New("historical evidence expired")
+)
+
+// Lifecycle and index-generation states introduced by the P1 compatibility
+// baseline. Existing rows are adopted as generation zero.
+const (
+	LifecycleActive   = "active"
+	LifecycleDeleting = "deleting"
+
+	IndexStateActive   = "active"
+	IndexStateBuilding = "building"
+	IndexStateRetired  = "retired"
+)
 
 // Service is the Knowledge Core facade: bases, documents, lifecycle.
 type Service struct {
@@ -48,14 +67,17 @@ type Service struct {
 	captionOptions *caption.Options
 	// batchMu serializes batch planning so title/hash decisions see one
 	// consistent snapshot before bounded ingestion workers start.
-	batchMu     sync.Mutex
-	ingestSlots chan struct{}
-	metricsMu   sync.Mutex
-	metrics     MetricsSnapshot
+	batchMu              sync.Mutex
+	ingestSlots          chan struct{}
+	searchModelSlots     chan struct{}
+	sharedModelAdmission scheduler.Admission
+	metricsMu            sync.Mutex
+	metrics              MetricsSnapshot
 }
 
 // NewService builds the service over the shared database.
 func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config, jobMgr *jobs.Manager) *Service {
+	global = global.Normalized()
 	var registryOptions []parser.Option
 	if strings.TrimSpace(global.Helpers.LegacyOffice) != "" {
 		registryOptions = append(registryOptions, parser.WithLegacyHelper(parser.ExecHelper{
@@ -73,12 +95,13 @@ func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config,
 		ingestWorkers = 2
 	}
 	service := &Service{
-		store:       newStore(db),
-		raw:         raw,
-		parsers:     parser.NewRegistry(registryOptions...),
-		global:      global,
-		jobMgr:      jobMgr,
-		ingestSlots: make(chan struct{}, ingestWorkers),
+		store:            newStore(db),
+		raw:              raw,
+		parsers:          parser.NewRegistry(registryOptions...),
+		global:           global,
+		jobMgr:           jobMgr,
+		ingestSlots:      make(chan struct{}, ingestWorkers),
+		searchModelSlots: make(chan struct{}, global.Scheduler.Model),
 	}
 	if strings.TrimSpace(global.Helpers.ContentConverter) != "" {
 		service.content = parser.ExecHelper{
@@ -129,6 +152,12 @@ func (s *Service) SetRuntime(manager runtime.Caller) {
 func (s *Service) SetOCRArtifactProvider(provider func() (string, bool)) {
 	s.ocrArtifacts = provider
 	s.selectOCR()
+}
+
+// SetSharedModelAdmission makes interactive retrieval observe the same
+// process-wide model budget as durable model operations.
+func (s *Service) SetSharedModelAdmission(admission scheduler.Admission) {
+	s.sharedModelAdmission = admission
 }
 
 // SetLegacyOfficeRunner installs the built-in LibreOffice adapter or removes
@@ -262,6 +291,12 @@ func (s *Service) providersForBase(baseID string) (providerSet, error) {
 	if hasRerankOverride(base.Config) {
 		providers.reranker = configured.reranker
 		providers.rerankerActive = configured.rerankerActive
+	}
+	// A provider object can exist while representing an absent/disabled space
+	// (for example the local runtime is not configured). Never offer it as an
+	// active embedding provider merely because a model key was configured.
+	if providers.embedder == nil || providers.embedder.ModelKey() == "none" {
+		providers.embeddingActive = false
 	}
 	return providers, nil
 }
@@ -739,19 +774,22 @@ func (s *Service) RenameBase(id string, name, description, group *string, cfg *B
 
 // DeleteBase removes the base with its documents, chunks, and raw files.
 func (s *Service) DeleteBase(id string) error {
-	if _, err := s.store.getBase(id); err != nil {
-		return err
-	}
-	docs, err := s.store.listDocumentMetadata(id)
+	base, err := s.store.markBaseDeleting(id)
 	if err != nil {
 		return err
 	}
-	for _, doc := range docs {
-		if err := s.store.deleteChunks(doc.ID); err != nil {
+	refs, err := s.store.listBaseCleanupRefs(base.ID)
+	if err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		if err := s.store.deleteDocumentGeneration(ref.ID, ref.ActiveIndexGen); err != nil {
 			return err
 		}
-		if err := s.store.deleteDocument(doc.ID); err != nil {
-			return err
+		if ref.RawFilePath != "" {
+			if err := s.raw.Delete(ref.RawFilePath); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.store.deleteChunksByBase(id); err != nil {
@@ -760,7 +798,41 @@ func (s *Service) DeleteBase(id string) error {
 	if err := s.raw.DeleteBase(id); err != nil {
 		return err
 	}
-	return s.store.deleteBase(id)
+	return nil
+}
+
+// setGenerationRawPath moves one already-published legacy raw path to the
+// immutable generation layout. The document and its generation mapping change
+// together; the file was written and verified by the caller first.
+func (s *store) setGenerationRawPath(docID string, generation int64, rawPath string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	docResult, err := tx.Exec(`UPDATE documents SET raw_file_path = ?
+		WHERE id = ? AND active_index_generation = ? AND lifecycle_state = ?`,
+		rawPath, docID, generation, LifecycleActive)
+	if err != nil {
+		return err
+	}
+	if affected, err := docResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return ErrConflict
+	}
+	mapResult, err := tx.Exec(`UPDATE document_generations SET raw_file_path = ?
+		WHERE doc_id = ? AND index_generation = ?`,
+		rawPath, docID, generation)
+	if err != nil {
+		return err
+	}
+	if affected, err := mapResult.RowsAffected(); err != nil {
+		return err
+	} else if affected != 1 {
+		return ErrConflict
+	}
+	return tx.Commit()
 }
 
 // GetBase returns one base.

@@ -14,8 +14,18 @@ const endpoint = (path) => `${extensionPrefix}${path}`;
 
 async function request(path, options = {}) {
   const { timeoutMs = 15000, ...fetchOptions } = options;
+  const externalSignal = fetchOptions.signal;
+  if (!externalSignal && routeSignal && (!fetchOptions.method || fetchOptions.method === "GET")
+    && !path.startsWith("/api/operations/") && !path.startsWith("/api/jobs/")) {
+    fetchOptions.signal = routeSignal;
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromRoute = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", abortFromRoute, { once: true });
+  }
   try {
     const response = await fetch(endpoint(path), {
       ...fetchOptions,
@@ -30,21 +40,33 @@ async function request(path, options = {}) {
     return payload.value;
   } catch (error) {
     if (error?.name === "AbortError") {
+      if (externalSignal?.aborted) {
+        const aborted = new ApiError(`Request aborted: ${path}`, 499, "request_aborted");
+        aborted.name = "AbortError";
+        throw aborted;
+      }
       throw new ApiError(`Request timed out: ${path}`, 408, "request_timeout");
     }
     throw error;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", abortFromRoute);
   }
+}
+
+let routeSignal;
+
+export function setRouteSignal(signal) {
+  routeSignal = signal;
 }
 
 const post = (path, body, options = {}) => request(path, { ...options, method: "POST", body: JSON.stringify(body) });
 
 export const api = {
   request,
-  status: () => request("/api/status"),
+  status: (options = {}) => request("/api/status", options),
   stats: (baseID = "") => request(baseID ? `/api/bases/${baseID}/stats` : "/api/stats"),
-  bases: () => request("/api/bases"),
+  bases: (options = {}) => request("/api/bases", options),
   createBase: (body) => post("/api/bases", body),
   updateBase: (id, body) => request(`/api/bases/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteBase: (id) => request(`/api/bases/${id}`, { method: "DELETE" }),
@@ -53,11 +75,35 @@ export const api = {
   renameGroup: (from, to) => request("/api/groups", { method: "PATCH", body: JSON.stringify({ from, to }) }),
   deleteGroup: (name) => request("/api/groups", { method: "DELETE", body: JSON.stringify({ name }) }),
   documents: (id) => request(`/api/bases/${id}/documents`),
+  documentChildren: (id, parentId = "", { limit = 50, offset = 0 } = {}) =>
+    request(`/api/bases/${id}/documents/children?parentId=${encodeURIComponent(parentId)}&limit=${limit}&offset=${offset}`),
   document: (id) => request(`/api/documents/${id}?includeChunks=false`),
   documentWithChunks: (id) => request(`/api/documents/${id}`),
   updateDocument: (id, title) => request(`/api/documents/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   chunks: (id, limit = 20, offset = 0) => request(`/api/documents/${id}/chunks?limit=${limit}&offset=${offset}`),
   addText: (baseID, body) => post(`/api/bases/${baseID}/documents`, body),
+  submitOperation: (body, idempotencyKey) => post("/api/operations", {
+    ...body, idempotencyKey,
+  }, { headers: { "Idempotency-Key": idempotencyKey } }),
+  operation: (id) => request(`/api/operations/${id}`),
+  operations: ({ states = [], baseId = "", documentId = "", limit = 100 } = {}) => {
+    const query = new URLSearchParams();
+    states.forEach((state) => query.append("state", state));
+    if (baseId) query.set("baseId", baseId);
+    if (documentId) query.set("documentId", documentId);
+    query.set("limit", String(limit));
+    return request(`/api/operations?${query.toString()}`);
+  },
+  cancelOperation: (id) => post(`/api/operations/${id}/cancel`, {}),
+  retryOperation: (id) => post(`/api/operations/${id}/retry`, {}),
+  createUpload: (body) => post("/api/uploads", body),
+  putUploadContent: (id, file) => request(`/api/uploads/${id}/content`, {
+    method: "PUT",
+    body: file,
+    headers: { "content-type": "application/octet-stream" },
+    timeoutMs: 600000,
+  }),
+  completeUpload: (id) => post(`/api/uploads/${id}/complete`, {}),
   addURL: (baseID, body) => post(`/api/bases/${baseID}/url`, body),
   addFiles: (baseID, body) => post(`/api/bases/${baseID}/files`, body),
   importDirectory: (baseID, path) => post(`/api/bases/${baseID}/import-directory`, { path }),
@@ -116,4 +162,9 @@ export function fileToBase64(file, onProgress = () => {}) {
     };
     reader.readAsDataURL(file);
   });
+}
+
+export async function fileSha256(file) {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
 }

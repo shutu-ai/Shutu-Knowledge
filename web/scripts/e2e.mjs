@@ -127,6 +127,26 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+async function apiValue(port, path, init = {}) {
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, init);
+  const payload = await response.json();
+  assert(response.ok && payload.ok === true, `API ${path} failed: HTTP ${response.status}`);
+  return payload.value;
+}
+
+async function waitForOperation(port, operationId) {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const operation = await apiValue(port, `/api/operations/${operationId}`);
+    if (["succeeded", "failed", "cancelled"].includes(operation.state)) {
+      assert(operation.state === "succeeded", `operation ${operationId}: ${operation.state} ${operation.errorMessage ?? ""}`);
+      return operation;
+    }
+    if (Date.now() >= deadline) throw new Error(`operation ${operationId} did not finish`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 function exited(child) {
   return new Promise((resolve) => child.once("exit", resolve));
 }
@@ -159,17 +179,21 @@ async function run() {
     "",
   ].join("\n"));
 
-  const backend = spawn(binary, ["serve"], {
-    env: { ...process.env, SHUTU_KNOWLEDGE_HOME: home },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  backend.stdout.on("data", () => {});
   let backendLog = "";
-  backend.stderr.on("data", (chunk) => {
-    const text = chunk.toString();
-    backendLog = `${backendLog}${text}`.slice(-8000);
-    process.stderr.write(text);
-  });
+  const startBackend = () => {
+    const child = spawn(binary, ["serve"], {
+      env: { ...process.env, SHUTU_KNOWLEDGE_HOME: home },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", () => {});
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      backendLog = `${backendLog}${text}`.slice(-8000);
+      process.stderr.write(text);
+    });
+    return child;
+  };
+  let backend = startBackend();
 
   let browser;
   let page;
@@ -182,6 +206,39 @@ async function run() {
       assert(value.ready === true, "backend did not become ready");
       return true;
     });
+
+    // C13 uses a real process boundary, not just a new handler: capture the
+    // deployed build identity and cache revalidation result, terminate the
+    // backend, then boot the same binary again on the same data home.
+    const versionResponse = await fetch(`http://127.0.0.1:${apiPort}/api/version`);
+    const versionBefore = await versionResponse.json();
+    const assetResponse = await fetch(`http://127.0.0.1:${apiPort}/app.js`);
+    const etagBefore = assetResponse.headers.get("etag");
+    assert(typeof versionBefore?.webBuild === "string" && /^[0-9a-f]{64}$/.test(versionBefore.webBuild),
+      "backend did not expose a SHA-256 web build identity");
+    assert(Boolean(etagBefore), "deployed web assets have no build ETag");
+    const revalidatedBefore = await fetch(`http://127.0.0.1:${apiPort}/app.js`, {
+      headers: { "if-none-match": etagBefore },
+    });
+    assert(revalidatedBefore.status === 304, "unchanged web asset did not revalidate as 304");
+    backend.kill();
+    await exited(backend);
+    backend = startBackend();
+    await waitFor("restarted backend health", 20_000, async () => {
+      const response = await fetch(`http://127.0.0.1:${apiPort}/healthz`);
+      if (!response.ok) throw new Error(`restarted backend health HTTP ${response.status}`);
+      const value = await response.json();
+      assert(value.ready === true, "restarted backend did not become ready");
+      return true;
+    });
+    const versionAfter = await (await fetch(`http://127.0.0.1:${apiPort}/api/version`)).json();
+    const assetAfter = await fetch(`http://127.0.0.1:${apiPort}/app.js`);
+    assert(versionAfter.webBuild === versionBefore.webBuild, "restart changed web build identity");
+    assert(assetAfter.headers.get("etag") === etagBefore, "restart changed web asset ETag");
+    const revalidatedAfter = await fetch(`http://127.0.0.1:${apiPort}/app.js`, {
+      headers: { "if-none-match": etagBefore },
+    });
+    assert(revalidatedAfter.status === 304, "restarted backend did not honor cached build identity");
 
     browser = spawn(browserPath, [
       "--headless=new",
@@ -240,6 +297,8 @@ async function run() {
       console.error("screen forms:", forms);
       throw error;
       }
+      await waitForPageValue(page, `${route} loading cleared`, 10_000,
+        `!document.querySelector("#screen .loading-state")`);
     };
     const screenshot = async (name) => {
       const result = await page.send("Page.captureScreenshot", { format: "png", fromSurface: true });
@@ -290,10 +349,39 @@ async function run() {
       form.requestSubmit();
     `);
 
+    // A directory path is validated by the worker, not by the receiver, so
+    // this exercises the browser operation card across a real 202-to-failure
+    // lifecycle without stubbing the OperationStore.
+    const missingDirectory = "definitely-missing-e2e-directory";
+    await evaluateWithArgs({ path: missingDirectory }, `
+      const form = [...document.querySelectorAll("form")].find((item) =>
+        [...item.querySelectorAll("h2")].some((heading) => heading.textContent === "Directory"));
+      if (!form) throw new Error("directory import form missing");
+      form.querySelector('[name="path"]').value = args.path;
+      form.requestSubmit();
+    `);
+    await waitForPageValue(page, "failed import operation card", 10_000, `
+      [...document.querySelectorAll("[data-document-job-id]")].some((card) =>
+        card.textContent.includes("${missingDirectory}") &&
+        card.querySelector("[data-document-job-status]")?.textContent.trim().toLowerCase() !== "succeeded")
+    `);
+    await waitForPageValue(page, "failed import terminal state", 10_000, `
+      [...document.querySelectorAll("[data-document-job-id]")].some((card) =>
+        card.textContent.includes("${missingDirectory}") &&
+        card.querySelector("[data-document-job-status]")?.textContent.trim().toLowerCase() === "failed" &&
+        [...card.querySelectorAll("button")].some((button) => button.textContent.trim() === "Retry"))
+    `);
+    await waitForPageValue(page, "failed import active count", 10_000,
+      `document.querySelector("[data-document-job-summary]")?.textContent === "0 active tasks"`);
+
     await navigate("documents");
     await waitForPageValue(page, "ready imported document", 20_000, `
       document.body.innerText.includes("Browser lifecycle document") &&
       document.body.innerText.toLowerCase().includes("ready")
+    `);
+    await waitForPageValue(page, "imported document row", 10_000, `
+      [...document.querySelectorAll("tbody tr")]
+        .some((item) => item.textContent.includes("Browser lifecycle document"))
     `);
     await evaluate(page, `
       const row = [...document.querySelectorAll("tbody tr")]
@@ -319,6 +407,139 @@ async function run() {
     `);
     await waitForPageValue(page, "collapsed chunk", 10_000,
       `document.querySelector("[data-chunk-toggle]")?.getAttribute("aria-expanded") === "false"`);
+
+    // P5 uses two isolated bases and real durable tasks. The stress marker
+    // lives outside #screen, so a full-page replacement fails the assertion.
+    const stressBases = [];
+    for (const [name, documentTitle] of [
+      ["E2E Stress Alpha", "Stress document Alpha"],
+      ["E2E Stress Beta", "Stress document Beta"],
+    ]) {
+      const base = await apiValue(apiPort, "/api/bases", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, group: "E2E Stress", description: "two-base frontend stress" }),
+      });
+      for (let documentIndex = 0; documentIndex < 3; documentIndex += 1) {
+        const title = `${documentTitle} ${documentIndex + 1}`;
+        const accepted = await apiValue(apiPort, `/api/bases/${base.id}/documents`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title, content: `${title} durable stress content.` }),
+        });
+        const operationId = accepted.operation?.operationId ?? accepted.operationId;
+        assert(Boolean(operationId), "text import did not return an operation");
+        await waitForOperation(apiPort, operationId);
+      }
+      stressBases.push(base);
+    }
+
+    await evaluate(page, `document.body.dataset.e2eStressMarker = "retained"; true`);
+    await navigate("bases");
+    await waitForPageValue(page, "stress bases listed", 10_000, `
+      document.body.innerText.includes("E2E Stress Alpha") &&
+      document.body.innerText.includes("E2E Stress Beta")
+    `);
+    await navigate("documents");
+    await waitForPageValue(page, "stress base picker", 10_000,
+      `Boolean(document.querySelector('select[aria-label="Knowledge base"]'))`);
+    let stressOperations = 0;
+    for (const base of stressBases) {
+      await waitForPageValue(page, `${base.name} base option`, 10_000,
+        `[...document.querySelectorAll('select[aria-label="Knowledge base"] option')].some((option) => option.text === "${base.name}")`);
+      await evaluateWithArgs({ baseName: base.name }, `
+        const picker = [...document.querySelectorAll('select[aria-label="Knowledge base"]')][0];
+        picker.value = [...picker.options].find((option) => option.text === args.baseName).value;
+        picker.dispatchEvent(new Event("change", { bubbles: true }));
+      `);
+      await waitForPageValue(page, `${base.name} stress document`, 10_000,
+        `document.body.innerText.includes("${base.name === stressBases[0].name ? "Stress document Alpha" : "Stress document Beta"}")`);
+      stressOperations += await evaluate(page, `
+        (() => {
+          const rows = [...document.querySelectorAll('[data-document-table] tbody tr')]
+            .filter((item) => item.textContent.includes("Stress document"));
+          for (const row of rows) {
+            [...row.querySelectorAll("button")].find((button) => button.textContent === "Reindex").click();
+          }
+          return rows.length;
+        })()
+      `);
+    }
+
+    for (let round = 0; round < 30; round += 1) {
+      await navigate(["overview", "bases", "import", "documents"][round % 4]);
+    }
+    await evaluate(page, `
+      if (document.body.dataset.e2eStressMarker !== "retained") throw new Error("full-page replacement detected");
+      const errorToast = document.querySelector(".toast.error");
+      if (errorToast && errorToast.style.display !== "none") throw new Error("stress produced an error toast");
+      true
+    `);
+    const deadline = Date.now() + 20_000;
+    let completedStress;
+    for (;;) {
+      const page1 = await apiValue(apiPort, "/api/operations?limit=100");
+      completedStress = page1.operations.filter((item) => item.type === "reindex_document"
+        && stressBases.some((base) => item.baseId === base.id));
+      if (completedStress.length >= stressOperations
+        && completedStress.every((item) => item.state === "succeeded")) break;
+      if (Date.now() >= deadline) {
+        throw new Error(`stress operations incomplete: ${JSON.stringify(completedStress.map(({ state, type }) => ({ state, type })))}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert(completedStress.length >= 6, `expected six stress reindex operations, got ${completedStress.length}`);
+    await navigate("documents");
+    await waitForPageValue(page, "completed stress task cards", 10_000,
+      `document.querySelector("[data-document-job-summary]")?.textContent === "0 active tasks"`);
+    for (const base of stressBases) {
+      const documents = await apiValue(apiPort, `/api/bases/${base.id}/documents/children?parentId=&limit=50&offset=0`);
+      assert(documents.documents.length === 3
+        && documents.documents.every((item) => item.chunkCount === 1),
+        `${base.name} did not retain exactly three indexed documents`);
+    }
+
+    // Force the older Alpha response to resolve after the current Beta
+    // response. The base-bound generation must discard Alpha rather than let
+    // it replace Beta's rendered document rows.
+    await navigate("documents");
+    await waitForPageValue(page, "stale-request base picker", 10_000,
+      `Boolean(document.querySelector('select[aria-label="Knowledge base"]'))`);
+    await evaluate(page, `
+      window.__nativeFetch = window.fetch;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (input, init) => {
+        const url = String(input instanceof Request ? input.url : input);
+        const response = await originalFetch(input, init);
+        if (url.includes("/api/bases/") && url.includes("/documents/children")) {
+          const baseId = decodeURIComponent(url.match(/\\/api\\/bases\\/([^/]+)\\/documents/)[1]);
+          const delay = baseId === ${JSON.stringify(stressBases[0].id)} ? 250 : 0;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+        return response;
+      };
+      true
+    `);
+    await evaluate(page, `
+      const picker = [...document.querySelectorAll('select[aria-label="Knowledge base"]')][0];
+      const choose = (name) => {
+        picker.value = [...picker.options].find((option) => option.text === name).value;
+        picker.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      choose("E2E Stress Alpha");
+      choose("E2E Stress Beta");
+      true
+    `);
+    await waitForPageValue(page, "stress Beta remains selected after delayed Alpha", 10_000,
+      `[...document.querySelectorAll("[data-document-table] tbody tr")]
+        .some((item) => item.textContent.includes("Stress document Beta"))`);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await evaluate(page, `
+      const rows = [...document.querySelectorAll("[data-document-table] tbody tr")];
+      if (!rows.some((item) => item.textContent.includes("Stress document Beta"))) throw new Error("Beta response lost");
+      if (rows.some((item) => item.textContent.includes("Stress document Alpha"))) throw new Error("stale Alpha response overwrote Beta");
+      if (document.body.dataset.e2eStressMarker !== "retained") throw new Error("full-page replacement detected");
+      true
+    `);
+    await evaluate(page, `(() => { window.fetch = window.__nativeFetch; return true; })()`);
 
     await navigate("recall");
     await waitForPageValue(page, "recall form", 10_000,
@@ -359,6 +580,8 @@ async function run() {
       const form = [...document.querySelectorAll("#screen form")]
         .find((item) => item.querySelector('select[name="provider"]'));
       if (!form) throw new Error("provider form missing");
+      form.querySelector('select[name="rerankMode"]').value = "remote";
+      form.querySelector('select[name="rerankMode"]').dispatchEvent(new Event("change", { bubbles: true }));
       window.fetch = async () => new Response(
         JSON.stringify({ ok: false, error: { message: "Dismissable UI-policy toast" } }),
         { status: 500, headers: { "content-type": "application/json" } },
@@ -401,18 +624,19 @@ async function run() {
       `[...document.querySelectorAll("#screen h2")].some((item) => item.textContent === "Global settings")`);
 
     await screenshot("lifecycle.png");
-    await navigate("bases");
-    await waitForPageValue(page, "base row before delete", 10_000,
-      `[...document.querySelectorAll(".list-row")].some((item) => item.textContent.includes("E2E Operations"))`);
-    await evaluate(page, `
-      window.confirm = () => true;
-      const row = [...document.querySelectorAll(".list-row")].find((item) => item.textContent.includes("E2E Operations"));
-      if (!row) throw new Error("base row missing before delete");
-      [...row.querySelectorAll("button")].find((button) => button.textContent === "Delete").click();
-    `, true);
-    await waitForPageValue(page, "base deletion", 10_000,
-      `!document.querySelector(".list-row")?.textContent.includes("E2E Operations")`);
-
+    const listedBases = await apiValue(apiPort, "/api/bases");
+    const cleanupBase = listedBases.find((item) => item.name === "E2E Operations");
+    assert(Boolean(cleanupBase), "E2E Operations base missing before cleanup");
+    const cleanupAccepted = await apiValue(apiPort, `/api/bases/${cleanupBase.id}`, { method: "DELETE" });
+    const cleanupOperationId = cleanupAccepted.operationId ?? cleanupAccepted.jobId;
+    assert(Boolean(cleanupOperationId), "base cleanup did not return an operation");
+    await waitForOperation(apiPort, cleanupOperationId);
+    for (const base of stressBases) {
+      const accepted = await apiValue(apiPort, `/api/bases/${base.id}`, { method: "DELETE" });
+      const operationId = accepted.operationId ?? accepted.jobId;
+      assert(Boolean(operationId), "stress base cleanup did not return an operation");
+      await waitForOperation(apiPort, operationId);
+    }
     const health = await (await fetch(`http://127.0.0.1:${apiPort}/api/stats`)).json();
     assert(health.ok === true, "final API health contract failed");
     succeeded = true;

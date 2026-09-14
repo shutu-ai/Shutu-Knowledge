@@ -16,6 +16,7 @@ web/dist/
 
 # Local data (never commit user knowledge data)
 /data/
+.local/
 *.db
 *.db-shm
 *.db-wal

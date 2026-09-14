@@ -20,8 +20,14 @@ func TestDefaultsClamp(t *testing.T) {
 	cfg.Retrieval.TopK = 9999
 	cfg.Chunking.Overlap = 100000
 	cfg.Maintenance.VacuumThresholdMB = 99999
+	cfg.Maintenance.QuarantineRetentionHours = 999999
+	cfg.Scheduler.IO = 999
+	cfg.Scheduler.MaxPerBase = 0
+	cfg.Scheduler.QueueLimit = 999999
 	cfg.clamp()
-	if cfg.Retrieval.TopK != 50 || cfg.Chunking.Overlap != 799 || cfg.Maintenance.VacuumThresholdMB != 4096 {
+	if cfg.Retrieval.TopK != 50 || cfg.Chunking.Overlap != 799 || cfg.Maintenance.VacuumThresholdMB != 4096 ||
+		cfg.Maintenance.QuarantineRetentionHours != 87600 ||
+		cfg.Scheduler.IO != 64 || cfg.Scheduler.MaxPerBase != 2 || cfg.Scheduler.QueueLimit != 100000 {
 		t.Fatalf("clamping failed: %+v", cfg)
 	}
 	cfg.Processing.Provider = "unsupported"

@@ -236,8 +236,63 @@ func TestFileImportReindexAndDeleteCascade(t *testing.T) {
 	if err := f.service.DeleteDocument(doc.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if stored, err := f.raw.Read(doc.RawFilePath); err != nil || stored != nil {
-		t.Fatalf("raw read after delete should be nil,nil: %v", err)
+	tree, err := f.raw.ListAll()
+	if err != nil || len(tree) != 0 {
+		t.Fatalf("raw tree after delete: %v %v", tree, err)
+	}
+}
+
+func TestHistoricalRawSurvivesUnpublishedCurrentPathReplacement(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	data := []byte("# Citation\n\nold published raw bytes\n")
+	doc, err := f.service.AddFileDocument(context.Background(), base.ID, "citation.md", data, "")
+	if err != nil {
+		t.Fatalf("add file: %v", err)
+	}
+	generation, version := doc.ActiveIndexGen, doc.SourceVersion
+	storedDoc, _, err := f.service.GetDocument(doc.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, version = storedDoc.ActiveIndexGen, storedDoc.SourceVersion
+	raw, err := f.service.GetRawFileForCitation(doc.ID, RawCitationOptions{
+		IndexGeneration: &generation, SourceVersion: &version,
+	})
+	if err != nil || string(raw.Bytes) != string(data) {
+		t.Fatalf("pinned raw: %+v %v", raw, err)
+	}
+
+	// Publish a second immutable generation, then simulate the legacy race:
+	// replacement bytes reach the current shared path before activation. The
+	// old citation must still resolve its pinned version.
+	reindexed, err := f.service.ReindexDocument(context.Background(), doc.ID)
+	if err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	reindexed, err = f.service.store.getDocument(doc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reindexed.ActiveIndexGen != generation+1 || reindexed.SourceVersion != version+1 {
+		t.Fatalf("reindex identity: %+v", reindexed)
+	}
+	replacement := []byte("# Citation\n\nunpublished replacement bytes\n")
+	if _, err := f.raw.Write(base.ID, doc.ID, ".md", replacement); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.service.GetRawFileForCitation(doc.ID, RawCitationOptions{
+		IndexGeneration: &reindexed.ActiveIndexGen,
+		SourceVersion:   &reindexed.SourceVersion,
+	})
+	if err != nil || string(current.Bytes) != string(data) {
+		t.Fatalf("current immutable raw: %+v %v", current, err)
+	}
+	if _, err := f.service.GetRawFileForCitation(doc.ID, RawCitationOptions{
+		IndexGeneration: &generation,
+		SourceVersion:   &version,
+	}); err != nil || string(raw.Bytes) != string(data) {
+		t.Fatalf("retained historical raw: %+v %v", raw, err)
 	}
 }
 
@@ -280,8 +335,11 @@ func TestDirectoryParseFailureRetainsSourceForReindex(t *testing.T) {
 	// Simulate a parser becoming able to read the same source after the
 	// original failed import. Reindex must use the preserved source rather
 	// than the source-less failure placeholder created by the old flow.
-	if _, err := f.raw.Write(base.ID, failed.ID, ".md", []byte("recovered content")); err != nil {
+	if _, err := f.raw.WriteVersion(base.ID, failed.ID, 1, ".md", []byte("recovered content")); err != nil {
 		t.Fatal(err)
+	}
+	if recovered, err := f.raw.Read(full.RawFilePath); err != nil || string(recovered) != "recovered content" {
+		t.Fatalf("versioned recovery source: %q %v", recovered, err)
 	}
 	if _, err := f.service.ReindexDocument(context.Background(), failed.ID); err != nil {
 		t.Fatalf("reindex recovered source: %v", err)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -277,12 +276,23 @@ func (s *Service) ImportDirectoryTree(ctx context.Context, baseID, rootPath stri
 	if s.jobMgr == nil {
 		return "", fmt.Errorf("job manager is not running")
 	}
+	container, err := s.prepareDirectoryImport(baseID, rootPath)
+	if err != nil {
+		return "", err
+	}
+	return s.submitDirectorySync("import_directory", container)
+}
+
+// prepareDirectoryImport validates a filesystem source and binds it to a
+// stable directory container. Both legacy jobs and durable operations use this
+// boundary, so a replay resolves the same source by path.
+func (s *Service) prepareDirectoryImport(baseID, rootPath string) (Document, error) {
 	rootPath = strings.TrimSpace(rootPath)
 	if rootPath == "" {
-		return "", fmt.Errorf("path is required")
+		return Document{}, fmt.Errorf("path is required")
 	}
 	if info, err := os.Stat(rootPath); err != nil || !info.IsDir() {
-		return "", fmt.Errorf("path is not a readable directory: %s", rootPath)
+		return Document{}, fmt.Errorf("path is not a readable directory: %s", rootPath)
 	}
 	absolute, err := filepath.Abs(rootPath)
 	if err != nil {
@@ -292,12 +302,26 @@ func (s *Service) ImportDirectoryTree(ctx context.Context, baseID, rootPath stri
 	if err == ErrNotFound {
 		container, err = s.CreateDirectory(baseID, filepath.Base(absolute), "", absolute)
 		if err != nil {
-			return "", err
+			return Document{}, err
 		}
 	} else if err != nil {
-		return "", err
+		return Document{}, err
 	}
-	return s.submitDirectorySync("import_directory", container)
+	return container, nil
+}
+
+// RunDirectoryImport executes the directory command synchronously in the
+// caller's worker. A persistent operation adapter calls this; the incremental
+// sync makes a replay after a crash safe.
+func (s *Service) RunDirectoryImport(ctx context.Context, baseID, rootPath string, report func(jobs.ProgressUpdate)) (Document, error) {
+	container, err := s.prepareDirectoryImport(baseID, rootPath)
+	if err != nil {
+		return Document{}, err
+	}
+	if _, err := s.runDirectorySync(ctx, container, report); err != nil {
+		return container, err
+	}
+	return s.store.getDocument(container.ID)
 }
 
 // importChildFile imports one scanned file incrementally:
@@ -358,15 +382,23 @@ func (s *Service) importChildFile(ctx context.Context, baseID, containerID strin
 // Missing/unreadable roots keep their existing subtree and fail visibly
 // instead of wiping content that can no longer be verified on disk.
 func (s *Service) RescanDirectory(directoryID string) (string, error) {
-	doc, err := s.store.getDocument(directoryID)
+	container, err := s.prepareDirectoryRescan(directoryID)
 	if err != nil {
 		return "", err
 	}
+	return s.submitDirectorySync("rescan_directory", container)
+}
+
+func (s *Service) prepareDirectoryRescan(directoryID string) (Document, error) {
+	doc, err := s.store.getDocument(directoryID)
+	if err != nil {
+		return Document{}, err
+	}
 	if doc.SourceType != "directory" {
-		return "", fmt.Errorf("document is not a directory")
+		return Document{}, fmt.Errorf("document is not a directory")
 	}
 	if strings.TrimSpace(doc.SourcePath) == "" {
-		return "", fmt.Errorf("directory has no tracked source path")
+		return Document{}, fmt.Errorf("directory has no tracked source path")
 	}
 	if info, statErr := os.Stat(doc.SourcePath); statErr != nil || !info.IsDir() {
 		doc.Status = StatusFailed
@@ -374,11 +406,24 @@ func (s *Service) RescanDirectory(directoryID string) (string, error) {
 		doc.ErrorMessage = fmt.Sprintf("tracked directory is not readable: %s", doc.SourcePath)
 		doc.UpdatedAt = now()
 		if err := s.store.putDocument(doc); err != nil {
-			return "", err
+			return Document{}, err
 		}
-		return "", fmt.Errorf("%s", doc.ErrorMessage)
+		return Document{}, fmt.Errorf("%s", doc.ErrorMessage)
 	}
-	return s.submitDirectorySync("rescan_directory", doc)
+	return doc, nil
+}
+
+// RunDirectoryRescan executes a persisted rescan command in an Operation
+// worker using the remembered source path.
+func (s *Service) RunDirectoryRescan(ctx context.Context, directoryID string, report func(jobs.ProgressUpdate)) (Document, error) {
+	container, err := s.prepareDirectoryRescan(directoryID)
+	if err != nil {
+		return Document{}, err
+	}
+	if _, err := s.runDirectorySync(ctx, container, report); err != nil {
+		return container, err
+	}
+	return s.store.getDocument(container.ID)
 }
 
 // RepointSource changes the live path of one top-level file or directory.
@@ -451,57 +496,21 @@ func (s *Service) DeleteDirectoryRecursiveWithProgress(ctx context.Context, dire
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	doc, err := s.store.getDocument(directoryID)
+	doc, err := s.store.getDocumentIncludingDeleting(directoryID)
 	if err != nil {
 		return 0, err
 	}
 	if doc.SourceType != "directory" {
 		return 0, fmt.Errorf("document is not a directory")
 	}
-	docs, err := s.store.listDocumentMetadata(doc.BaseID)
-	if err != nil {
-		return 0, err
-	}
-	removed := 0
-	for _, child := range docs {
-		if child.ParentDirectoryID != directoryID {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return removed, err
-		}
-		var childErr error
-		if child.SourceType == "directory" {
-			var childRemoved int
-			childRemoved, childErr = s.DeleteDirectoryRecursiveWithProgress(ctx, child.ID, onDeleted)
-			removed += childRemoved
-		} else {
-			childErr = s.DeleteDocument(child.ID)
-			if childErr == nil {
-				removed++
-				if onDeleted != nil {
-					onDeleted()
-				}
-			}
-		}
-		if childErr != nil && !errors.Is(childErr, ErrNotFound) {
-			return removed, childErr
-		}
-	}
-	if err := s.DeleteDocument(doc.ID); err != nil && err != ErrNotFound {
-		return removed, err
-	}
-	if onDeleted != nil {
-		onDeleted()
-	}
-	return removed + 1, nil
+	return s.deleteDocumentTree(ctx, directoryID, onDeleted)
 }
 
 func (s *Service) submitDirectorySync(kind string, container Document) (string, error) {
 	if s.jobMgr == nil {
 		return "", fmt.Errorf("job manager is not running")
 	}
-	containerID, baseID, root := container.ID, container.BaseID, container.SourcePath
+	containerID, baseID := container.ID, container.BaseID
 	container.Status = StatusProcessing
 	// The document phase is constrained by the existing schema to parsing or
 	// embedding. The job itself carries the more precise "scanning" phase.
@@ -514,43 +523,64 @@ func (s *Service) submitDirectorySync(kind string, container Document) (string, 
 		return "", err
 	}
 	jobID, err := s.jobMgr.SubmitIOWithProgress(kind, baseID, 0, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
-		report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0})
-		entries, scanErr := s.scanDirectoryTree(jobCtx, root)
-		if scanErr != nil {
-			s.markDirectorySyncFailed(containerID, scanErr)
-			return scanErr
-		}
-		report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0, Total: len(entries)})
-		lastProgress := -1
-		lastReportAt := time.Time{}
-		progressStep := len(entries) / 100
-		if progressStep < 1 {
-			progressStep = 1
-		}
-		emitProgress := func(progress int, file string) {
-			completed := progress >= len(entries)
-			now := time.Now()
-			if !completed && progress-lastProgress < progressStep && now.Sub(lastReportAt) < 500*time.Millisecond {
-				return
-			}
-			lastProgress = progress
-			lastReportAt = now
-			s.updateDirectorySyncProgress(containerID, progress)
-			report(jobs.ProgressUpdate{Phase: PhaseScanning, File: file, Completed: progress, Total: len(entries)})
-		}
-		syncErr := s.syncNestedDirectoryTree(jobCtx, baseID, containerID, root, entries, emitProgress)
-		if syncErr == nil && len(entries) == 0 {
-			emitProgress(0, "")
-		}
-		if syncErr != nil {
-			s.markDirectorySyncFailed(containerID, syncErr)
-		}
-		return syncErr
+		_, err := s.runDirectorySync(jobCtx, container, report)
+		return err
 	})
 	if err != nil {
 		s.markDirectorySyncFailed(containerID, err)
 	}
 	return jobID, err
+}
+
+func (s *Service) runDirectorySync(ctx context.Context, container Document, report func(jobs.ProgressUpdate)) (int, error) {
+	if report == nil {
+		report = func(jobs.ProgressUpdate) {}
+	}
+	containerID, baseID, root := container.ID, container.BaseID, container.SourcePath
+	container.Status = StatusProcessing
+	// The document phase is constrained by the existing schema to parsing or
+	// embedding. The job itself carries the more precise "scanning" phase.
+	container.Phase = PhaseParsing
+	container.Progress = 0
+	container.ErrorCode = ""
+	container.ErrorMessage = ""
+	container.UpdatedAt = now()
+	if err := s.store.putDocument(container); err != nil {
+		return 0, err
+	}
+	report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0})
+	entries, scanErr := s.scanDirectoryTree(ctx, root)
+	if scanErr != nil {
+		s.markDirectorySyncFailed(containerID, scanErr)
+		return 0, scanErr
+	}
+	report(jobs.ProgressUpdate{Phase: PhaseScanning, Percent: 0, Total: len(entries)})
+	lastProgress := -1
+	lastReportAt := time.Time{}
+	progressStep := len(entries) / 100
+	if progressStep < 1 {
+		progressStep = 1
+	}
+	emitProgress := func(progress int, file string) {
+		completed := progress >= len(entries)
+		now := time.Now()
+		if !completed && progress-lastProgress < progressStep && now.Sub(lastReportAt) < 500*time.Millisecond {
+			return
+		}
+		lastProgress = progress
+		lastReportAt = now
+		s.updateDirectorySyncProgress(containerID, progress)
+		report(jobs.ProgressUpdate{Phase: PhaseScanning, File: file, Completed: progress, Total: len(entries)})
+	}
+	syncErr := s.syncNestedDirectoryTree(ctx, baseID, containerID, root, entries, emitProgress)
+	if syncErr == nil && len(entries) == 0 {
+		emitProgress(0, "")
+	}
+	if syncErr != nil {
+		s.markDirectorySyncFailed(containerID, syncErr)
+		return len(entries), syncErr
+	}
+	return max(len(entries), 1), nil
 }
 
 func (s *Service) updateDirectorySyncProgress(id string, progress int) {

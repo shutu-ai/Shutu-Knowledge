@@ -13,10 +13,12 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 )
 
 func testApp(t *testing.T) *app.App {
@@ -41,6 +43,9 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 		"knowledge_delete_document", "knowledge_import_url", "knowledge_refresh_url",
 		"knowledge_stats", "knowledge_get_document", "knowledge_read_document",
 		"knowledge_reindex_document", "knowledge_reindex_base",
+		"knowledge_maintenance_storage",
+		"knowledge_operation_status", "knowledge_operation_cancel",
+		"knowledge_operation_retry",
 	}
 	gotTools := make([]string, 0, len(manifest.Tools.Definitions))
 	for _, definition := range manifest.Tools.Definitions {
@@ -60,7 +65,7 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 	}
 	for _, definition := range manifest.Tools.Definitions {
 		switch definition.Name {
-		case "knowledge_delete_base", "knowledge_delete_document":
+		case "knowledge_delete_base", "knowledge_delete_document", "knowledge_maintenance_storage":
 			if definition.Risk != extension.ToolRiskDestructive || !definition.RequiresApproval {
 				t.Fatalf("%s risk: %+v", definition.Name, definition)
 			}
@@ -69,6 +74,49 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 				t.Fatalf("%s risk: %+v", definition.Name, definition)
 			}
 		}
+	}
+}
+
+func TestMaintenanceStorageToolQuarantinesOrphans(t *testing.T) {
+	application := testApp(t)
+	base, err := application.Knowledge.CreateBase("Maintenance", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(application.RawStore.Root(), base.ID, "orphan.bin")
+	if err := os.MkdirAll(filepath.Dir(orphan), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphan, []byte("bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := CallTool(context.Background(), application, extension.ToolCallRequest{
+		Name: "knowledge_maintenance_storage",
+	})
+	if err != nil || result.Error != "" {
+		t.Fatalf("submit maintenance: %v %s", err, result.Error)
+	}
+	submitted := result.Value.(map[string]any)
+	operationID, _ := submitted["operationId"].(string)
+	if operationID == "" {
+		t.Fatalf("maintenance submission: %#v", submitted)
+	}
+	operation := waitForOperation(t, application, operationID)
+	if operation.State != operations.StateSucceeded {
+		t.Fatalf("maintenance operation: %#v", operation)
+	}
+	var maintenanceResult struct {
+		Quarantined     int   `json:"quarantined"`
+		QuarantineBytes int64 `json:"quarantineBytes"`
+	}
+	if err := json.Unmarshal(operation.Result, &maintenanceResult); err != nil {
+		t.Fatal(err)
+	}
+	if maintenanceResult.Quarantined != 1 || maintenanceResult.QuarantineBytes != 5 {
+		t.Fatalf("maintenance result: %+v", maintenanceResult)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan remained active: %v", err)
 	}
 }
 
@@ -178,9 +226,26 @@ func TestToolLifecycleAndContext(t *testing.T) {
 	if result.Error != "" {
 		t.Fatalf("add document: %s", result.Error)
 	}
-	value := result.Value.(map[string]any)
-	if value["chunkCount"].(int) < 1 {
-		t.Fatalf("add document result: %#v", value)
+	submitted := result.Value.(map[string]any)
+	operationID, _ := submitted["operationId"].(string)
+	if operationID == "" {
+		t.Fatalf("add document submission: %#v", submitted)
+	}
+	operation := waitForOperation(t, application, operationID)
+	if operation.State != operations.StateSucceeded {
+		t.Fatalf("add document operation: %#v", operation)
+	}
+	var documentResult map[string]any
+	if err := json.Unmarshal(operation.Result, &documentResult); err != nil {
+		t.Fatal(err)
+	}
+	documents, _ := documentResult["documents"].([]any)
+	if len(documents) != 1 {
+		t.Fatalf("add document result: %#v", documentResult)
+	}
+	document, _ := documents[0].(map[string]any)
+	if chunkCount, _ := document["chunkCount"].(float64); chunkCount < 1 {
+		t.Fatalf("add document result: %#v", documentResult)
 	}
 
 	search, err := CallTool(ctx, application, extension.ToolCallRequest{
@@ -244,6 +309,126 @@ func TestToolLifecycleAndContext(t *testing.T) {
 	})
 	if err != nil || disabled.Error == "" {
 		t.Fatalf("disabled scope: %#v %#v", disabled, err)
+	}
+}
+
+type gatedAgentEmbedder struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *gatedAgentEmbedder) Embed(_ context.Context, texts []string) ([][]float64, error) {
+	close(e.started)
+	<-e.release
+	out := make([][]float64, 0, len(texts))
+	for range texts {
+		out = append(out, []float64{1, 0})
+	}
+	return out, nil
+}
+
+func (e *gatedAgentEmbedder) ModelKey() string { return "fake:gated-agent" }
+
+func TestOperationCancelToolCancelsRunningImport(t *testing.T) {
+	application := testApp(t)
+	ctx := context.Background()
+	base, err := application.Knowledge.CreateBase("Agent Cancel", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.Config.Embedding.Provider = "openai"
+	application.Knowledge.SetGlobalConfig(application.Config)
+	blocked := &gatedAgentEmbedder{started: make(chan struct{}), release: make(chan struct{})}
+	application.Knowledge.SetProviders(blocked, nil)
+
+	submittedCall, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name: "knowledge_add_document",
+		Arguments: map[string]any{
+			"baseId": base.ID, "title": "Cancellable", "content": "# Storage\n\nwait for Agent cancellation",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submittedCall.Error != "" {
+		t.Fatalf("submit through Agent tool: %s", submittedCall.Error)
+	}
+	submitted := submittedCall.Value.(map[string]any)
+	operationID, _ := submitted["operationId"].(string)
+	if operationID == "" {
+		t.Fatalf("Agent submission omitted operationId: %#v", submitted)
+	}
+	select {
+	case <-blocked.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Agent-submitted import did not reach cancellable embedding phase")
+	}
+
+	cancelCall, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name:      "knowledge_operation_cancel",
+		Arguments: map[string]any{"operationId": operationID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelCall.Error != "" {
+		t.Fatalf("cancel through Agent tool: %s", cancelCall.Error)
+	}
+	cancelling := cancelCall.Value.(operations.Operation)
+	if cancelling.State != operations.StateCancelling || !cancelling.CancelRequested {
+		t.Fatalf("Agent cancel response: %#v", cancelling)
+	}
+	close(blocked.release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		statusCall, err := CallTool(ctx, application, extension.ToolCallRequest{
+			Name:      "knowledge_operation_status",
+			Arguments: map[string]any{"operationId": operationID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if statusCall.Error != "" {
+			t.Fatalf("status after Agent cancel: %s", statusCall.Error)
+		}
+		operation := statusCall.Value.(operations.Operation)
+		if operation.State == operations.StateCancelled {
+			break
+		}
+		if operation.State == operations.StateSucceeded || operation.State == operations.StateFailed {
+			t.Fatalf("Agent cancel converged to %s: %#v", operation.State, operation)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation state = %s", operation.State)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitForOperation(t *testing.T, application *app.App, operationID string) operations.Operation {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		result, err := CallTool(context.Background(), application, extension.ToolCallRequest{
+			Name:      "knowledge_operation_status",
+			Arguments: map[string]any{"operationId": operationID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Error != "" {
+			t.Fatalf("operation status: %s", result.Error)
+		}
+		operation := result.Value.(operations.Operation)
+		switch operation.State {
+		case operations.StateSucceeded, operations.StateFailed, operations.StateCancelled:
+			return operation
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %s did not finish: %#v", operationID, operation)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

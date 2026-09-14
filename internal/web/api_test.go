@@ -8,14 +8,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
-	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 	"os"
 	"path/filepath"
@@ -71,6 +72,68 @@ func valueMap(t *testing.T, payload map[string]any) map[string]any {
 	return value
 }
 
+func createTextDocument(t *testing.T, s *Server, baseID, title, content string) string {
+	t.Helper()
+	code, payload := call(t, s, "POST", "/api/bases/"+baseID+"/documents", map[string]any{
+		"title": title, "content": content,
+	})
+	if code != http.StatusAccepted {
+		t.Fatalf("add document status = %d, body=%v", code, payload)
+	}
+	accepted := valueMap(t, payload)
+	documentID := accepted["documentId"].(string)
+	operationID := accepted["operationId"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		op, err := s.app.Operations.Get(operationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if op.State == "succeeded" {
+			return documentID
+		}
+		if op.State == "failed" {
+			t.Fatalf("add document failed: %s", op.ErrorMessage)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("add document state = %s", op.State)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func addLegacyFiles(t *testing.T, s *Server, baseID string, files []map[string]any, conflict string) knowledge.AddFilesResult {
+	t.Helper()
+	code, payload := call(t, s, "POST", "/api/bases/"+baseID+"/files", map[string]any{
+		"files": files, "conflict": conflict,
+	})
+	if code != http.StatusAccepted {
+		t.Fatalf("add files status = %d, body=%v", code, payload)
+	}
+	operationID := valueMap(t, payload)["operationId"].(string)
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		op, err := s.app.Operations.Get(operationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if op.State == "succeeded" {
+			var result knowledge.AddFilesResult
+			if err := json.Unmarshal(op.Result, &result); err != nil {
+				t.Fatalf("decode add files result: %v", err)
+			}
+			return result
+		}
+		if op.State == "failed" {
+			t.Fatalf("add files failed: %s", op.ErrorMessage)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("add files state = %s", op.State)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestKnowledgeAPIRoundTrip(t *testing.T) {
 	s := newTestServer(t)
 
@@ -83,18 +146,7 @@ func TestKnowledgeAPIRoundTrip(t *testing.T) {
 	baseID := base["id"].(string)
 
 	// Import a text document and read chunks.
-	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/documents", map[string]any{
-		"title":   "Note",
-		"content": "# Head\n\nsome body text",
-	})
-	if code != http.StatusOK {
-		t.Fatalf("add doc: %d %v", code, payload)
-	}
-	doc := valueMap(t, payload)
-	docID := doc["id"].(string)
-	if doc["status"] != "ready" {
-		t.Fatalf("doc not ready: %v", doc)
-	}
+	docID := createTextDocument(t, s, baseID, "Note", "# Head\n\nsome body text")
 
 	code, payload = call(t, s, "GET", "/api/documents/"+docID+"/chunks?limit=10&offset=0", nil)
 	if code != http.StatusOK {
@@ -119,8 +171,22 @@ func TestKnowledgeAPIRoundTrip(t *testing.T) {
 		t.Fatalf("rename: %d", code)
 	}
 	code, _ = call(t, s, "DELETE", "/api/documents/"+docID, nil)
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("delete: %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, _ = call(t, s, "GET", "/api/documents/"+docID+"?includeChunks=false", nil)
+		if code == http.StatusNotFound {
+			break
+		}
+		if code != http.StatusOK {
+			t.Fatalf("deleted document lookup: %d", code)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deleted document remained readable")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// Scope toggle round-trip.
@@ -148,38 +214,34 @@ func TestDocumentDeleteJobRemovesDocumentWithoutBlockingRequest(t *testing.T) {
 		t.Fatalf("create base: %d %v", code, payload)
 	}
 	baseID := valueMap(t, payload)["id"].(string)
-	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/documents", map[string]any{
-		"title": "SmartCare product dictionary.xlsx", "content": "delete job marker",
-	})
-	if code != http.StatusOK {
-		t.Fatalf("create document: %d %v", code, payload)
-	}
-	docID := valueMap(t, payload)["id"].(string)
+	docID := createTextDocument(t, s, baseID, "SmartCare product dictionary.xlsx", "delete job marker")
 
 	code, payload = call(t, s, "POST", "/api/documents/"+docID+"/delete", nil)
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("submit delete job: %d %v", code, payload)
 	}
 	jobID := valueMap(t, payload)["jobId"].(string)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		job, ok := s.app.Jobs.Status(jobID)
-		if !ok {
-			t.Fatalf("delete job missing: %s", jobID)
+		code, payload = call(t, s, "GET", "/api/jobs/"+jobID, nil)
+		if code != http.StatusOK {
+			t.Fatalf("delete job status: %d %v", code, payload)
 		}
-		if job.Status == jobs.StatusDone {
-			if job.Progress != 1 || job.Total != 1 || job.Phase != "deleting" {
-				t.Fatalf("delete job result: %+v", job)
+		job := valueMap(t, payload)
+		if job["status"] != "done" {
+			if job["status"] == "failed" {
+				t.Fatalf("delete job failed: %v", job)
 			}
-			break
+			if time.Now().After(deadline) {
+				t.Fatalf("delete job timeout: %v", job)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		if job.Status == jobs.StatusFailed {
-			t.Fatalf("delete job failed: %+v", job)
+		if int(job["progress"].(float64)) != 1 || int(job["total"].(float64)) != 1 || job["phase"] != "deleting" {
+			t.Fatalf("delete job result: %v", job)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("delete job timeout: %+v", job)
-		}
-		time.Sleep(10 * time.Millisecond)
+		break
 	}
 	code, payload = call(t, s, "GET", "/api/documents/"+docID+"?includeChunks=false", nil)
 	if code != http.StatusNotFound {
@@ -268,12 +330,7 @@ func TestRecallSearchHistoryAPI(t *testing.T) {
 		t.Fatalf("create base: %d %v", code, payload)
 	}
 	baseID := valueMap(t, payload)["id"].(string)
-	code, _ = call(t, s, "POST", "/api/bases/"+baseID+"/documents", map[string]any{
-		"title": "Guide", "content": "The recall history marker is QH-4171.",
-	})
-	if code != http.StatusOK {
-		t.Fatalf("add document: %d", code)
-	}
+	createTextDocument(t, s, baseID, "Guide", "The recall history marker is QH-4171.")
 
 	request := map[string]any{
 		"query": "recall history marker", "baseId": baseID,
@@ -338,7 +395,7 @@ func TestDocumentTreeAndGroupAPI(t *testing.T) {
 	}
 	baseID := valueMap(t, payload)["id"].(string)
 	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/import-directory", map[string]any{"path": source})
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("import directory: %d %v", code, payload)
 	}
 	jobID := valueMap(t, payload)["jobId"].(string)
@@ -389,29 +446,31 @@ func TestDocumentTreeAndGroupAPI(t *testing.T) {
 	}
 
 	code, payload = call(t, s, "POST", "/api/documents/"+rootID+"/delete-tree-job", nil)
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("submit delete document tree job: %d %v", code, payload)
 	}
 	deleteJobID := valueMap(t, payload)["jobId"].(string)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		job, ok := s.app.Jobs.Status(deleteJobID)
-		if !ok {
-			t.Fatalf("delete tree job missing: %s", deleteJobID)
+		code, payload = call(t, s, "GET", "/api/jobs/"+deleteJobID, nil)
+		if code != http.StatusOK {
+			t.Fatalf("delete tree job status: %d %v", code, payload)
 		}
-		if job.Status == jobs.StatusDone {
-			if job.Progress != 3 || job.Total != 3 || job.Phase != "deleting" {
-				t.Fatalf("delete tree job result: %+v", job)
+		job := valueMap(t, payload)
+		if job["status"] != "done" {
+			if job["status"] == "failed" {
+				t.Fatalf("delete tree job failed: %v", job)
 			}
-			break
+			if time.Now().After(deadline) {
+				t.Fatalf("delete tree job timeout: %v", job)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-		if job.Status == jobs.StatusFailed {
-			t.Fatalf("delete tree job failed: %+v", job)
+		if int(job["progress"].(float64)) != 3 || int(job["total"].(float64)) != 3 || job["phase"] != "deleting" {
+			t.Fatalf("delete tree job result: %v", job)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("delete tree job timeout: %+v", job)
-		}
-		time.Sleep(10 * time.Millisecond)
+		break
 	}
 	_, payload = call(t, s, "GET", "/api/bases/"+baseID+"/documents", nil)
 	if len(payload["value"].([]any)) != 0 {
@@ -595,27 +654,27 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	}
 
 	code, payload = call(t, s, "POST", "/api/local-models/self-test", map[string]any{"id": "local:owner/custom-reranker"})
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("self-test: %d %v", code, payload)
 	}
 	jobID := valueMap(t, payload)["jobId"].(string)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		job, ok := application.Jobs.Status(jobID)
-		if !ok {
-			t.Fatalf("self-test job missing: %s", jobID)
+		op, err := application.Operations.Get(jobID)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if job.Status == "done" {
-			if job.Progress != 100 || job.Phase != "ready" {
-				t.Fatalf("self-test job result: %+v", job)
+		if op.State == operations.StateSucceeded {
+			if op.CompletedUnits != 100 || op.Phase != "ready" {
+				t.Fatalf("self-test operation result: %+v", op)
 			}
 			break
 		}
-		if job.Status == "failed" {
-			t.Fatalf("self-test job failed: %+v", job)
+		if op.State == operations.StateFailed {
+			t.Fatalf("self-test operation failed: %+v", op)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("self-test job timeout: %+v", job)
+			t.Fatalf("self-test operation timeout: %+v", op)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -727,12 +786,36 @@ func TestModelCacheMigrationAPI(t *testing.T) {
 	code, payload = call(t, s, "POST", "/api/local-models/cache-migration", map[string]any{
 		"targetDir": target, "removeSource": true,
 	})
-	if code != http.StatusOK {
+	if code != http.StatusAccepted {
 		t.Fatalf("migrate cache: %d %v", code, payload)
 	}
-	result := valueMap(t, payload)
-	if result["modelCount"].(float64) != 1 || result["sourceRemoved"] != true {
-		t.Fatalf("migration result: %v", result)
+	migrationID := valueMap(t, payload)["jobId"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	var migrationResult struct {
+		ModelCount   int  `json:"modelCount"`
+		SourceRemove bool `json:"sourceRemoved"`
+	}
+	for {
+		op, err := application.Operations.Get(migrationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if op.State == operations.StateSucceeded {
+			if err := json.Unmarshal(op.Result, &migrationResult); err != nil {
+				t.Fatalf("decode migration result %s: %v", op.Result, err)
+			}
+			break
+		}
+		if op.State == operations.StateFailed {
+			t.Fatalf("migration operation failed: %+v", op)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("migration operation timeout: %+v", op)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if migrationResult.ModelCount != 1 || migrationResult.SourceRemove != true {
+		t.Fatalf("migration result: %+v", migrationResult)
 	}
 	if application.Config.Models.CacheDir != filepath.Clean(target) || application.Models.Root() != filepath.Clean(target) {
 		t.Fatalf("migration was not activated: config=%q root=%q",
@@ -746,7 +829,7 @@ func TestModelCacheMigrationAPI(t *testing.T) {
 	}
 
 	code, _ = call(t, s, "POST", "/api/local-models/cache-migration", map[string]any{
-		"targetDir": home, "removeSource": false,
+		"targetDir": filepath.Join(target, "nested"), "removeSource": false,
 	})
 	if code != http.StatusBadRequest {
 		t.Fatalf("nested target should fail: %d", code)
@@ -799,15 +882,14 @@ func TestAddFilesConflictRoundTrip(t *testing.T) {
 
 	content := base64Of("# Doc")
 	files := []map[string]any{{"fileName": "a.md", "contentBase64": content}}
-	code, payload := call(t, s, "POST", "/api/bases/"+baseID+"/files", map[string]any{"files": files, "conflict": "rename"})
-	if code != http.StatusOK {
-		t.Fatalf("add files: %d %v", code, payload)
+	result := addLegacyFiles(t, s, baseID, files, "rename")
+	if result.Accepted[0].Skipped {
+		t.Fatalf("first import skipped: %+v", result)
 	}
 	// Same content again is skipped (dedup).
-	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/files", map[string]any{"files": files, "conflict": "rename"})
-	accepted := payload["value"].(map[string]any)["accepted"].([]any)
-	if code != http.StatusOK || !accepted[0].(map[string]any)["skipped"].(bool) {
-		t.Fatalf("dedup round: %d %v", code, payload)
+	result = addLegacyFiles(t, s, baseID, files, "rename")
+	if !result.Accepted[0].Skipped {
+		t.Fatalf("dedup round did not skip: %+v", result)
 	}
 	// detect now collides on the title imported in round one.
 	_, _ = call(t, s, "POST", "/api/bases", map[string]any{"name": "Files2"})
@@ -902,9 +984,14 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 	source := valueMap(t, payload)
 	sourceID := source["id"].(string)
 	files := []map[string]any{{"fileName": "source.txt", "contentBase64": base64Of("retry budget is thirty seconds")}}
-	_, payload = call(t, s, "POST", "/api/bases/"+sourceID+"/files", map[string]any{"files": files, "conflict": "rename"})
-	accepted := valueMap(t, payload)["accepted"].([]any)
-	docID := accepted[0].(map[string]any)["id"].(string)
+	result := addLegacyFiles(t, s, sourceID, files, "rename")
+	docID := result.Accepted[0].ID
+	published, _, err := s.app.Knowledge.GetDocument(docID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	citation := fmt.Sprintf("indexGeneration=%d&sourceVersion=%d",
+		published.ActiveIndexGen, published.SourceVersion)
 
 	// Raw source is a binary response, not the normal JSON envelope.
 	req := httptest.NewRequest("GET", "/api/documents/"+docID+"/raw", nil)
@@ -913,6 +1000,34 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.String() != "retry budget is thirty seconds" ||
 		rec.Header().Get("Content-Disposition") == "" {
 		t.Fatalf("raw download: code=%d headers=%v body=%q", rec.Code, rec.Header(), rec.Body.String())
+	}
+	if rec.Header().Get("X-Index-Generation") != strconv.Itoa(int(published.ActiveIndexGen)) ||
+		rec.Header().Get("X-Source-Version") != strconv.Itoa(int(published.SourceVersion)) {
+		t.Fatalf("raw citation headers: %v", rec.Header())
+	}
+	req = httptest.NewRequest("GET", "/api/documents/"+docID+"/raw?"+citation, nil)
+	rec = httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "retry budget is thirty seconds" {
+		t.Fatalf("pinned raw download: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if _, err := s.app.Knowledge.ReindexDocument(context.Background(), docID); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest("GET", "/api/documents/"+docID+"/raw?"+citation, nil)
+	rec = httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "retry budget is thirty seconds" ||
+		rec.Header().Get("X-Index-Generation") != strconv.Itoa(int(published.ActiveIndexGen)) ||
+		rec.Header().Get("X-Source-Version") != strconv.Itoa(int(published.SourceVersion)) {
+		t.Fatalf("retained historical raw citation = %d %q headers=%v", rec.Code, rec.Body.String(), rec.Header())
+	}
+	current, _, err := s.app.Knowledge.GetDocument(docID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ActiveIndexGen != published.ActiveIndexGen+1 || current.SourceVersion != published.SourceVersion+1 {
+		t.Fatalf("reindex did not advance citation identity: before=%+v after=%+v", published, current)
 	}
 	req = httptest.NewRequest("GET", "/api/documents/"+docID+"/raw?inline=1", nil)
 	rec = httptest.NewRecorder()
@@ -942,7 +1057,7 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 		t.Fatalf("metrics: %d %v", code, payload)
 	}
 	metrics := valueMap(t, payload)
-	if int(metrics["imports"].(float64)) != 2 || int(metrics["searches"].(float64)) != 1 ||
+	if int(metrics["imports"].(float64)) != 3 || int(metrics["searches"].(float64)) != 1 ||
 		int(metrics["contextCount"].(float64)) != 1 || int(metrics["candidateCount"].(float64)) < 1 {
 		t.Fatalf("metrics: %v", metrics)
 	}

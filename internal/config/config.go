@@ -90,6 +90,7 @@ type Config struct {
 		RRFVectorWeight  float64 `yaml:"rrfVectorWeight" json:"rrfVectorWeight"`
 		SiblingChunks    int     `yaml:"siblingChunks" json:"siblingChunks"`
 		ContextTimeoutMS int     `yaml:"contextTimeoutMs" json:"contextTimeoutMs"`
+		SearchTimeoutMS  int     `yaml:"searchTimeoutMs" json:"searchTimeoutMs"`
 	} `yaml:"retrieval" json:"retrieval"`
 
 	// Processing is the deployment-wide document processor default. A base
@@ -124,12 +125,33 @@ type Config struct {
 		WorkerIdleTimeoutMS int    `yaml:"workerIdleTimeoutMs" json:"workerIdleTimeoutMs"`
 	} `yaml:"models" json:"models"`
 
+	// Scheduler bounds long-running work across independent resource lanes.
+	// These limits protect SQLite, disk, model helpers, and remote endpoints
+	// from one workload monopolizing the process.
+	Scheduler struct {
+		IO          int `yaml:"io" json:"io"`
+		DBWrite     int `yaml:"dbWrite" json:"dbWrite"`
+		Disk        int `yaml:"disk" json:"disk"`
+		Network     int `yaml:"network" json:"network"`
+		Model       int `yaml:"model" json:"model"`
+		ModelWaitMS int `yaml:"modelWaitMs" json:"modelWaitMs"`
+		Maintenance int `yaml:"maintenance" json:"maintenance"`
+		MaxPerBase  int `yaml:"maxPerBase" json:"maxPerBase"`
+		QueueLimit  int `yaml:"queueLimit" json:"queueLimit"`
+		// IdempotencyRetentionHours bounds the terminal response retry window.
+		// Zero retains bindings indefinitely.
+		IdempotencyRetentionHours int `yaml:"idempotencyRetentionHours" json:"idempotencyRetentionHours"`
+	} `yaml:"scheduler" json:"scheduler"`
+
 	Maintenance struct {
 		// FTSAutoOptimize merges FTS5 index segments after startup.
 		FTSAutoOptimize bool `yaml:"ftsAutoOptimize" json:"ftsAutoOptimize"`
 		// Vacuum is enabled only when the main database reaches the threshold.
 		Vacuum            bool `yaml:"vacuum" json:"vacuum"`
 		VacuumThresholdMB int  `yaml:"vacuumThresholdMB" json:"vacuumThresholdMB"`
+		// Quarantine retention window. Zero retains recovery copies until an
+		// explicit purge; otherwise expired copies are removed by maintenance.
+		QuarantineRetentionHours int `yaml:"quarantineRetentionHours" json:"quarantineRetentionHours"`
 	} `yaml:"maintenance" json:"maintenance"`
 
 	Runtime struct {
@@ -211,6 +233,7 @@ func Defaults() Config {
 	c.Retrieval.RRFVectorWeight = 1
 	c.Retrieval.SiblingChunks = 1
 	c.Retrieval.ContextTimeoutMS = 4000
+	c.Retrieval.SearchTimeoutMS = 8000
 	c.Processing.Provider = "builtin"
 	c.Processing.APIHost = "https://mineru.net"
 	c.Workflow.ConflictStrategy = "rename"
@@ -218,6 +241,16 @@ func Defaults() Config {
 	c.AutoRetrieve.Weight = 3
 	c.Jobs.ImportWorkers = 5
 	c.Jobs.ResumeInterrupt = true
+	c.Scheduler.IO = 2
+	c.Scheduler.DBWrite = 1
+	c.Scheduler.Disk = 1
+	c.Scheduler.Network = 2
+	c.Scheduler.Model = 1
+	c.Scheduler.ModelWaitMS = 2000
+	c.Scheduler.Maintenance = 1
+	c.Scheduler.MaxPerBase = 2
+	c.Scheduler.QueueLimit = 1000
+	c.Scheduler.IdempotencyRetentionHours = 168
 	c.Models.WorkerIdleTimeoutMS = 60000
 	c.Runtime.StartupTimeoutMS = 10000
 	c.Runtime.RequestTimeoutMS = 60000
@@ -225,6 +258,7 @@ func Defaults() Config {
 	c.Maintenance.FTSAutoOptimize = true
 	c.Maintenance.Vacuum = true
 	c.Maintenance.VacuumThresholdMB = 256
+	c.Maintenance.QuarantineRetentionHours = 168
 	c.OCR.Mode = "auto"
 	c.OCR.TimeoutMS = 120000
 	c.OCR.RenderTimeoutMS = 120000
@@ -349,14 +383,26 @@ func (c *Config) clamp() {
 	c.Retrieval.RRFVectorWeight = clampFloat(c.Retrieval.RRFVectorWeight, 0.1, 5, 1)
 	c.Retrieval.SiblingChunks = clampInt(c.Retrieval.SiblingChunks, 0, 3, 1)
 	c.Retrieval.ContextTimeoutMS = clampInt(c.Retrieval.ContextTimeoutMS, 500, 60000, 4000)
+	c.Retrieval.SearchTimeoutMS = clampInt(c.Retrieval.SearchTimeoutMS, 500, 600000, 8000)
 	c.Workflow.URLRefreshHours = clampInt(c.Workflow.URLRefreshHours, 0, 24*365, 0)
 	c.AutoRetrieve.Weight = clampInt(c.AutoRetrieve.Weight, 0, 5, 3)
 	c.Jobs.ImportWorkers = clampInt(c.Jobs.ImportWorkers, 1, 32, 5)
+	c.Scheduler.IO = clampInt(c.Scheduler.IO, 1, 64, 2)
+	c.Scheduler.DBWrite = clampInt(c.Scheduler.DBWrite, 1, 4, 1)
+	c.Scheduler.Disk = clampInt(c.Scheduler.Disk, 1, 16, 1)
+	c.Scheduler.Network = clampInt(c.Scheduler.Network, 1, 16, 2)
+	c.Scheduler.Model = clampInt(c.Scheduler.Model, 1, 8, 1)
+	c.Scheduler.ModelWaitMS = clampInt(c.Scheduler.ModelWaitMS, 100, 60000, 2000)
+	c.Scheduler.Maintenance = clampInt(c.Scheduler.Maintenance, 1, 2, 1)
+	c.Scheduler.MaxPerBase = clampInt(c.Scheduler.MaxPerBase, 1, 16, 2)
+	c.Scheduler.QueueLimit = clampInt(c.Scheduler.QueueLimit, 1, 100000, 1000)
+	c.Scheduler.IdempotencyRetentionHours = clampInt(c.Scheduler.IdempotencyRetentionHours, 0, 87600, 168)
 	c.Models.WorkerIdleTimeoutMS = clampInt(c.Models.WorkerIdleTimeoutMS, 0, 24*3600*1000, 60000)
 	c.Runtime.StartupTimeoutMS = clampInt(c.Runtime.StartupTimeoutMS, 1000, 120000, 10000)
 	c.Runtime.RequestTimeoutMS = clampInt(c.Runtime.RequestTimeoutMS, 1000, 600000, 60000)
 	c.Runtime.IdleTimeoutMS = clampInt(c.Runtime.IdleTimeoutMS, 0, 24*3600*1000, 300000)
 	c.Maintenance.VacuumThresholdMB = clampInt(c.Maintenance.VacuumThresholdMB, 16, 4096, 256)
+	c.Maintenance.QuarantineRetentionHours = clampInt(c.Maintenance.QuarantineRetentionHours, 0, 87600, 168)
 	c.OCR.RenderTimeoutMS = clampInt(c.OCR.RenderTimeoutMS, 1000, 600000, 120000)
 	c.Helpers.ImageDecoderTimeoutMS = clampInt(c.Helpers.ImageDecoderTimeoutMS, 1000, 600000, 120000)
 	switch c.Embedding.Provider {

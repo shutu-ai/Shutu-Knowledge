@@ -76,6 +76,10 @@ type Base struct {
 	Config      BaseConfig `json:"config,omitempty"`
 	CreatedAt   int64      `json:"createdAt"`
 	UpdatedAt   int64      `json:"updatedAt"`
+	// LifecycleState is the P1 delete fence. It is intentionally separate
+	// from business status and is persisted before cleanup begins.
+	LifecycleState string `json:"-"`
+	MutationEpoch  int64  `json:"-"`
 }
 
 // Document lifecycle statuses.
@@ -133,6 +137,15 @@ type Document struct {
 	ErrorMessage   string `json:"errorMessage,omitempty"`
 	CreatedAt      int64  `json:"createdAt"`
 	UpdatedAt      int64  `json:"updatedAt,omitempty"`
+	// Version/fence state retained on every document. Generation zero is the
+	// compatibility identity assigned to all pre-migration rows.
+	LifecycleState     string `json:"-"`
+	MutationEpoch      int64  `json:"-"`
+	SourceVersion      int64  `json:"-"`
+	ActiveIndexGen     int64  `json:"-"`
+	DesiredIndexGen    int64  `json:"-"`
+	HasDesiredIndexGen bool   `json:"-"`
+	IndexState         string `json:"-"`
 }
 
 // Chunk is one stored chunk. Phase 2 stores text + metadata; embedding and
@@ -149,10 +162,16 @@ type Chunk struct {
 	EmbeddingHash string `json:"-"`
 	// EmbeddingVec/EmbeddingModel are set on the semantic-chunking insert
 	// path; the regular phase-3 path persists vectors via PutChunkVectors.
-	EmbeddingVec   []float64 `json:"-"`
-	EmbeddingModel string    `json:"-"`
-	CreatedAt      int64     `json:"-"`
-	HasEmbedding   bool      `json:"-"`
+	EmbeddingVec    []float64 `json:"-"`
+	EmbeddingModel  string    `json:"-"`
+	CreatedAt       int64     `json:"-"`
+	HasEmbedding    bool      `json:"-"`
+	IndexGeneration int64     `json:"-"`
+	SourceVersion   int64     `json:"-"`
+	// Stage values are used only while inserting a new generation before it
+	// becomes active. They keep reusable vectors attached to the new rows.
+	StageEmbedding      []byte `json:"-"`
+	StageEmbeddingModel string `json:"-"`
 }
 
 // DocumentSummary is the list view of a document.
@@ -176,6 +195,18 @@ type DocumentSummary struct {
 	ErrorMessage   string `json:"errorMessage,omitempty"`
 	CreatedAt      int64  `json:"createdAt"`
 	UpdatedAt      int64  `json:"updatedAt,omitempty"`
+}
+
+// DocumentChildrenPage is one bounded directory view. Breadcrumbs are ordered
+// from the base root to the requested parent and never include raw source text.
+type DocumentChildrenPage struct {
+	ParentID    string            `json:"parentId,omitempty"`
+	Documents   []DocumentSummary `json:"documents"`
+	Total       int               `json:"total"`
+	Limit       int               `json:"limit"`
+	Offset      int               `json:"offset"`
+	HasMore     bool              `json:"hasMore"`
+	Breadcrumbs []DocumentSummary `json:"breadcrumbs"`
 }
 
 // BaseSummary is the list view of a base.

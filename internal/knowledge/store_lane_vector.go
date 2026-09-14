@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 // VectorSearch brute-force scans scoped embeddings for one model space and
 // ranks by cosine similarity (normalized vectors, so dot == cosine). Vectors
 // with a mismatched dimension are skipped, never mixed.
-func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, limit int, modelKey string) ([]LaneHit, error) {
+func (s *store) VectorSearch(ctx context.Context, q queryRunner, queryVector []float64, baseIDs, docIDs []string, limit int, modelKey string) ([]LaneHit, error) {
 	if len(queryVector) == 0 {
 		return nil, nil
 	}
@@ -20,7 +21,10 @@ func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, li
 		return nil, err
 	}
 	querySQL := laneSelect + `
-		FROM chunks c WHERE c.embedding IS NOT NULL`
+		FROM chunks c JOIN documents d ON d.id = c.doc_id
+		JOIN bases b ON b.id = c.base_id
+		WHERE c.embedding IS NOT NULL AND d.lifecycle_state = 'active' AND b.lifecycle_state = 'active'
+		AND c.index_generation = d.active_index_generation`
 	queryArgs := []any{}
 	if modelKey != "" {
 		querySQL += ` AND c.embedding_model = ?`
@@ -28,7 +32,7 @@ func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, li
 	}
 	querySQL += scope
 	queryArgs = append(queryArgs, scopeArgs...)
-	rows, err := s.db.Query(querySQL, queryArgs...)
+	rows, err := q.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("vector lane: %w", err)
 	}
@@ -38,7 +42,8 @@ func (s *store) VectorSearch(queryVector []float64, baseIDs, docIDs []string, li
 		var hit LaneHit
 		var embedding []byte
 		if err := rows.Scan(&hit.ID, &hit.DocID, &hit.BaseID, &hit.Index, &hit.Text, &hit.Heading,
-			&hit.Context, &hit.EmbeddingHash, &hit.CreatedAt, &embedding); err != nil {
+			&hit.Context, &hit.EmbeddingHash, &hit.CreatedAt, &embedding,
+			&hit.IndexGeneration, &hit.SourceVersion); err != nil {
 			return nil, err
 		}
 		hit.Embedding = decodeEmbedding(embedding)
@@ -100,7 +105,7 @@ func decodeEmbedding(blob []byte) []float32 {
 
 // PutChunkVectors persists one embedded batch (crash-recovery write path:
 // every landed batch stays). modelKey tags the vector space.
-func (s *store) PutChunkVectors(docID, modelKey string, byHash map[string][]float64) error {
+func (s *store) PutChunkVectors(docID string, generation int64, modelKey string, byHash map[string][]float64) error {
 	if len(byHash) == 0 {
 		return nil
 	}
@@ -111,8 +116,8 @@ func (s *store) PutChunkVectors(docID, modelKey string, byHash map[string][]floa
 	defer func() { _ = tx.Rollback() }()
 	for hash, vector := range byHash {
 		if _, err := tx.Exec(
-			`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND embedding_text_hash = ?`,
-			encodeEmbedding(vector), modelKey, docID, hash,
+			`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND index_generation = ? AND embedding_text_hash = ?`,
+			encodeEmbedding(vector), modelKey, docID, generation, hash,
 		); err != nil {
 			return err
 		}

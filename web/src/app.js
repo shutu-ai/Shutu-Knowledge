@@ -1,4 +1,4 @@
-import { api, fileToBase64 } from "./api.js";
+import { api, fileSha256, setRouteSignal } from "./api.js";
 import { applyI18n, currentLocale, formatDate, formatNumber, initializeI18n, localized, observeI18n } from "./i18n.js";
 
 const navigation = [
@@ -13,13 +13,16 @@ const navigation = [
 
 const state = {
   route: "overview", bases: [], selectedBaseId: localStorage.getItem("knowledge-base") ?? "", docFolder: "",
+  docOffset: 0, docLimit: 50,
   modelJobs: {}, documentJobs: {}, chunkExpansionAll: false, expandedChunks: new Set(), docExpandedFolders: new Set(),
 };
 const screen = document.getElementById("screen");
 const toastNode = document.getElementById("toast");
 let toastTimer;
 let documentRefreshPromise;
+let documentListRefresh;
 let routeGeneration = 0;
+let routeAbortController;
 const MAX_IMPORT_FILES = 20;
 const SUPPORTED_IMPORT_EXTENSIONS = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.epub";
 
@@ -82,6 +85,7 @@ async function guard(action, successMessage) {
 }
 
 const selectedBase = () => state.bases.find((base) => base.id === state.selectedBaseId);
+const operationStore = new Map();
 const number = formatNumber;
 const date = formatDate;
 const chip = (value = "unknown") => h("span", { class: `chip ${String(value).toLowerCase().replace(/\s+/g, "-")}` }, localized(value));
@@ -156,6 +160,8 @@ function documentJobPhaseText(job) {
 function documentJobCard(id, job) {
   const percent = documentJobPercent(job);
   const indeterminate = documentJobIndeterminate(job);
+  const operation = operationStore.get(id)?.operation;
+  const action = documentJobAction(id, operation);
   return h("article", { class: "document-job", "data-document-job-id": id }, [
     h("div", { class: "document-job-head" }, [
       h("div", { class: "document-job-copy" }, [
@@ -175,9 +181,24 @@ function documentJobCard(id, job) {
     }, h("span", { class: `document-job-fill${indeterminate ? " indeterminate" : ""}`, style: `width:${percent}%` })),
     h("div", { class: "document-job-foot" }, [
       h("span", { class: "muted", "data-document-job-count": "" }, documentJobCountText(job)),
-      h("button", { class: "button small danger", onclick: () => guard(async () => { await api.cancelJob(id); }) }, localized("Cancel")),
+      h("span", { class: "document-job-actions", "data-document-job-actions": "" }, action),
     ]),
   ]);
+}
+
+function documentJobAction(id, operation) {
+  if (operation?.state === "failed" && operation.retryable) {
+    return h("button", { class: "button small", onclick: () => guard(async () => {
+      const retry = await api.retryOperation(id);
+      await trackOperation(retry, operationStore.get(id)?.label);
+    }) }, [icon(icons.refresh), localized("Retry")]);
+  }
+  if (["failed", "cancelled"].includes(operation?.state)) {
+    return h("span", { class: "muted" }, localized(operation.state));
+  }
+  return h("button", { class: "button small danger", onclick: () => guard(async () => {
+    await (operation ? api.cancelOperation(id) : api.cancelJob(id));
+  }) }, localized("Cancel"));
 }
 
 function updateDocumentJobCard(id, job, label) {
@@ -193,6 +214,7 @@ function updateDocumentJobCard(id, job, label) {
   const countNode = card.querySelector("[data-document-job-count]");
   const progressNode = card.querySelector(".document-job-progress");
   const fillNode = card.querySelector(".document-job-fill");
+  const actionNode = card.querySelector("[data-document-job-actions]");
   if (statusNode) {
     statusNode.textContent = localized(job.status || "pending");
     statusNode.className = `chip document-job-status ${job.status || "pending"}`;
@@ -215,6 +237,11 @@ function updateDocumentJobCard(id, job, label) {
     fillNode.classList.toggle("indeterminate", indeterminate);
     fillNode.style.width = `${percent}%`;
   }
+  if (actionNode) {
+    const operation = operationStore.get(id)?.operation;
+    actionNode.replaceChildren(documentJobAction(id, operation));
+  }
+  syncDocumentJobSection();
   if (label) {
     const title = card.querySelector(".document-job-copy strong");
     if (title) title.textContent = label;
@@ -223,20 +250,118 @@ function updateDocumentJobCard(id, job, label) {
 
 function documentJobSection() {
   const entries = Object.entries(state.documentJobs);
+  const activeCount = entries.filter(([, job]) => !["done", "failed", "cancelled", "succeeded"].includes(job.status)).length;
   return h("section", { class: "section", "data-document-jobs-section": "", hidden: !entries.length }, [
     h("div", { class: "section-head" }, [
       h("h2", {}, localized("Document tasks")),
-      h("span", { class: "chip processing", "data-document-job-summary": "" }, `${entries.length} ${localized("active tasks")}`),
+      h("span", { class: "chip processing", "data-document-job-summary": "" }, `${activeCount} ${localized("active tasks")}`),
     ]),
     h("div", { class: "document-jobs", "data-document-jobs-container": "" }, entries.map(([id, job]) => documentJobCard(id, job))),
   ]);
 }
 
+function operationPhaseText(operation) {
+  if (operation.state === "queued") return localized("Queued for disk");
+  if (operation.phase === "fetching") return localized("Loading file");
+  if (operation.phase === "scanning") return localized("Scanning directory");
+  if (operation.phase === "deleting") return localized("Deleting document");
+  if (operation.phase === "importing") return localized("Importing document");
+  if (operation.phase === "parsing") return localized("Parsing file");
+  if (operation.phase === "embedding") return localized("Embedding file");
+  if (operation.phase === "reindexing") return localized("Reindexing file");
+  if (operation.phase === "deleting") return localized("Deleting document");
+  return localized("Processing");
+}
+
+function rememberOperation(operation, label = "") {
+  const previous = operationStore.get(operation.operationId) || {};
+  const entry = {
+    ...previous,
+    operation,
+    label: label || previous.label || operation.operationId,
+    stateRevision: Math.max(Number(previous.stateRevision || 0), Number(operation.stateRevision || 0)),
+  };
+  operationStore.set(operation.operationId, entry);
+  const terminal = ["succeeded", "failed", "cancelled"].includes(operation.state);
+  if (!terminal) {
+    state.documentJobs[operation.operationId] = {
+      label: entry.label, kind: operation.type, status: operation.state,
+      progress: operation.completedUnits || 0, total: operation.totalUnits || 0,
+      phase: operation.phase || operationPhaseText(operation),
+      file: "",
+    };
+  } else if (["failed", "cancelled"].includes(operation.state)) {
+    state.documentJobs[operation.operationId] = {
+      label: entry.label, kind: operation.type, status: operation.state,
+      progress: operation.completedUnits || 0, total: operation.totalUnits || 0,
+      phase: operation.phase || operationPhaseText(operation), file: "",
+    };
+  }
+  return entry;
+}
+
+function operationJobView(operation) {
+  return {
+    status: operation.state, progress: operation.completedUnits || 0,
+    total: operation.totalUnits || 0, phase: operation.phase || operationPhaseText(operation),
+  };
+}
+
+async function trackOperation(operation, label) {
+  let remembered = rememberOperation(operation, label);
+  if (state.route === "documents" || state.route === "import") mountDocumentJobSection();
+  if (remembered.pollPromise) return remembered.pollPromise;
+  remembered.pollPromise = (async () => {
+    let current = operation;
+    for (;;) {
+      if (Number(current.stateRevision) >= remembered.stateRevision) {
+        remembered = rememberOperation(current, label);
+        updateDocumentJobCard(current.operationId, operationJobView(current), label);
+      }
+      if (["succeeded", "failed", "cancelled"].includes(current.state)) {
+        refreshDocumentViewInBackground();
+        if (current.state === "succeeded") {
+          delete state.documentJobs[current.operationId];
+          removeDocumentJobCard(current.operationId);
+        }
+        if (current.state !== "succeeded") {
+          throw new Error(current.errorMessage || `Operation ${current.state}`);
+        }
+        return current;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      current = await api.operation(current.operationId);
+    }
+  })();
+  try {
+    return await remembered.pollPromise;
+  } finally {
+    const stored = operationStore.get(operation.operationId);
+    if (stored === remembered) remembered.pollPromise = null;
+    if (remembered.operation?.state === "succeeded") {
+      delete state.documentJobs[operation.operationId];
+      removeDocumentJobCard(operation.operationId);
+    }
+  }
+}
+
+async function recoverOperations() {
+  const { operations } = await api.operations({ states: ["queued", "running", "cancelling"] });
+  for (const operation of operations) {
+    trackOperation(operation, operation.type).catch((error) => showToast(error.message, true));
+  }
+}
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || error?.code === "request_aborted";
+}
+
 function syncDocumentJobSection() {
   const section = document.querySelector("[data-document-jobs-section]");
   if (!section) return;
-  const count = Object.keys(state.documentJobs).length;
-  section.hidden = count === 0;
+  const count = Object.values(state.documentJobs)
+    .filter((job) => !["done", "failed", "cancelled", "succeeded"].includes(job.status)).length;
+  section.hidden = Object.keys(state.documentJobs).length === 0;
   const summary = section.querySelector("[data-document-job-summary]");
   if (summary) summary.textContent = `${count} ${localized("active tasks")}`;
 }
@@ -249,10 +374,12 @@ function removeDocumentJobCard(id) {
 }
 
 function refreshDocumentViewInBackground() {
-  if (state.route !== "documents" && state.route !== "import") return;
+  if (state.route !== "documents" || !documentListRefresh) return;
   if (documentRefreshPromise) return;
-  documentRefreshPromise = render()
-    .catch((error) => showToast(error.message, true))
+  documentRefreshPromise = documentListRefresh()
+    .catch((error) => {
+      if (!isAbortError(error)) showToast(error.message, true);
+    })
     .finally(() => { documentRefreshPromise = null; });
 }
 
@@ -352,14 +479,14 @@ function showRouteError(error) {
   ]));
 }
 
-async function render(initialQuery = "", generation = routeGeneration) {
-  const status = await api.status();
+async function render(initialQuery = "", generation = ++routeGeneration) {
+  const status = await api.status({ signal: routeAbortController?.signal });
   if (!isCurrentRoute(generation)) return;
   const healthChip = chip(status.ready ? "Ready" : "Degraded");
   const searchButton = state.route !== "recall"
     ? h("a", { class: "button", href: "#/recall" }, [icon(icons.search), "Recall Test"]) : null;
   setHeader(`${localized(status.status)} · v${status.version}`, [healthChip, searchButton].filter(Boolean));
-  showContentLoading();
+  screen.replaceChildren();
   try {
     if (state.route === "models") {
       await renderModels();
@@ -367,7 +494,7 @@ async function render(initialQuery = "", generation = routeGeneration) {
     }
     if (state.route === "overview") await renderOverview();
     if (state.route === "bases") await renderBases();
-    if (state.route === "documents") await renderDocuments(generation);
+if (state.route === "documents") await renderDocuments(generation, state.selectedBaseId);
     if (state.route === "import") await renderImport();
     if (state.route === "recall") await renderRecall(initialQuery);
     if (state.route === "settings") await renderSettings();
@@ -456,7 +583,11 @@ async function renderBases() {
         }, "Base renamed") }, "Rename"),
         h("button", { class: "button small danger", onclick: () => guard(async () => {
           if (!window.confirm(`Delete "${base.name}" and all documents?`)) return;
-          await api.deleteBase(base.id);
+          const operation = await api.submitOperation({
+            type: "delete_base", commandSchemaVersion: 1,
+            target: { baseId: base.id }, input: {},
+          }, crypto.randomUUID());
+          await trackOperation(operation, `delete ${base.name}`);
           if (state.selectedBaseId === base.id) syncBasePicker("");
           await loadBases(); await render();
         }, "Base deleted") }, "Delete"),
@@ -486,7 +617,7 @@ async function renderBases() {
   ]));
 }
 
-async function renderDocuments(generation = routeGeneration) {
+async function renderDocuments(generation = routeGeneration, baseId = state.selectedBaseId) {
   if (!state.selectedBaseId || !state.bases.some((base) => base.id === state.selectedBaseId)) {
     screen.append(h("section", { class: "section" }, [
       h("div", { class: "section-head" }, [
@@ -506,50 +637,25 @@ async function renderDocuments(generation = routeGeneration) {
     h("div", { class: "section-head" }, [h("h2", {}, localized("Documents")), chip("loading")]),
     h("p", { class: "muted" }, localized("Loading document list")),
   ]));
-  const documents = await api.documents(state.selectedBaseId);
-  if (!isCurrentRoute(generation)) return;
+  const page = await api.documentChildren(state.selectedBaseId, state.docFolder, {
+    limit: state.docLimit, offset: state.docOffset,
+  });
+  if (!isCurrentRoute(generation) || baseId !== state.selectedBaseId) return;
   screen.replaceChildren();
-  if (state.docFolder && !documents.some((doc) => doc.id === state.docFolder)) state.docFolder = "";
-  const current = documents.find((doc) => doc.id === state.docFolder);
-  const childrenByParent = new Map();
-  documents.forEach((doc) => {
-    const parentID = doc.parentDirectoryId ?? "";
-    if (!childrenByParent.has(parentID)) childrenByParent.set(parentID, []);
-    childrenByParent.get(parentID).push(doc);
-  });
-  const directoryChildren = (folderID) => childrenByParent.get(folderID) ?? [];
-  const sortRows = (items) => [...items].sort((left, right) => {
-    if (left.sourceType === right.sourceType) return 0;
-    return left.sourceType === "directory" ? -1 : 1;
-  });
-  const rows = sortRows((childrenByParent.get(state.docFolder) ?? []).filter((doc) => current || doc.sourceType !== "url"));
-  const flattenRows = (items, depth = 0, ancestry = new Set()) => items.flatMap((doc) => {
-    const row = { doc, depth };
-    if (doc.sourceType !== "directory" || !state.docExpandedFolders.has(doc.id) || ancestry.has(doc.id)) return [row];
-    const nextAncestry = new Set(ancestry).add(doc.id);
-    return [row, ...flattenRows(sortRows(directoryChildren(doc.id)), depth + 1, nextAncestry)];
-  });
-  const visibleRows = flattenRows(rows);
+  let currentPage = page;
+  const rows = page.documents;
+  const visibleRows = rows.map((doc) => ({ doc, depth: 0 }));
   const openFolder = (folderID) => {
     state.docFolder = folderID;
     state.docPreview = null;
-    let item = documents.find((doc) => doc.id === folderID);
-    while (item) {
-      state.docExpandedFolders.add(item.id);
-      item = documents.find((doc) => doc.id === item.parentDirectoryId);
-    }
+    state.docOffset = 0;
     render();
   };
-  const breadcrumbs = [h("button", { class: "button small", onclick: () => { state.docFolder = ""; state.docPreview = null; render(); } }, "Root")];
-  if (current) {
-    const trail = [];
-    let item = current;
-    while (item) { trail.unshift(item); item = documents.find((doc) => doc.id === item.parentDirectoryId); }
-    trail.forEach((item, index) => breadcrumbs.push(h("button", {
-      class: `button small${index === trail.length - 1 ? " primary" : ""}`,
-      onclick: () => { state.docFolder = item.id; state.docPreview = null; render(); },
-    }, item.title)));
-  }
+  const breadcrumbs = [h("button", { class: "button small", onclick: () => { state.docFolder = ""; state.docPreview = null; state.docOffset = 0; render(); } }, "Root")];
+  page.breadcrumbs.forEach((item, index) => breadcrumbs.push(h("button", {
+    class: `button small${index === page.breadcrumbs.length - 1 ? " primary" : ""}`,
+    onclick: () => { state.docFolder = item.id; state.docPreview = null; state.docOffset = 0; render(); },
+  }, item.title)));
 
   const statusText = (doc) => h("div", {}, [
     chip(doc.status),
@@ -559,21 +665,8 @@ async function renderDocuments(generation = routeGeneration) {
     h("div", { class: "muted mono" }, `${doc.sourceType === "directory" && doc.status === "processing" ? localized("Scanning directory") : (doc.phase || doc.status)}${doc.status === "processing" ? ` · ${doc.progress}%` : ""}`),
   ]);
   const documentTitle = (doc, depth) => {
-    const children = directoryChildren(doc.id);
-    const expanded = state.docExpandedFolders.has(doc.id);
     return h("div", { class: "document-tree-title", style: `--tree-depth:${depth}` }, [
-      doc.sourceType === "directory" && children.length ? h("button", {
-        class: "document-tree-toggle",
-        type: "button",
-        "aria-label": localized(expanded ? "Collapse folder" : "Expand folder"),
-        "aria-expanded": String(expanded),
-        onclick: (event) => {
-          event.stopPropagation();
-          if (expanded) state.docExpandedFolders.delete(doc.id);
-          else state.docExpandedFolders.add(doc.id);
-          render();
-        },
-      }, expanded ? "⌄" : "›") : h("span", { class: "document-tree-toggle", "aria-hidden": "true" }),
+      h("span", { class: "document-tree-toggle", "aria-hidden": "true" }),
       h("span", { class: "document-tree-glyph", "aria-hidden": "true" }, doc.sourceType === "directory" ? "▰" : ""),
       h("div", { class: "truncate" }, [
         h("strong", {}, doc.title),
@@ -587,11 +680,18 @@ async function renderDocuments(generation = routeGeneration) {
   const documentActions = (doc) => h("div", { class: "toolbar" }, [
     doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => openFolder(doc.id) }, "Open") : null,
     doc.sourceType === "directory" ? h("button", { class: "button small", onclick: () => guard(async () => {
-      const job = await api.rescanDirectory(doc.id);
-      await trackDocumentJob(job.jobId, `rescan ${doc.title}`, { kind: "rescan_directory", documentId: doc.id });
+      const operation = await api.submitOperation({
+        type: "rescan_directory", commandSchemaVersion: 1,
+        target: { baseId: doc.baseId, documentId: doc.id }, input: {},
+      }, crypto.randomUUID());
+      await trackOperation(operation, `rescan ${doc.title}`);
     }, "Directory rescanned") }, "Rescan") : null,
     doc.sourceType === "url" ? h("button", { class: "button small", onclick: () => guard(async () => {
-      const result = await api.refreshURL(doc.id); showToast(result.changed ? "URL refreshed" : "URL unchanged"); await render();
+      const operation = await api.submitOperation({
+        type: "refresh_url", commandSchemaVersion: 1,
+        target: { baseId: doc.baseId, documentId: doc.id }, input: {},
+      }, crypto.randomUUID());
+      await trackOperation(operation, `refresh ${doc.title}`);
     }) }, "Refresh") : null,
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => setPreview(doc, "text") }, "Text") : null,
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => setPreview(doc, "chunks") }, "Chunks") : null,
@@ -601,39 +701,58 @@ async function renderDocuments(generation = routeGeneration) {
       await api.updateDocument(doc.id, title); await render();
     }, "Document renamed") }, "Rename"),
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => guard(async () => {
-      const job = await api.reindexDocument(doc.id);
-      await trackDocumentJob(job.jobId, `reindex ${doc.title}`, { kind: "reindex_document", documentId: doc.id });
+      const operation = await api.submitOperation({
+        type: "reindex_document", commandSchemaVersion: 1,
+        target: { baseId: doc.baseId, documentId: doc.id }, input: {},
+      }, crypto.randomUUID());
+      await trackOperation(operation, `reindex ${doc.title}`);
     }, "Document reindexed") }, "Reindex") : null,
     h("button", { class: "button small danger", onclick: () => guard(async () => {
       const message = doc.sourceType === "directory" ? `Delete folder "${doc.title}" and all nested documents?` : `Delete "${doc.title}"?`;
       if (!window.confirm(message)) return;
       if (doc.sourceType === "directory") {
-        const job = await api.deleteDirectoryJob(doc.id);
-        await trackDocumentJob(job.jobId, `delete ${doc.title}`, { kind: "delete_directory", documentId: doc.id });
+        const operation = await api.submitOperation({
+          type: "delete_directory", commandSchemaVersion: 1,
+          target: { baseId: doc.baseId, documentId: doc.id }, input: {},
+        }, crypto.randomUUID());
+        await trackOperation(operation, `delete ${doc.title}`);
         return;
       }
-      const job = await api.deleteDocumentJob(doc.id);
-      await trackDocumentJob(job.jobId, `delete ${doc.title}`, { kind: "delete_document", documentId: doc.id });
+      const operation = await api.submitOperation({
+        type: "delete_document", commandSchemaVersion: 1,
+        target: { baseId: doc.baseId, documentId: doc.id }, input: {},
+      }, crypto.randomUUID());
+      await trackOperation(operation, `delete ${doc.title}`);
     }, "Document deleted") }, "Delete"),
   ]);
 
   const form = h("form", { class: "section", onsubmit: (event) => { event.preventDefault(); guard(async () => {
     const ids = [...event.target.querySelectorAll("input[name='select']:checked")].map((input) => input.value);
     if (!ids.length) return;
-    const job = await api.reindexDocuments(ids);
-    await trackDocumentJob(job.jobId, `reindex ${ids.length} files`, { kind: "reindex_documents" });
+    const operation = await api.submitOperation({
+      type: "reindex_documents", commandSchemaVersion: 1,
+      target: { baseId: state.selectedBaseId },
+      input: { documentIds: ids },
+    }, crypto.randomUUID());
+    await trackOperation(operation, `reindex ${ids.length} files`);
   }, "Selected documents reindexed"); } }, [
     h("section", { class: "section toolbar" }, [
-      basePicker(async (value) => { syncBasePicker(value); state.docFolder = ""; state.docPreview = null; await render(); }),
+      basePicker(async (value) => { syncBasePicker(value); state.docFolder = ""; state.docPreview = null; state.docOffset = 0; await render(); }),
       ...breadcrumbs,
       h("button", { class: "button" }, [icon(icons.refresh), "Rebuild selected"]),
       h("button", { class: "button danger", type: "button", onclick: () => guard(async () => {
-        const ids = [...document.querySelectorAll("input[name='select']:checked")].map((input) => input.value);
-        if (!ids.length || !window.confirm(`Delete ${ids.length} selected documents?`)) return;
-        const result = await api.deleteDocuments(ids); showToast(`${result.deleted} documents deleted`); await render();
+      const ids = [...document.querySelectorAll("input[name='select']:checked")].map((input) => input.value);
+      if (!ids.length || !window.confirm(`Delete ${ids.length} selected documents?`)) return;
+        const operation = await api.submitOperation({
+          type: "delete_documents", commandSchemaVersion: 1,
+          target: { baseId: state.selectedBaseId },
+          input: { documentIds: ids },
+        }, crypto.randomUUID());
+        await trackOperation(operation, `delete ${ids.length} documents`);
       }) }, "Delete selected"),
     ]),
-    h("section", { class: "section" }, table(["", "Title", "Status", "Source", "Chunks", "Updated", "Actions"], visibleRows.map(({ doc, depth }) => h("tr", {},
+  ]);
+  const documentTable = table(["", "Title", "Status", "Source", "Chunks", "Updated", "Actions"], visibleRows.map(({ doc, depth }) => h("tr", {},
       h("td", {}, doc.sourceType !== "directory" ? h("input", { name: "select", type: "checkbox", value: doc.id }) : null),
       h("td", {}, documentTitle(doc, depth)),
       h("td", {}, statusText(doc)),
@@ -641,13 +760,71 @@ async function renderDocuments(generation = routeGeneration) {
       h("td", {}, number(doc.chunkCount)),
       h("td", { class: "muted" }, date(doc.updatedAt || doc.createdAt)),
       h("td", {}, documentActions(doc)),
-    )))),
-  ]);
+    )));
+  documentTable.setAttribute("data-document-table", "");
+  const documentRows = documentTable.querySelector("tbody");
+  const documentPageSummary = h("span", { class: "muted" },
+    `${number(page.offset + 1)}–${number(page.offset + page.documents.length)} / ${number(page.total)}`);
+  const previousPage = h("button", {
+    class: "button small", disabled: page.offset === 0,
+    onclick: () => { state.docOffset = Math.max(0, state.docOffset - state.docLimit); render(); },
+  }, "Previous");
+  const nextPage = h("button", {
+    class: "button small", disabled: !page.hasMore,
+    onclick: () => { state.docOffset = state.docOffset + page.documents.length; render(); },
+  }, "Next");
+  form.append(h("section", { class: "section toolbar" }, [
+    documentPageSummary, previousPage, nextPage,
+  ]));
+  form.append(h("section", { class: "section" }, documentTable));
+
+  const applyDocumentPage = (next) => {
+    currentPage = next;
+    const selected = new Set([...documentRows.querySelectorAll("input[name='select']:checked")].map((item) => item.value));
+    documentRows.replaceChildren(...next.documents.map((doc) => h("tr", {},
+      h("td", {}, doc.sourceType !== "directory" ? h("input", {
+        name: "select", type: "checkbox", value: doc.id, checked: selected.has(doc.id),
+      }) : null),
+      h("td", {}, documentTitle(doc, 0)),
+      h("td", {}, statusText(doc)),
+      h("td", {}, doc.sourceType),
+      h("td", {}, number(doc.chunkCount)),
+      h("td", { class: "muted" }, date(doc.updatedAt || doc.createdAt)),
+      h("td", {}, documentActions(doc)),
+    )));
+    documentPageSummary.textContent =
+      `${number(next.offset + 1)}–${number(next.offset + next.documents.length)} / ${number(next.total)}`;
+    previousPage.disabled = next.offset === 0;
+    nextPage.disabled = !next.hasMore;
+  };
+
+  const refreshDocumentPage = async () => {
+    const baseId = state.selectedBaseId;
+    const folderId = state.docFolder;
+    const offset = state.docOffset;
+    const next = await api.documentChildren(baseId, folderId, {
+      limit: state.docLimit, offset,
+    });
+    if (!isCurrentRoute(routeGeneration) || baseId !== state.selectedBaseId
+      || folderId !== state.docFolder || offset !== state.docOffset) return;
+    applyDocumentPage(next);
+    if (state.docPreview) {
+      const previewDoc = next.documents.find((item) => item.id === state.docPreview.id);
+      if (previewDoc) renderPreview(previewPanel, previewDoc, state.docPreview.mode);
+      else {
+        state.docPreview = null;
+        previewPanel.replaceChildren();
+      }
+    }
+  };
+  documentListRefresh = refreshDocumentPage;
+  applyDocumentPage(page);
+
   screen.append(documentJobSection());
   screen.append(form);
   screen.append(previewPanel);
   if (state.docPreview) {
-    const doc = documents.find((item) => item.id === state.docPreview.id);
+    const doc = page.documents.find((item) => item.id === state.docPreview.id);
     if (doc) renderPreview(previewPanel, doc, state.docPreview.mode);
   }
 }
@@ -730,10 +907,12 @@ async function renderImport() {
       const form = event.target;
       const title = form.title.value;
       const content = form.content.value;
-      await runLocalImportTask(`import ${title || "text"}`, {}, async (update) => {
-        update({ phase: "importing", file: title || "text" });
-        await api.addText(state.selectedBaseId, { title, content });
-      });
+      const operation = await api.submitOperation({
+        type: "import_text", commandSchemaVersion: 1,
+        target: { baseId: state.selectedBaseId },
+        input: { title, content },
+      }, crypto.randomUUID());
+      await trackOperation(operation, `import ${title || "text"}`);
       form.reset(); await render();
     }, "Text imported"); } }, [
       h("h2", {}, "Text"), h("label", { class: "field" }, "Title", h("input", { name: "title", required: true })),
@@ -744,10 +923,12 @@ async function renderImport() {
       const form = event.target;
       const url = form.url.value;
       const title = form.title.value;
-      await runLocalImportTask(`import ${title || url}`, {}, async (update) => {
-        update({ phase: "importing", file: title || url });
-        await api.addURL(state.selectedBaseId, { url, title });
-      });
+      const operation = await api.submitOperation({
+        type: "import_url", commandSchemaVersion: 1,
+        target: { baseId: state.selectedBaseId },
+        input: { url, title },
+      }, crypto.randomUUID());
+      await trackOperation(operation, `import ${title || url}`);
       form.reset(); await render();
     }, "URL imported"); } }, [
       h("h2", {}, "URL"), h("label", { class: "field" }, "Page URL", h("input", { name: "url", type: "url", required: true })),
@@ -763,16 +944,30 @@ async function renderImport() {
       }
       const conflict = form.conflict.value;
       await runLocalImportTask(`import ${selectedFiles.length} files`, { total: selectedFiles.length, phase: "loading" }, async (update) => {
-        const files = [];
         for (const [index, file] of selectedFiles.entries()) {
           update({ phase: "loading", file: file.name, progress: index });
-          const contentBase64 = await fileToBase64(file, (loaded, total) => {
-            update({ phase: "loading", file: file.name, progress: index + loaded / total });
+          const checksum = await fileSha256(file);
+          const upload = await api.createUpload({
+            baseId: state.selectedBaseId,
+            fileName: file.name,
+            expectedSize: file.size,
+            expectedSha256: checksum,
           });
-          files.push({ fileName: file.name, contentBase64 });
+          await api.putUploadContent(upload.uploadId, file);
+          await api.completeUpload(upload.uploadId);
+          update({ phase: "submitting", file: file.name, progress: index + 1 });
+          const operation = await api.submitOperation({
+            type: "import_file",
+            commandSchemaVersion: 1,
+            target: { baseId: state.selectedBaseId },
+            input: {
+              uploadId: upload.uploadId,
+              fileName: file.name,
+              conflict,
+            },
+          }, crypto.randomUUID());
+          await trackOperation(operation, `import ${file.name}`);
         }
-        update({ phase: "submitting", file: "", progress: selectedFiles.length, total: 0 });
-        await api.addFiles(state.selectedBaseId, { files, conflict });
       });
       form.reset();
     }, "Files imported"); } }, [
@@ -783,8 +978,12 @@ async function renderImport() {
     ]),
     h("form", { class: "panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
       const form = event.target;
-      const job = await api.importDirectory(state.selectedBaseId, form.path.value);
-      await trackDocumentJob(job.jobId, `import ${form.path.value}`, { kind: "import_directory" });
+      const operation = await api.submitOperation({
+        type: "import_directory", commandSchemaVersion: 1,
+        target: { baseId: state.selectedBaseId },
+        input: { path: form.path.value },
+      }, crypto.randomUUID());
+      await trackOperation(operation, `import ${form.path.value}`);
       form.reset();
     }, "Directory imported"); } }, [
       h("h2", {}, "Directory"), h("label", { class: "field" }, "Absolute local path", h("input", { name: "path", required: true })),
@@ -1435,8 +1634,13 @@ async function renderModels() {
           const form = event.target;
           const removeSource = form.removeSource.checked;
           if (removeSource && !window.confirm("Move the model cache and remove the source models after verification?")) return;
-          const result = await api.migrateCache({ targetDir: form.targetDir.value, removeSource });
-          showToast(`Migrated ${result.modelCount} models (${number(result.bytes)} bytes)`);
+          const operation = await api.submitOperation({
+            type: "migrate_model_cache", commandSchemaVersion: 1,
+            target: {},
+            input: { targetDir: form.targetDir.value, removeSource },
+          }, crypto.randomUUID());
+          await trackJob(operation.operationId, "model cache migration", { kind: "cache-migration" });
+          showToast("Model cache migrated");
           form.reset(); await render();
         }, "Model cache migrated"); } }, [
           h("label", { class: "field" }, "New cache directory", h("input", { name: "targetDir", type: "text", required: true, placeholder: "/absolute/path/to/models" })),
@@ -1707,7 +1911,7 @@ async function renderSettings() {
 }
 
 async function loadBases() {
-  state.bases = await api.bases();
+  state.bases = await api.bases({ signal: routeAbortController?.signal });
   if (!state.bases.some((base) => base.id === state.selectedBaseId)) syncBasePicker("");
 }
 
@@ -1719,6 +1923,10 @@ function renderNavigation() {
 async function route() {
   const [route, query = ""] = (location.hash.replace("#/", "") || "overview").split("?");
   const generation = ++routeGeneration;
+  documentListRefresh = null;
+  routeAbortController?.abort();
+  routeAbortController = new AbortController();
+  setRouteSignal(routeAbortController.signal);
   state.route = route;
   renderNavigation();
   showRouteLoading();
@@ -1728,6 +1936,7 @@ async function route() {
     await render(new URLSearchParams(query).get("q") ?? "", generation);
     applyI18n(document);
   } catch (error) {
+    if (isAbortError(error)) return;
     if (isCurrentRoute(generation)) {
       showRouteError(error);
       showToast(error.message, true);
@@ -1742,4 +1951,5 @@ if (returnAgent) {
   returnAgent.hidden = !/^\/extensions\/shutu-knowledge(?:\/|$)/.test(window.location.pathname);
 }
 observeI18n(screen);
+recoverOperations().catch((error) => showToast(error.message, true));
 route();

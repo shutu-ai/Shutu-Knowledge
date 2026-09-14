@@ -46,6 +46,8 @@ type Excerpt struct {
 type Window struct {
 	AnchorChunkID   string    `json:"anchorChunkId"`
 	AnchorIndex     int       `json:"anchorIndex"`
+	IndexGeneration int64     `json:"indexGeneration"`
+	SourceVersion   int64     `json:"sourceVersion"`
 	Before          []Excerpt `json:"before"`
 	Anchor          Excerpt   `json:"anchor"`
 	After           []Excerpt `json:"after"`

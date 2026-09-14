@@ -104,6 +104,64 @@ func (s *Service) ListDocumentsContext(ctx context.Context, baseID string) ([]Do
 	return out, nil
 }
 
+// ListDocumentChildrenContext returns one bounded directory page. Directory
+// navigation is lazy; a large base never requires loading its full metadata
+// tree just to render the current folder.
+func (s *Service) ListDocumentChildrenContext(ctx context.Context, baseID, parentID string, limit, offset int) (DocumentChildrenPage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if parentID != "" {
+		parent, err := s.store.getDocumentMetadataContext(ctx, parentID)
+		if err != nil {
+			return DocumentChildrenPage{}, err
+		}
+		if parent.BaseID != baseID || parent.SourceType != "directory" {
+			return DocumentChildrenPage{}, ErrNotFound
+		}
+	}
+	docs, total, err := s.store.listChildDocumentMetadataContext(ctx, baseID, parentID, limit, offset)
+	if err != nil {
+		return DocumentChildrenPage{}, err
+	}
+	modelKey := ""
+	if providers, providerErr := s.providersForBase(baseID); providerErr != nil {
+		return DocumentChildrenPage{}, providerErr
+	} else if providers.embeddingActive && providers.embedder != nil {
+		modelKey = providers.embedder.ModelKey()
+	}
+	documents := make([]DocumentSummary, 0, len(docs))
+	for _, document := range docs {
+		summary := summarize(document)
+		summary.EmbeddingReady = modelKey != "" && document.EmbeddingReady && document.EmbeddingModel == modelKey
+		documents = append(documents, summary)
+	}
+	var breadcrumbs []DocumentSummary
+	if parentID == "" {
+		breadcrumbs = []DocumentSummary{}
+	} else {
+		path, pathErr := s.store.documentPathMetadataContext(ctx, baseID, parentID)
+		if pathErr != nil {
+			return DocumentChildrenPage{}, pathErr
+		}
+		breadcrumbs = make([]DocumentSummary, 0, len(path))
+		for _, document := range path {
+			breadcrumbs = append(breadcrumbs, summarize(document))
+		}
+	}
+	return DocumentChildrenPage{
+		ParentID: parentID, Documents: documents, Total: total,
+		Limit: limit, Offset: offset, HasMore: offset+len(documents) < total,
+		Breadcrumbs: breadcrumbs,
+	}, nil
+}
+
 // ListChunks returns a page of a document's chunks.
 func (s *Service) ListChunks(docID string, limit, offset int) ([]Chunk, error) {
 	if _, err := s.store.getDocument(docID); err != nil {
@@ -142,36 +200,134 @@ func (s *Service) GetDocument(id string, includeChunks bool) (Document, []Chunk,
 
 // RawFile is original source content prepared for HTTP download/preview.
 type RawFile struct {
-	Bytes    []byte
-	FileName string
-	MimeType string
+	Bytes           []byte
+	FileName        string
+	MimeType        string
+	IndexGeneration int64
+	SourceVersion   int64
+}
+
+// RawCitationOptions pins a raw download to the identity emitted by a search
+// hit. Nil fields preserve the current-document compatibility path.
+type RawCitationOptions struct {
+	SourceVersion   *int64
+	IndexGeneration *int64
 }
 
 // GetRawFile returns the stored original bytes for a file document.
 func (s *Service) GetRawFile(id string) (*RawFile, error) {
-	doc, err := s.store.getDocument(id)
-	if err != nil {
-		return nil, err
+	return s.GetRawFileForCitation(id, RawCitationOptions{})
+}
+
+// GetRawFileForCitation serves raw bytes only when the caller's generation and
+// source version identify the currently published document. The raw path can
+// be replaced by a later re-index, so a historical mapping is never enough:
+// returning current bytes under an old citation would mix evidence.
+func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*RawFile, error) {
+	if (opts.IndexGeneration == nil) != (opts.SourceVersion == nil) {
+		return nil, fmt.Errorf("indexGeneration and sourceVersion must be supplied together")
 	}
-	if doc.RawFilePath == "" {
+	var identity generationIdentity
+	var current Document
+	if opts.IndexGeneration != nil {
+		var err error
+		identity, err = s.store.generationByID(context.Background(), s.store.db.ReadDB(),
+			id, *opts.IndexGeneration)
+		if err != nil {
+			return nil, err
+		}
+		if identity.SourceVersion != *opts.SourceVersion {
+			return nil, ErrHistoricalEvidenceExpired
+		}
+		// Historical bytes never bypass a committed tombstone. Once the
+		// current document is invisible, fail with the citation contract
+		// instead of exposing ordinary not-found semantics.
+		current, err = s.store.getDocument(id)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, ErrHistoricalEvidenceExpired
+			}
+			return nil, err
+		}
+	} else {
+		var err error
+		current, err = s.store.getDocument(id)
+		if err != nil {
+			return nil, err
+		}
+		identity = generationIdentity{
+			Generation: current.ActiveIndexGen, SourceVersion: current.SourceVersion,
+			RawFilePath: current.RawFilePath, ContentHash: current.ContentHash,
+		}
+	}
+	if identity.RawFilePath == "" {
 		return nil, fmt.Errorf("%w: document has no raw source", ErrNotFound)
 	}
-	data, err := s.raw.Read(doc.RawFilePath)
+	data, err := s.raw.Read(identity.RawFilePath)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: raw source is missing", ErrNotFound)
 	}
-	fileName := doc.FileName
-	if fileName == "" {
-		fileName = doc.Title
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != identity.ContentHash {
+		// A legacy shared path can be replaced before a new generation is
+		// activated; immutable paths detect corruption or accidental writes.
+		return nil, ErrHistoricalEvidenceExpired
 	}
-	mimeType := doc.MimeType
+	fileName := current.FileName
+	if fileName == "" {
+		fileName = current.Title
+	}
+	mimeType := current.MimeType
 	if mimeType == "" {
 		mimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(fileName)))
 	}
-	return &RawFile{Bytes: data, FileName: fileName, MimeType: mimeType}, nil
+	return &RawFile{
+		Bytes: data, FileName: fileName, MimeType: mimeType,
+		IndexGeneration: identity.Generation, SourceVersion: identity.SourceVersion,
+	}, nil
+}
+
+// rawPathIsVersioned distinguishes the pre-generation shared layout from the
+// immutable per-source-version layout.
+func rawPathIsVersioned(rawPath string) bool {
+	return strings.Contains(filepath.ToSlash(rawPath), "/.generations/")
+}
+
+// preserveLegacyRawGeneration copies an old shared raw file into the immutable
+// layout before a rebuild can replace it. The content hash must already match
+// the published document; otherwise the historical citation is already unsafe.
+func (s *Service) preserveLegacyRawGeneration(doc *Document, data []byte) error {
+	if doc.SourceType != "file" || doc.RawFilePath == "" || rawPathIsVersioned(doc.RawFilePath) ||
+		doc.SourceVersion <= 0 || doc.ContentHash == "" {
+		return nil
+	}
+	if len(data) == 0 {
+		var err error
+		data, err = s.raw.Read(doc.RawFilePath)
+		if err != nil {
+			return err
+		}
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	sum := sha256.Sum256(data)
+	if hex.EncodeToString(sum[:]) != doc.ContentHash {
+		return nil
+	}
+	rel, err := s.raw.WriteVersion(doc.BaseID, doc.ID, doc.SourceVersion,
+		"."+parser.ExtensionOf(doc.FileName), data)
+	if err != nil {
+		return err
+	}
+	if err := s.store.setGenerationRawPath(doc.ID, doc.ActiveIndexGen, rel); err != nil {
+		return err
+	}
+	doc.RawFilePath = rel
+	return nil
 }
 
 // IndexingStatus is one currently active import/index job.
@@ -221,35 +377,84 @@ func (s *Service) RenameDocument(id, title string) (Document, error) {
 	return doc, nil
 }
 
-// DeleteDocument removes one document with its chunks and raw source.
-func (s *Service) DeleteDocument(id string) error {
-	doc, err := s.store.getDocument(id)
-	if err != nil {
-		return err
+// deleteDocumentTree first commits the logical delete fence for the target and
+// every descendant, then performs bounded physical cleanup. A cleanup failure
+// leaves lifecycle_state=deleting rather than exposing or resurrecting rows.
+// Once that fence commits, cancellation can no longer restore the tree, so
+// cleanup continues to its bounded terminal state instead of pausing midway.
+func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDeleted func()) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	if doc.SourceType == "directory" {
-		children, err := s.store.listDocumentMetadata(doc.BaseID)
-		if err != nil {
-			return err
+	root, err := s.store.getDocument(rootID)
+	switch {
+	case err == nil:
+		if _, err := s.store.markDocumentTreeDeleting(rootID); err != nil {
+			return 0, err
 		}
-		for _, child := range children {
-			if child.ParentDirectoryID != doc.ID {
+	case errors.Is(err, ErrNotFound):
+		root, err = s.store.getDocumentIncludingDeleting(rootID)
+		if err != nil {
+			return 0, err
+		}
+		if root.LifecycleState != LifecycleDeleting {
+			return 0, ErrNotFound
+		}
+	default:
+		return 0, err
+	}
+	refs, err := s.store.listDocumentTreeCleanupRefs(root.ID)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, ref := range refs {
+		rawPaths, err := s.store.deleteDocumentGenerations(ref.ID)
+		if err != nil {
+			return removed, err
+		}
+		activeIsGenerationRaw := false
+		for _, rawPath := range rawPaths {
+			if rawPath == ref.RawFilePath {
+				activeIsGenerationRaw = true
+			}
+			if err := s.raw.Delete(rawPath); err != nil {
+				return removed, err
+			}
+		}
+		if ref.RawFilePath != "" {
+			if activeIsGenerationRaw {
+				removed++
+				if onDeleted != nil {
+					onDeleted()
+				}
 				continue
 			}
-			if err := s.DeleteDocument(child.ID); err != nil && err != ErrNotFound {
-				return err
+			if err := s.raw.Delete(ref.RawFilePath); err != nil {
+				return removed, err
 			}
 		}
-	}
-	if err := s.store.deleteChunks(doc.ID); err != nil {
-		return err
-	}
-	if doc.RawFilePath != "" {
-		if err := s.raw.Delete(doc.RawFilePath); err != nil {
-			return err
+		removed++
+		if onDeleted != nil {
+			onDeleted()
 		}
 	}
-	return s.store.deleteDocument(doc.ID)
+	return removed, nil
+}
+
+// DeleteDocument marks the document subtree deleting before cleanup. The
+// logical effect is committed before this call returns.
+func (s *Service) DeleteDocument(id string) error {
+	_, err := s.deleteDocumentTree(context.Background(), id, nil)
+	return err
+}
+
+// DeleteDocumentWithProgress behaves like DeleteDocument and invokes onDeleted
+// after each tombstoned document's physical data has been removed. Callers may
+// use it for durable progress; cancellation remains authoritative only before
+// the logical fence commits.
+func (s *Service) DeleteDocumentWithProgress(ctx context.Context, id string, onDeleted func()) (int, error) {
+	return s.deleteDocumentTree(ctx, id, onDeleted)
 }
 
 // DeleteDocuments removes several documents.
@@ -269,6 +474,17 @@ func (s *Service) DeleteDocuments(ids []string) (int, error) {
 
 // AddTextDocument imports a text note.
 func (s *Service) AddTextDocument(ctx context.Context, baseID, title, content string) (Document, error) {
+	id, err := newID()
+	if err != nil {
+		return Document{}, err
+	}
+	return s.AddTextDocumentWithID(ctx, baseID, id, title, content)
+}
+
+// AddTextDocumentWithID lets a durable operation preallocate the business ID.
+// If its business effect already committed before the terminal state was
+// written, a restart returns the same document instead of importing again.
+func (s *Service) AddTextDocumentWithID(ctx context.Context, baseID, id, title, content string) (Document, error) {
 	base, err := s.store.getBase(baseID)
 	if err != nil {
 		return Document{}, err
@@ -280,8 +496,32 @@ func (s *Service) AddTextDocument(ctx context.Context, baseID, title, content st
 	if title = strings.TrimSpace(title); title == "" {
 		title = "untitled"
 	}
-	doc := s.newDocument(baseID, title, "text")
+	if id == "" {
+		id, err = newID()
+		if err != nil {
+			return Document{}, err
+		}
+	}
+	doc, err := s.store.getDocument(id)
+	if err == nil {
+		if doc.Status == StatusReady {
+			return doc, nil
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return Document{}, err
+	} else {
+		doc = s.newDocument(baseID, title, "text")
+	}
+	doc.ID = id
+	doc.BaseID = baseID
+	doc.Title = title
+	doc.SourceType = "text"
+	doc.Status = StatusPending
+	doc.CreatedAt = doc.CreatedAt
 	doc.RawText = content
+	if doc.CreatedAt == 0 {
+		doc.CreatedAt = now()
+	}
 	if err := s.ingest(ctx, &doc, base.Config, nil); err != nil {
 		return Document{}, err
 	}
@@ -290,6 +530,17 @@ func (s *Service) AddTextDocument(ctx context.Context, baseID, title, content st
 
 // AddFileDocument imports an uploaded file (conflict handled by caller).
 func (s *Service) AddFileDocument(ctx context.Context, baseID, fileName string, data []byte, parentDirID string) (Document, error) {
+	id, err := newID()
+	if err != nil {
+		return Document{}, err
+	}
+	return s.AddFileDocumentWithID(ctx, baseID, id, fileName, data, parentDirID)
+}
+
+// AddFileDocumentWithID gives a durable operation ownership of the business ID
+// before execution. After a publish/crash race, a ready document is returned
+// rather than imported a second time.
+func (s *Service) AddFileDocumentWithID(ctx context.Context, baseID, id, fileName string, data []byte, parentDirID string) (Document, error) {
 	base, err := s.store.getBase(baseID)
 	if err != nil {
 		return Document{}, err
@@ -300,9 +551,32 @@ func (s *Service) AddFileDocument(ctx context.Context, baseID, fileName string, 
 	if len(data) > MaxIngestFileBytes {
 		return Document{}, fmt.Errorf("file exceeds %d MB limit", MaxIngestFileBytes>>20)
 	}
-	doc := s.newDocument(baseID, fileName, "file")
+	if id == "" {
+		id, err = newID()
+		if err != nil {
+			return Document{}, err
+		}
+	}
+	doc, err := s.store.getDocument(id)
+	if err == nil {
+		if doc.Status == StatusReady {
+			return doc, nil
+		}
+	} else if !errors.Is(err, ErrNotFound) {
+		return Document{}, err
+	} else {
+		doc = s.newDocument(baseID, fileName, "file")
+	}
+	doc.ID = id
+	doc.BaseID = baseID
+	doc.Title = fileName
+	doc.SourceType = "file"
 	doc.FileName = fileName
 	doc.ParentDirectoryID = parentDirID
+	doc.Status = StatusPending
+	if doc.CreatedAt == 0 {
+		doc.CreatedAt = now()
+	}
 	if err := s.ingest(ctx, &doc, base.Config, data); err != nil {
 		return Document{}, err
 	}
@@ -544,6 +818,11 @@ func (s *Service) DetectConflicts(baseID string, fileNames []string) []string {
 	return conflicts
 }
 
+// FindDocumentByTitle exposes title conflict lookup to operation adapters.
+func (s *Service) FindDocumentByTitle(baseID, title string) (Document, error) {
+	return s.store.findDocumentByTitle(baseID, title)
+}
+
 // RenameAvailable suggests the first free "name_1" style title.
 func (s *Service) RenameAvailable(baseID, fileName string) string {
 	ext := filepath.Ext(fileName)
@@ -677,6 +956,16 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if err != nil {
 		return err
 	}
+	if doc.SourceType == "file" && len(fileBytes) > 0 {
+		if err := s.preserveLegacyRawGeneration(doc, fileBytes); err != nil {
+			return err
+		}
+	}
+	previous := *doc
+	publishedVectors := 0
+	if previous.ID != "" {
+		publishedVectors, _ = s.store.countEmbeddedChunksByDocGeneration(previous.ID, previous.ActiveIndexGen)
+	}
 	if s.ingestSlots != nil {
 		select {
 		case s.ingestSlots <- struct{}{}:
@@ -701,12 +990,13 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.EmbeddingReady = false
 	doc.EmbeddingModel = ""
 	doc.UpdatedAt = now()
-	if err := s.store.putDocument(*doc); err != nil {
+	if err := s.store.startDocumentIngest(*doc); err != nil {
 		return err
 	}
 
 	if doc.SourceType == "file" && len(fileBytes) > 0 {
-		rel, err := s.raw.Write(doc.BaseID, doc.ID, "."+parser.ExtensionOf(doc.FileName), fileBytes)
+		rel, err := s.raw.WriteVersion(doc.BaseID, doc.ID, doc.SourceVersion+1,
+			"."+parser.ExtensionOf(doc.FileName), fileBytes)
 		if err != nil {
 			return s.failDocument(doc, ErrParseFailed, err)
 		}
@@ -773,9 +1063,22 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if len(rows) == 0 {
 		return s.failDocument(doc, ErrParseFailed, fmt.Errorf("chunker produced no chunks"))
 	}
-	if err := s.store.putChunksReplace(ctx, rows); err != nil {
+	targetModelKey := ""
+	if providers.embeddingActive && providers.embedder != nil && providers.embedder.ModelKey() != "none" {
+		targetModelKey = providers.embedder.ModelKey()
+	}
+	generation, err := s.store.putChunksReplace(ctx, rows, targetModelKey)
+	if err != nil {
 		return s.failDocument(doc, ErrParseFailed, err)
 	}
+	staged, err := s.store.getDocument(doc.ID)
+	if err != nil {
+		return s.failDocument(doc, ErrParseFailed, err)
+	}
+	expectedEpoch := staged.MutationEpoch
+	doc.DesiredIndexGen = generation
+	doc.HasDesiredIndexGen = true
+	doc.IndexState = IndexStateBuilding
 	s.recordMetric(func(m *MetricsSnapshot) { m.ChunkCount += int64(len(rows)) })
 
 	// Vector phase: with an active embedding provider, chunks are embedded
@@ -813,6 +1116,36 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			if err := s.store.putDocument(*doc); err != nil {
 				return err
 			}
+			if publishedVectors > 0 {
+				// A previously published vector index remains authoritative
+				// when a reindex cannot produce vectors. The staged lexical
+				// version stays unactivated for later bounded cleanup.
+				*doc = previous
+				doc.Status = StatusReady
+				doc.ErrorCode = code
+				doc.ErrorMessage = cause.Error()
+				doc.UpdatedAt = now()
+				return s.store.putDocument(*doc)
+			}
+			if code == ErrInterrupted {
+				return nil
+			}
+			doc.SourceVersion++
+			if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
+				return s.failDocument(doc, code, err)
+			}
+			rawPaths, pruneErr := s.store.pruneRetiredGenerations(doc.ID, generation)
+			if pruneErr != nil {
+				return pruneErr
+			}
+			for _, rawPath := range rawPaths {
+				if rawPath == "" {
+					continue
+				}
+				if err := s.raw.Delete(rawPath); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 	}
@@ -827,7 +1160,23 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.Progress = 100
 	doc.Incomplete = false
 	doc.UpdatedAt = now()
-	return s.store.putDocument(*doc)
+	doc.SourceVersion++
+	if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
+		return s.failDocument(doc, ErrParseFailed, err)
+	}
+	rawPaths, err := s.store.pruneRetiredGenerations(doc.ID, generation)
+	if err != nil {
+		return err
+	}
+	for _, rawPath := range rawPaths {
+		if rawPath == "" {
+			continue
+		}
+		if err := s.raw.Delete(rawPath); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // parseFileContent runs the format-specific extraction chain for file
@@ -1160,7 +1509,7 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		}
 	}
 	if len(reusedForDocument) > 0 {
-		if err := s.store.PutChunkVectors(doc.ID, modelKey, reusedForDocument); err != nil {
+		if err := s.store.PutChunkVectors(doc.ID, rows[0].IndexGeneration, modelKey, reusedForDocument); err != nil {
 			return ErrEmbeddingProvider, err
 		}
 	}
@@ -1201,7 +1550,7 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 			}
 			byHash[batch[i]] = vector
 		}
-		if err := s.store.PutChunkVectors(doc.ID, modelKey, byHash); err != nil {
+		if err := s.store.PutChunkVectors(doc.ID, rows[0].IndexGeneration, modelKey, byHash); err != nil {
 			return ErrEmbeddingProvider, err
 		}
 		report()

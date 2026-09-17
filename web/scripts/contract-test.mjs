@@ -1,6 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 
-const SUPPORTED_IMPORT_ACCEPT = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.epub";
+const SUPPORTED_IMPORT_ACCEPT = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xlsm,.xls,.epub";
 
 for (const path of ["index.html", "styles.css", "app.js", "api.js", "build-info.json"]) {
   await access(new URL(`../../internal/web/dist/${path}`, import.meta.url));
@@ -26,6 +26,9 @@ if (typeof buildInfo.buildId !== "string" || !/^[0-9a-f]{64}$/.test(buildInfo.bu
 }
 if (!api.includes("extensionPrefix") || !api.includes("fetch(endpoint(path)")) {
   throw new Error("extension API requests must preserve the reverse-proxy prefix");
+}
+if (!api.includes("requestText") || !api.includes("rawText: (id, options = {}) => requestText")) {
+  throw new Error("raw preview must use the prefixed, cancellable text request helper");
 }
 const i18n = await readFile(new URL("../src/i18n.js", import.meta.url), "utf8");
 if (!i18n.includes("navigator.languages") || !i18n.includes("split(\"-\")[0] === \"zh\"") || !i18n.includes('addEventListener("storage"')) {
@@ -54,6 +57,15 @@ if (!app.includes("MAX_IMPORT_FILES = 20") || !app.includes("files per import; s
 }
 if (!app.includes(SUPPORTED_IMPORT_ACCEPT)) {
   throw new Error("missing supported import accept filter");
+}
+if (!app.includes("webkitdirectory") || !app.includes("Import frontend directory") || !app.includes("parentDirectoryId")) {
+  throw new Error("missing browser folder import flow");
+}
+if (!app.includes("Refresh bases") || !app.includes("renderBasePickerOptions")) {
+  throw new Error("missing knowledge base refresh control");
+}
+if (!app.includes("Frontend directory") || !app.includes("Backend directory")) {
+  throw new Error("missing frontend/backend directory labels");
 }
 
 const ollamaStart = app.indexOf("function ollamaPanel");

@@ -24,7 +24,7 @@ let documentListRefresh;
 let routeGeneration = 0;
 let routeAbortController;
 const MAX_IMPORT_FILES = 20;
-const SUPPORTED_IMPORT_EXTENSIONS = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.epub";
+const SUPPORTED_IMPORT_EXTENSIONS = ".txt,.md,.markdown,.mdx,.csv,.html,.htm,.json,.log,.pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xlsm,.xls,.epub";
 
 function h(tag, attributes = {}, ...children) {
   const element = document.createElement(tag);
@@ -101,11 +101,33 @@ function setHeader(subtitle, actions = []) {
   topActions.replaceChildren(...actions);
 }
 
-function basePicker(onChange = () => {}) {
-  return h("select", { onchange: (event) => onChange(event.target.value), "aria-label": "Knowledge base" },
+function renderBasePickerOptions(select) {
+  select.replaceChildren(
     h("option", { value: "" }, "All knowledge bases"),
-    state.bases.map((base) => h("option", { value: base.id, selected: base.id === state.selectedBaseId }, base.name)),
+    ...state.bases.map((base) => h("option", { value: base.id, selected: base.id === state.selectedBaseId }, base.name)),
   );
+  select.value = state.selectedBaseId || "";
+}
+
+function basePicker(onChange = () => {}) {
+  const select = h("select", { onchange: (event) => onChange(event.target.value), "aria-label": "Knowledge base" });
+  renderBasePickerOptions(select);
+  const refresh = h("button", {
+    class: "button small",
+    type: "button",
+    title: "Refresh bases",
+    onclick: async () => {
+      try {
+        state.bases = await api.bases();
+        if (!state.bases.some((base) => base.id === state.selectedBaseId)) syncBasePicker("");
+        renderBasePickerOptions(select);
+        showToast("Knowledge bases refreshed");
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    },
+  }, icon(icons.refresh), "Refresh bases");
+  return h("div", { class: "toolbar base-picker" }, select, refresh);
 }
 
 function syncBasePicker(value) {
@@ -897,6 +919,117 @@ async function renderPreview(container, doc, mode) {
   }
 }
 
+function importExtension(fileName) {
+  const dot = String(fileName).lastIndexOf(".");
+  return dot < 0 ? "" : String(fileName).slice(dot + 1).toLowerCase();
+}
+
+function isBrowserImportFile(file) {
+  if (!file || String(file.name).startsWith("~$")) return false;
+  return SUPPORTED_IMPORT_EXTENSIONS.split(",").includes(`.${importExtension(file.name)}`);
+}
+
+function browserRelativeParts(file) {
+  const relative = String(file.webkitRelativePath || file.name || "").replaceAll("\\", "/");
+  return relative.split("/").filter(Boolean);
+}
+
+async function importSelectedDirectory(baseID, form, update) {
+  const selected = [...form.directoryFiles.files];
+  const files = selected.filter(isBrowserImportFile).sort((a, b) => {
+    const left = String(a.webkitRelativePath || a.name);
+    const right = String(b.webkitRelativePath || b.name);
+    return left.localeCompare(right);
+  });
+  if (!files.length) {
+    throw new Error("Select a folder containing supported documents");
+  }
+  const skipped = selected.length - files.length;
+  if (skipped > 0) {
+    showToast(`${skipped} unsupported or temporary files skipped`, false);
+  }
+
+  // Browser folder pickers expose relative paths, not absolute paths. Build a
+  // logical directory tree and upload files beneath it, preserving the folder
+  // navigation users expect without requiring access to the local path.
+  const directories = new Map();
+  const parentForFile = new Map();
+  for (const file of files) {
+    const parts = browserRelativeParts(file);
+    let parentID = "";
+    for (let index = 0; index < Math.max(0, parts.length - 1); index += 1) {
+      const path = parts.slice(0, index + 1).join("/");
+      if (!directories.has(path)) {
+        const directory = await api.createDirectory(baseID, {
+          title: parts[index], parentDirectoryId: parentID, sourcePath: "",
+        });
+        directories.set(path, directory.id);
+      }
+      parentID = directories.get(path);
+    }
+    parentForFile.set(file, parentID);
+  }
+
+  for (const [index, file] of files.entries()) {
+    update({ phase: "loading", file: file.webkitRelativePath || file.name, progress: index });
+    const checksum = await fileSha256(file);
+    const upload = await api.createUpload({
+      baseId,
+      fileName: file.name,
+      expectedSize: file.size,
+      expectedSha256: checksum,
+    });
+    await api.putUploadContent(upload.uploadId, file);
+    await api.completeUpload(upload.uploadId);
+    update({ phase: "submitting", file: file.webkitRelativePath || file.name, progress: index + 1 });
+    const operation = await api.submitOperation({
+      type: "import_file",
+      commandSchemaVersion: 1,
+      target: { baseId },
+      input: {
+        uploadId: upload.uploadId,
+        fileName: file.name,
+        conflict: form.conflict.value,
+        parentDirectoryId: parentForFile.get(file) || "",
+      },
+    }, crypto.randomUUID());
+    await trackOperation(operation, `import ${file.webkitRelativePath || file.name}`);
+  }
+}
+
+function browserDirectoryImportForm() {
+  const summary = h("p", { class: "muted", "aria-live": "polite" }, "No folder selected");
+  const picker = h("input", {
+    name: "directoryFiles", type: "file", multiple: true,
+    webkitdirectory: true, directory: true, accept: SUPPORTED_IMPORT_EXTENSIONS,
+    onchange: (event) => {
+      const files = [...event.target.files];
+      const supported = files.filter(isBrowserImportFile).length;
+      summary.textContent = files.length
+        ? `${supported} supported files selected${files.length > supported ? ` · ${files.length - supported} skipped` : ""}`
+        : "No folder selected";
+    },
+  });
+  return h("form", { class: "panel panel-body", onsubmit: async (event) => {
+    event.preventDefault();
+    await guard(async () => {
+      const files = [...event.target.directoryFiles.files].filter(isBrowserImportFile);
+      await runLocalImportTask(`import folder (${files.length} files)`, { total: files.length, phase: "preparing" },
+        (update) => importSelectedDirectory(state.selectedBaseId, event.target, update));
+      event.target.reset();
+      summary.textContent = "No folder selected";
+    }, "Folder imported");
+  } }, [
+    h("h2", {}, localized("Frontend directory")),
+    h("p", { class: "muted" }, "Select the SmartCare product dictionary or Suite folder. Folder structure is preserved."),
+    h("label", { class: "field" }, "Local folder", picker),
+    summary,
+    h("label", { class: "field" }, "Conflict strategy", h("select", { name: "conflict" },
+      ["rename", "replace", "keep", "detect"].map((value) => h("option", { value, selected: value === "rename" }, value)))),
+    h("button", { class: "button primary" }, localized("Import frontend directory")),
+  ]);
+}
+
 async function renderImport() {
   if (!state.selectedBaseId) {
     screen.append(h("section", { class: "section" }, [
@@ -998,6 +1131,7 @@ async function renderImport() {
         ["rename", "replace", "keep", "detect"].map((value) => h("option", { value, selected: value === "rename" }, value)))),
       h("button", { class: "button primary" }, "Import files"),
     ]),
+    browserDirectoryImportForm(),
     h("form", { class: "panel panel-body", onsubmit: (event) => { event.preventDefault(); guard(async () => {
       const form = event.target;
       const operation = await api.submitOperation({
@@ -1008,8 +1142,8 @@ async function renderImport() {
       await trackOperation(operation, `import ${form.path.value}`);
       form.reset();
     }, "Directory imported"); } }, [
-      h("h2", {}, "Directory"), h("label", { class: "field" }, "Absolute local path", h("input", { name: "path", required: true })),
-      h("button", { class: "button primary" }, "Import directory"),
+      h("h2", {}, localized("Backend directory")), h("label", { class: "field" }, "Absolute local path", h("input", { name: "path", required: true })),
+      h("button", { class: "button primary" }, localized("Import backend directory")),
     ]),
   ]));
 }
@@ -1572,7 +1706,9 @@ async function renderModels() {
           h("div", { class: "toolbar" }, [
             ocrModel.status !== "not-downloaded" ? h("button", { class: "button small danger", onclick: () => guard(async () => {
               if (!window.confirm(`Delete OCR model "${ocrModel.id}"?`)) return;
-              await api.removeOCRModel(); await render();
+              const job = await api.removeOCRModel();
+              trackJob(job.jobId, `remove ocr ${ocrModel.id}`, { modelId: ocrModel.id, kind: "ocr-remove", progressMode: job.progressMode || "determinate" }).catch((error) => showToast(error.message, true));
+              await render();
             }, "OCR model removed") }, [icon(icons.trash), "Delete"]) : null,
             h("button", { class: "button small primary", onclick: () => guard(async () => {
               const job = await api.downloadOCRModel();
@@ -1622,7 +1758,9 @@ async function renderModels() {
           })() : null,
             h("button", { class: "button small danger", onclick: () => guard(async () => {
               if (!window.confirm(`Delete local model "${model.id}"?`)) return;
-              await api.removeModel(model.id); await render();
+              const job = await api.removeModel(model.id);
+              trackJob(job.jobId, `remove ${model.id}`, { modelId: model.id, kind: "model-remove", progressMode: job.progressMode || "determinate" }).catch((error) => showToast(error.message, true));
+              await render();
             }, "Model removed") }, "Delete"),
           ]),
         ])) : []),
@@ -1682,7 +1820,9 @@ function ollamaPanel(ollamaModels, ollamaError) {
         h("div", {}, [h("strong", { class: "truncate" }, model.name), h("div", { class: "muted" }, `${number(model.size)} bytes`)]),
         h("button", { class: "button small danger", onclick: () => guard(async () => {
           if (!window.confirm(`Delete Ollama model "${model.name}"?`)) return;
-          await api.deleteOllama(model.name); await render();
+          const job = await api.deleteOllama(model.name);
+          trackJob(job.jobId, `remove ollama ${model.name}`, { modelId: model.name, kind: "ollama-remove", progressMode: job.progressMode || "determinate" }).catch((error) => showToast(error.message, true));
+          await render();
         }, "Ollama model deleted") }, "Delete"),
       ])) : h("div", { class: "empty" }, "No Ollama models")),
     h("form", { class: "panel panel-body toolbar", style: "margin-top:12px", onsubmit: (event) => { event.preventDefault(); guard(async () => {

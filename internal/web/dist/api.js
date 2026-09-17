@@ -15,16 +15,13 @@ const endpoint = (path) => `${extensionPrefix}${path}`;
 async function request(path, options = {}) {
   const { timeoutMs = 15000, ...fetchOptions } = options;
   const externalSignal = fetchOptions.signal;
-  if (!externalSignal && routeSignal && (!fetchOptions.method || fetchOptions.method === "GET")
-    && !path.startsWith("/api/operations/") && !path.startsWith("/api/jobs/")) {
-    fetchOptions.signal = routeSignal;
-  }
+  const cancellationSignal = externalSignal ?? routeRequestSignal(path, fetchOptions.method);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const abortFromRoute = () => controller.abort();
-  if (externalSignal) {
-    if (externalSignal.aborted) controller.abort();
-    else externalSignal.addEventListener("abort", abortFromRoute, { once: true });
+  if (cancellationSignal) {
+    if (cancellationSignal.aborted) controller.abort();
+    else cancellationSignal.addEventListener("abort", abortFromRoute, { once: true });
   }
   try {
     const response = await fetch(endpoint(path), {
@@ -40,7 +37,7 @@ async function request(path, options = {}) {
     return payload.value;
   } catch (error) {
     if (error?.name === "AbortError") {
-      if (externalSignal?.aborted) {
+      if (cancellationSignal?.aborted) {
         const aborted = new ApiError(`Request aborted: ${path}`, 499, "request_aborted");
         aborted.name = "AbortError";
         throw aborted;
@@ -50,11 +47,54 @@ async function request(path, options = {}) {
     throw error;
   } finally {
     clearTimeout(timer);
-    if (externalSignal) externalSignal.removeEventListener("abort", abortFromRoute);
+    if (cancellationSignal) cancellationSignal.removeEventListener("abort", abortFromRoute);
   }
 }
 
 let routeSignal;
+
+function routeRequestSignal(path, method = "GET") {
+  if (method && method !== "GET") return undefined;
+  if (!routeSignal || path.startsWith("/api/operations/") || path.startsWith("/api/jobs/")) return undefined;
+  return routeSignal;
+}
+
+async function requestText(path, options = {}) {
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const externalSignal = fetchOptions.signal;
+  const cancellationSignal = externalSignal ?? routeRequestSignal(path, fetchOptions.method);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromRoute = () => controller.abort();
+  if (cancellationSignal) {
+    if (cancellationSignal.aborted) controller.abort();
+    else cancellationSignal.addEventListener("abort", abortFromRoute, { once: true });
+  }
+  try {
+    const response = await fetch(endpoint(path), {
+      ...fetchOptions,
+      signal: controller.signal,
+      headers: { ...(fetchOptions.headers ?? {}) },
+    });
+    if (!response.ok) {
+      throw new ApiError(`HTTP ${response.status}`, response.status);
+    }
+    return await response.text();
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      if (cancellationSignal?.aborted) {
+        const aborted = new ApiError(`Request aborted: ${path}`, 499, "request_aborted");
+        aborted.name = "AbortError";
+        throw aborted;
+      }
+      throw new ApiError(`Request timed out: ${path}`, 408, "request_timeout");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (cancellationSignal) cancellationSignal.removeEventListener("abort", abortFromRoute);
+  }
+}
 
 export function setRouteSignal(signal) {
   routeSignal = signal;
@@ -82,6 +122,7 @@ export const api = {
   updateDocument: (id, title) => request(`/api/documents/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   chunks: (id, limit = 20, offset = 0) => request(`/api/documents/${id}/chunks?limit=${limit}&offset=${offset}`),
   addText: (baseID, body) => post(`/api/bases/${baseID}/documents`, body),
+  createDirectory: (baseID, body) => post(`/api/bases/${baseID}/directories`, body),
   submitOperation: (body, idempotencyKey) => post("/api/operations", {
     ...body, idempotencyKey,
   }, { headers: { "Idempotency-Key": idempotencyKey } }),
@@ -117,11 +158,7 @@ export const api = {
   deleteDocuments: (ids) => post("/api/documents/delete", { ids }),
   reindexDocuments: (ids) => post("/api/documents/reindex", { ids }),
   deleteDirectory: (id) => post(`/api/documents/${id}/delete-tree`, {}),
-  rawText: async (id) => {
-    const response = await fetch(`/api/documents/${id}/raw?inline=1`);
-    if (!response.ok) throw new Error(`raw preview failed: HTTP ${response.status}`);
-    return await response.text();
-  },
+  rawText: (id, options = {}) => requestText(`/api/documents/${id}/raw?inline=1`, options),
   job: (id) => request(`/api/jobs/${id}`),
   cancelJob: (id) => post(`/api/jobs/${id}/cancel`, {}),
   search: (body) => post("/api/search", body),

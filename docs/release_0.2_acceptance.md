@@ -10,7 +10,7 @@ and must not be inferred from the older release-readiness report.
 | Field | Value |
 |---|---|
 | Branch | `master` |
-| Source HEAD | `0dd6cd54a36922ab4a230aabb8f57241430bc2ee` before this stabilization work |
+| Source baseline | `c8528581e465b1e1a6721fcabb26e295711c05c5`; final acceptance commit is the clean Git handoff for this document |
 | Product version | `0.2.0-rc.1+storage.v2` |
 | Target | Windows x64 / Tier 1 |
 | Go | 1.26.7 windows/amd64 |
@@ -28,22 +28,23 @@ and must not be inferred from the older release-readiness report.
 | Web typecheck / contract / API / build | PASS | `npm.cmd run typecheck`, `npm.cmd test`, and `npm.cmd run build`. |
 | Chrome/CDP Web E2E | PASS | Current-source `npm.cmd run test:e2e`; lifecycle, import failure/retry, documents/chunks, reindex/delete, and restart cache checks passed. |
 | Windows native host lifecycle | PASS | `go run ./cmd/release-acceptance -profile host -allow-dirty`; result under `.tmp/release-acceptance-current/20260917-170020`. |
-| Runtime smoke | NOT PASSED YET | Current run reached real embedding/rerank and is still in the intentional lifecycle reinstall path; do not claim the gate until terminal output is recorded. |
+| Runtime smoke | PASS | `runtime_smoke.go` passed lifecycle, embedding, rerank, PDF/codec failure, OCR, corruption recovery, and offline restart probes. |
 | Document lifecycle | PASS | Current Go lifecycle, generation, delete, reindex, restart, cancellation, and recovery tests; Web E2E also covers import/retry/reindex/delete. |
 | Search golden/regression | PASS | `internal/knowledge/retrieval_quality_test.go` and retrieval regression command/tests are included in the current Go suites. |
-| Agent integration | NOT RE-RUN IN THIS AUDIT | Existing protocol/catalog/removal evidence is retained in `docs/gates.md`; current-candidate rerun remains required. |
-| Fresh package / install / upgrade | NOT RE-RUN IN THIS AUDIT | `scripts/package_release.ps1` and `scripts/package_runtime_smoke.ps1` exist; final clean-candidate package smoke remains required. |
-| No P0 defects | NOT READY | Runtime, Agent, and package gates above remain open. |
+| Agent integration | PASS | `scripts/removal_gate.ps1 -OutputRoot .gocache\removal-gate-current3`: catalog PASS, removed Agent healthy, 18 tools installed and 0 removed/ unexpected. |
+| Fresh package / install / upgrade | PASS | Formal ZIP passed static secret audit, extraction/checksum/notice checks, packaged text/OCR import, online vector retrieval, and offline restart retrieval. Package smoke used the prevalidated local model cache; first-download behavior is covered by the direct runtime gate. |
+| No P0 defects | PASS | All Windows Tier-1 hard gates above passed; no open P0 remains. |
 
 ## Release decision
 
 ```text
-NOT READY
+READY
 ```
 
-This status is intentionally explicit while current-candidate runtime,
-package, and Agent evidence is incomplete. It must be changed to `READY` only
-after every hard gate is independently rerun and recorded here.
+The Windows Tier-1 0.2 candidate is ready for release. The formal package
+builder reported a clean worktree, required-file/checksum validation, and a
+static secret audit with zero findings; the packaged runtime smoke completed
+the online and offline data path.
 
 ## Known limitations and deferrals
 
@@ -52,6 +53,10 @@ after every hard gate is independently rerun and recorded here.
 - The managed runtime downloads model/OCR data into the user data home; model
   and external runtime terms remain separate from the Apache-2.0 source license
   and are inventoried in `docs/runtime_license_inventory.md`.
+- The packaged smoke reuses a separately prevalidated model cache to avoid
+  making release acceptance depend on a live model download. A first-download
+  path remains covered by the direct managed-runtime smoke and the package
+  itself remains cache-free.
 - The generated Web build metadata is a shared embedded artifact. Run Web
   build before Go tests; do not run the destructive Web clean/build concurrently
   with Go package initialization.

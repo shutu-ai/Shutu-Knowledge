@@ -10,18 +10,20 @@ retrieval/runtime subsystems.
 
 | Item | Current state | Required closure evidence |
 |---|---|---|
-| Managed runtime smoke | In progress in the current worktree; the smoke reached real embedding and rerank inference, then entered the intentional model lifecycle reinstall path. | Complete current-source embedding, rerank, OCR, PDF, corruption recovery, lifecycle, and offline restart smoke. |
-| Formal release package | Existing package builder and static audit are present, but must be run after the final candidate is clean. | ZIP extraction, checksums, required notices, secret audit, packaged startup/import/search/offline restart. |
-| Agent integration | Existing protocol, catalog, removal, and real-process tests are present. | Re-run the current candidate's Agent integration/removal gate or record the external Agent binary as unavailable. |
+| Managed runtime smoke | PASS | Current-source embedding, rerank, OCR, PDF, corruption recovery, lifecycle, and offline restart smoke completed. |
+| Formal release package | PASS | Clean formal ZIP passed checksums, required notices, static secret audit, packaged startup/import/search, and offline restart. |
+| Agent integration | PASS | Current candidate removal gate passed catalog validation, real Agent health, and zero removed/unexpected tools or routes. |
 
 No new P0 correctness defect remains open after the storage shutdown fix: the
-full serial race suite passed after the fix. The three rows above remain gates
-until their current-candidate evidence is recorded.
+full serial race suite passed after the fix, and all three release rows above
+now have current-candidate evidence.
 
 ## Must fix (P1)
 
 - Keep the Web E2E selector tied to stable form semantics (`name="path"`),
   not translated heading text.
+- Keep package smoke paths absolute and poll durable operation receipts before
+  asserting document readiness; the Web API is asynchronous by contract.
 - Keep the release commands serial where Go package initialization consumes
   the generated `internal/web/dist/build-info.json`; concurrent Web build and
   Go test can delete that shared embedded output during test startup.

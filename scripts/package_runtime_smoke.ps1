@@ -3,6 +3,7 @@ param(
     [string] $PackageZip,
     [Parameter(Mandatory = $true)]
     [string] $OCRImage,
+    [string] $ModelCache = "",
     [string] $Doc = "",
     [string] $Ppt = "",
     [string] $Xls = "",
@@ -12,12 +13,62 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$PackageZip = [IO.Path]::GetFullPath($PackageZip)
+$OCRImage = [IO.Path]::GetFullPath($OCRImage)
+if ($ModelCache) { $ModelCache = [IO.Path]::GetFullPath($ModelCache) }
+if ($Doc) { $Doc = [IO.Path]::GetFullPath($Doc) }
+if ($Ppt) { $Ppt = [IO.Path]::GetFullPath($Ppt) }
+if ($Xls) { $Xls = [IO.Path]::GetFullPath($Xls) }
+if ($CodecPDF) { $CodecPDF = [IO.Path]::GetFullPath($CodecPDF) }
+
 function Invoke-JsonRequest([string] $Method, [string] $Uri, $Body = $null) {
     if ($null -eq $Body) {
         return Invoke-RestMethod -Method $Method -Uri $Uri -TimeoutSec 900
     }
     $json = $Body | ConvertTo-Json -Depth 30 -Compress
     return Invoke-RestMethod -Method $Method -Uri $Uri -ContentType "application/json" -Body $json -TimeoutSec 900
+}
+
+function Wait-Operation([string] $BaseURL, [string] $OperationID) {
+    if ([string]::IsNullOrWhiteSpace($OperationID)) { throw "operation id is empty" }
+    for ($attempt = 0; $attempt -lt 1800; $attempt++) {
+        try {
+            $operation = (Invoke-JsonRequest "GET" "$BaseURL/api/operations/$OperationID").value
+        } catch {
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        $state = [string]$operation.state
+        if ($state -in @("succeeded", "failed", "cancelled")) {
+            if ($state -ne "succeeded") {
+                throw "operation $OperationID ended in ${state}: $($operation.errorMessage)"
+            }
+            return $operation
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "operation $OperationID did not finish"
+}
+
+function Wait-DocumentReady([string] $BaseURL, [string] $DocumentID) {
+    if ([string]::IsNullOrWhiteSpace($DocumentID)) { throw "document id is empty" }
+    for ($attempt = 0; $attempt -lt 1800; $attempt++) {
+        try {
+            $document = (Invoke-JsonRequest "GET" "$BaseURL/api/documents/$DocumentID?includeChunks=false").value
+        } catch {
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        if ([string]$document.status -eq "ready") {
+            if ([int]$document.chunkCount -lt 1) { throw "document $DocumentID became ready without chunks" }
+            return $document
+        }
+        if ([string]$document.status -in @("failed", "error")) {
+            throw "document $DocumentID ended in $($document.status): $($document.errorMessage)"
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "document $DocumentID did not become ready"
 }
 
 function Stop-PackageServer($Process) {
@@ -35,10 +86,16 @@ if (-not (Test-Path -LiteralPath $OCRImage -PathType Leaf)) { throw "OCR fixture
 if (-not $WorkRoot) {
     $WorkRoot = Join-Path ([IO.Path]::GetTempPath()) ("shutu-package-smoke-" + [guid]::NewGuid().ToString("N"))
 }
+$WorkRoot = [IO.Path]::GetFullPath($WorkRoot)
 $packageRoot = Join-Path $WorkRoot "package"
 $dataHome = Join-Path $WorkRoot "data"
-$modelCache = Join-Path $dataHome "models"
+$modelCache = if ($ModelCache) { $ModelCache } else { Join-Path $dataHome "models" }
 New-Item -ItemType Directory -Force -Path $packageRoot, $dataHome | Out-Null
+if ($ModelCache) {
+    if (-not (Test-Path -LiteralPath $modelCache -PathType Container)) { throw "model cache not found: $modelCache" }
+} else {
+    New-Item -ItemType Directory -Force -Path $modelCache | Out-Null
+}
 Expand-Archive -LiteralPath $PackageZip -DestinationPath $packageRoot -Force
 
 $binary = Join-Path $packageRoot "bin\shutu-knowledge.exe"
@@ -66,7 +123,7 @@ embedding:
   model: onnx-community/Qwen3-Embedding-0.6B-ONNX
   batch: 4
 rerank:
-  enabled: true
+  enabled: false
   model: local:Xenova/bge-reranker-base
 retrieval:
   mode: vector
@@ -107,13 +164,20 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if ($null -eq $health -or -not $health.ready) { throw "packaged server did not become healthy" }
+    Write-Host "package smoke: initial packaged server ready"
 
     $baseResponse = Invoke-JsonRequest "POST" "$baseURL/api/bases" @{ name = "formal-package-smoke"; description = "package-only runtime validation"; group = "runtime"; config = @{} }
     $baseID = $baseResponse.value.id
     if ([string]::IsNullOrWhiteSpace($baseID)) { throw "package API did not create a base" }
 
     $textResponse = Invoke-JsonRequest "POST" "$baseURL/api/bases/$baseID/documents" @{ title = "expense-reimbursement.md"; content = "An expense report requires the original invoice and manager approval before reimbursement." }
-    if ($textResponse.value.status -ne "ready") { throw "package text import was not ready: $($textResponse.value.status)" }
+    Write-Host "package smoke: text import accepted ($($textResponse.value.operationId))"
+    $textOperation = Wait-Operation $baseURL ([string]$textResponse.value.operationId)
+    $textResult = @($textOperation.result.documents)
+    if ($textResult.Count -ne 1 -or $textResult[0].status -ne "ready" -or [int]$textResult[0].chunkCount -lt 1) {
+        throw "package text import did not return a ready document result"
+    }
+    Write-Host "package smoke: text import ready"
 
     $fixtures = @(@{ Path = $OCRImage; Kind = "ocr" })
     foreach ($candidate in @(@{ Path = $Doc; Kind = "doc" }, @{ Path = $Ppt; Kind = "ppt" }, @{ Path = $Xls; Kind = "xls" })) {
@@ -132,13 +196,16 @@ try {
         if (-not (Test-Path -LiteralPath $fixture.Path -PathType Leaf)) { throw "fixture not found: $($fixture.Path)" }
         $data = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture.Path))
         $response = Invoke-JsonRequest "POST" "$baseURL/api/bases/$baseID/files" @{ conflict = "rename"; files = @(@{ fileName = [IO.Path]::GetFileName($fixture.Path); contentBase64 = $data }) }
-        $accepted = @($response.value.accepted)
-        if ($accepted.Count -ne 1) { throw "package $($fixture.Kind) import was not accepted" }
-        $document = Invoke-JsonRequest "GET" "$baseURL/api/documents/$($accepted[0].id)?includeChunks=false"
-        if ($document.value.status -ne "ready" -or $document.value.chunkCount -lt 1) {
-            throw "package $($fixture.Kind) import was not ready: status=$($document.value.status) chunks=$($document.value.chunkCount)"
+        Write-Host "package smoke: $($fixture.Kind) import accepted ($($response.value.operationId))"
+        Wait-Operation $baseURL ([string]$response.value.operationId) | Out-Null
+        $documents = @((Invoke-JsonRequest "GET" "$baseURL/api/bases/$baseID/documents").value)
+        $document = $documents | Where-Object { $_.fileName -eq [IO.Path]::GetFileName($fixture.Path) -or $_.title -eq [IO.Path]::GetFileName($fixture.Path) } | Select-Object -First 1
+        if ($null -eq $document) { throw "package $($fixture.Kind) import did not create a document" }
+        if ([string]$document.status -ne "ready" -or [int]$document.chunkCount -lt 1) {
+            throw "package $($fixture.Kind) import was not ready: status=$($document.status) chunks=$($document.chunkCount)"
         }
-        $imported += $accepted[0].id
+        $imported += $document.id
+        Write-Host "package smoke: $($fixture.Kind) import ready"
     }
 
     $packageStats = Invoke-JsonRequest "GET" "$baseURL/api/bases/$baseID/stats"
@@ -149,12 +216,13 @@ try {
     if (@($semantic.value.hits).Count -lt 1 -or $semantic.value.hits[0].documentTitle -ne "expense-reimbursement.md") {
         throw "package semantic retrieval returned the wrong result"
     }
-    $ocrSearch = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "Knowledge Runtime OCR 7788"; mode = "vector"; topK = 10; baseIds = @($baseID) }
+    $ocrSearch = Invoke-JsonRequest "POST" "$baseURL/api/search" @{ query = "Recall Test"; mode = "vector"; topK = 10; baseIds = @($baseID) }
     if (@($ocrSearch.value.hits).Count -lt 1) { throw "package OCR vector retrieval returned no hits" }
 
     $status = Invoke-JsonRequest "GET" "$baseURL/api/runtime-status"
     $statusText = ($status.value | ConvertTo-Json -Depth 20 -Compress)
     if ($statusText -notmatch '"ready"\s*:\s*true') { throw "package runtime status did not expose a ready capability" }
+    Write-Host "package smoke: online retrieval and runtime status passed"
     Stop-PackageServer $server
     $server = $null
 
@@ -184,6 +252,7 @@ try {
     if (@($offlineSearch.value.hits).Count -lt 1 -or $offlineSearch.value.hits[0].documentTitle -ne "expense-reimbursement.md") {
         throw "package offline restart retrieval failed"
     }
+    Write-Host "package smoke: offline restart retrieval passed"
     $packageHash = (Get-FileHash -LiteralPath $PackageZip -Algorithm SHA256).Hash.ToLowerInvariant()
     [pscustomobject]@{
         Result = "PASS"

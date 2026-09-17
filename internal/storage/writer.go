@@ -289,7 +289,17 @@ func (w *Writer) Start() error {
 
 // Stop rejects queued work and waits for the in-flight callback to return.
 func (w *Writer) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	w.stopOnce.Do(func() { close(w.stop) })
+	// Check before selecting between done and ctx.Done. When the writer has
+	// already drained, both channels may be ready and select would otherwise
+	// nondeterministically report a successful shutdown for an already-canceled
+	// caller.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-w.done:
 		return nil

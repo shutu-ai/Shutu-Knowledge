@@ -5,11 +5,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
+$AgentBinary = [IO.Path]::GetFullPath($AgentBinary)
 if (-not $env:GOCACHE) { $env:GOCACHE = Join-Path $RepoRoot ".gocache" }
 if (-not (Test-Path $AgentBinary)) { throw "Agent binary not found: $AgentBinary" }
 $AgentDist = Join-Path (Split-Path -Parent $AgentBinary) "web\dist"
 if (-not (Test-Path (Join-Path $AgentDist "index.html"))) { throw "Agent web dist not found: $AgentDist" }
 if (-not $OutputRoot) { $OutputRoot = Join-Path $RepoRoot ".gocache\removal-gate" }
+$OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
 $knowledgeBinary = Join-Path $OutputRoot "shutu-knowledge-gate.exe"

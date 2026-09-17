@@ -13,6 +13,7 @@ import (
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
+	"github.com/shutu-ai/shutu-knowledge/internal/health"
 	"github.com/shutu-ai/shutu-knowledge/internal/version"
 	"github.com/shutu-ai/shutu-knowledge/internal/web"
 )
@@ -57,6 +58,26 @@ func Manifest() extension.Manifest {
 }
 
 // Run serves Extension Protocol v1 over the provided stdio streams.
+func extensionHealthResult(report health.Report) extension.HealthResult {
+	detail := ""
+	for i, c := range report.Components {
+		if i > 0 {
+			detail += ";"
+		}
+		detail += fmt.Sprintf("%s=%s", c.Name, c.Status)
+		if c.Detail != "" {
+			detail += "(" + c.Detail + ")"
+		}
+	}
+	// Startup recovery is deliberately deferred so the extension web surface
+	// can come up before a large database is scanned. Agent extension startup
+	// requires the initial health response to be ready, so treat this explicit
+	// in-progress state as protocol-ready while preserving the "starting"
+	// status and the later failed state.
+	ready := report.Ready || report.Status == "starting"
+	return extension.HealthResult{Ready: ready, Status: report.Status, Detail: detail}
+}
+
 func Run(ctx context.Context, app *app.App, in io.Reader, out io.Writer) error {
 	webServer := web.New(app)
 	addr, err := webServer.Listen("127.0.0.1:0")
@@ -84,21 +105,7 @@ func Run(ctx context.Context, app *app.App, in io.Reader, out io.Writer) error {
 		},
 		Health: func(ctx context.Context) (extension.HealthResult, error) {
 			report := app.HealthSnapshot(ctx)
-			detail := ""
-			for i, c := range report.Components {
-				if i > 0 {
-					detail += ";"
-				}
-				detail += fmt.Sprintf("%s=%s", c.Name, c.Status)
-				if c.Detail != "" {
-					detail += "(" + c.Detail + ")"
-				}
-			}
-			return extension.HealthResult{
-				Ready:  report.Ready,
-				Status: report.Status,
-				Detail: detail,
-			}, nil
+			return extensionHealthResult(report), nil
 		},
 		ProvideContext: func(ctx context.Context, request extension.ContextRequest) (extension.ContextResult, error) {
 			return ProvideContext(ctx, app, request)

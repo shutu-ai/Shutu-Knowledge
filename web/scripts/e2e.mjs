@@ -360,8 +360,8 @@ async function run() {
     const missingDirectory = "definitely-missing-e2e-directory";
     await evaluateWithArgs({ path: missingDirectory }, `
       const form = [...document.querySelectorAll("form")].find((item) =>
-        [...item.querySelectorAll("h2")].some((heading) => heading.textContent === "Directory"));
-      if (!form) throw new Error("directory import form missing");
+        item.querySelector('[name="path"]'));
+      if (!form) throw new Error("backend directory import form missing");
       form.querySelector('[name="path"]').value = args.path;
       form.requestSubmit();
     `);

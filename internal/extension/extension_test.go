@@ -17,6 +17,7 @@ import (
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
+	"github.com/shutu-ai/shutu-knowledge/internal/health"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 )
@@ -75,6 +76,22 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 				t.Fatalf("%s risk: %+v", definition.Name, definition)
 			}
 		}
+	}
+}
+
+func TestExtensionHealthAllowsDeferredRecoveryToStartAgent(t *testing.T) {
+	starting := extensionHealthResult(health.Report{
+		Ready:      false,
+		Status:     "starting",
+		Components: []health.Component{{Name: "startup-recovery", Status: "ok"}},
+	})
+	if !starting.Ready || starting.Status != "starting" || !strings.Contains(starting.Detail, "startup-recovery=ok") {
+		t.Fatalf("deferred recovery health = %+v", starting)
+	}
+
+	failed := extensionHealthResult(health.Report{Ready: false, Status: "unhealthy: startup-recovery"})
+	if failed.Ready {
+		t.Fatalf("failed recovery reported ready: %+v", failed)
 	}
 }
 

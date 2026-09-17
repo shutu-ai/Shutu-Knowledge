@@ -310,13 +310,22 @@ func (w *Writer) Stop(ctx context.Context) error {
 
 // Exec executes one bounded mutation through the writer.
 func (w *Writer) Exec(ctx context.Context, priority WritePriority, query string, args ...any) (sql.Result, error) {
-	var result sql.Result
+	type execResult struct {
+		result sql.Result
+		err    error
+	}
+	results := make(chan execResult, 1)
 	err := w.Do(ctx, priority, func(runCtx context.Context) error {
-		var err error
-		result, err = w.db.ExecContext(runCtx, query, args...)
-		return err
+		result, execErr := w.db.ExecContext(runCtx, query, args...)
+		results <- execResult{result: result, err: execErr}
+		return execErr
 	})
-	return result, err
+	select {
+	case result := <-results:
+		return result.result, result.err
+	default:
+		return nil, err
+	}
 }
 
 // Tx executes a transaction entirely inside the writer loop. The callback

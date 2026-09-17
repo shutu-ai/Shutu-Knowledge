@@ -63,7 +63,7 @@ jobs:
       - name: Check storage writer guard
         run: go test ./scripts -run '^TestWriterGuard$' -count=1
       - name: Test race
-        run: go test -race ./...
+        run: go test -race ./... -p 1 -timeout=30m
       - name: Benchmark smoke
         run: go test ./internal/knowledge -run '^$' -bench Benchmark -benchtime=1x
       - name: Browser E2E

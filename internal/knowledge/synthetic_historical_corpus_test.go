@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -25,7 +26,7 @@ func TestSyntheticHistoricalCorpusLongReaderGCDrill(t *testing.T) {
 	fill := strings.Repeat(" historical corpus retrieval alpha beta gamma delta epsilon", 8)
 
 	buildStart := time.Now()
-	tx, err := f.service.store.db.Begin()
+	tx, err := f.service.store.db.DB.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,8 +144,7 @@ func TestSyntheticHistoricalCorpusLongReaderGCDrill(t *testing.T) {
 	}
 
 	expired := now() - retiredGenerationRetentionMS - 1
-	if _, err := f.service.store.db.Exec(`UPDATE chunks SET created_at = ?
-		WHERE index_generation = 1`, expired); err != nil {
+	if err := ageRetiredChunksInBatches(f.service.store.db, expired, 500); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.service.store.db.Exec(`UPDATE document_generations SET created_at = ?
@@ -267,4 +267,56 @@ func TestSyntheticHistoricalCorpusLongReaderGCDrill(t *testing.T) {
 	t.Logf("synthetic historical corpus docs=%d chunks=%d active=%d retired=%d build=%s search=%s gc=%s pinnedReader=%s dbBytes=%d",
 		documentCount, chunkCount, activeChunks, retiredChunks, buildElapsed,
 		searchElapsed, gcElapsed, readerElapsed, databaseInfo.Size())
+}
+
+// ageRetiredChunksInBatches keeps the synthetic fixture aligned with the
+// bounded-maintenance contract. A single UPDATE over the whole historical
+// corpus exceeds the normal Writer deadline under -race on Windows and also
+// hides the batch behavior that the GC drill is intended to exercise.
+func ageRetiredChunksInBatches(db interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, createdAt int64, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+	ctx := context.Background()
+	var afterRowID int64
+	for {
+		rows, err := db.QueryContext(ctx, `SELECT rowid FROM chunks
+			WHERE index_generation = 1 AND rowid > ? ORDER BY rowid LIMIT ?`, afterRowID, batchSize)
+		if err != nil {
+			return err
+		}
+		rowIDs := make([]int64, 0, batchSize)
+		for rows.Next() {
+			var rowID int64
+			if err := rows.Scan(&rowID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			rowIDs = append(rowIDs, rowID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if len(rowIDs) == 0 {
+			return nil
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(rowIDs)), ",")
+		args := make([]any, 0, len(rowIDs)+1)
+		args = append(args, createdAt)
+		for _, rowID := range rowIDs {
+			args = append(args, rowID)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE chunks SET created_at = ?
+			WHERE rowid IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
+		afterRowID = rowIDs[len(rowIDs)-1]
+	}
 }

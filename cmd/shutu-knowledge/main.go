@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
@@ -88,7 +89,23 @@ func cmdServe(ctx context.Context) error {
 	application.StartBackgroundMaintenance()
 	application.Logger.Info("serve started", "addr", addr.String(), "home", application.Home)
 	<-ctx.Done()
-	return server.Shutdown(context.Background())
+	return shutdownServerWithTimeout(server, 15*time.Second)
+}
+
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+// shutdownServerWithTimeout prevents an uncooperative HTTP handler from
+// consuming the entire process shutdown path. App.Close has its own bounded
+// cleanup budget after the listener is stopped.
+func shutdownServerWithTimeout(server httpShutdowner, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return server.Shutdown(shutdownCtx)
 }
 
 func formatListenError(addr string, err error) error {
@@ -132,12 +149,12 @@ func cmdDoctor(ctx context.Context) error {
 	}
 	defer application.Close()
 
-	v, err := storage.SchemaVersion(application.DB.DB)
+	v, err := storage.SchemaVersion(application.DB.ReadDB())
 	if err != nil {
 		return err
 	}
 	fmt.Println("schema version:", v)
-	format, err := storage.StorageFormat(application.DB.DB)
+	format, err := storage.StorageFormat(application.DB.ReadDB())
 	if err != nil {
 		return err
 	}

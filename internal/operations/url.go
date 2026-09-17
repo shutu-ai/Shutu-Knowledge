@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 const MaxURLCaptureBytes = 10 << 20
@@ -68,7 +70,7 @@ func (s *Service) EnsureURLCapture(ctx context.Context, operationID, rawURL, fin
 		CreatedAt: current, UpdatedAt: current,
 		ExpiresAt: current + int64(7*24*time.Hour/time.Millisecond),
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO url_captures
+	_, err = s.db.ExecPriority(ctx, storage.ControlWrite, `INSERT INTO url_captures
 		(id, operation_id, raw_url, final_url, content_type, sha256, size_bytes, state,
 		 body, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -108,7 +110,7 @@ func (s *Service) GetURLCapture(ctx context.Context, operationID string) (URLCap
 // ConsumeURLCapture clears bulky bytes after the document publish has
 // succeeded, while retaining the audit reference and digest.
 func (s *Service) ConsumeURLCapture(ctx context.Context, operationID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE url_captures SET state = ?, body = NULL, updated_at = ?
+	_, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE url_captures SET state = ?, body = NULL, updated_at = ?
 		WHERE operation_id = ? AND state = ?`, URLStateConsumed, now(), operationID, URLStateReady)
 	return err
 }
@@ -116,7 +118,30 @@ func (s *Service) ConsumeURLCapture(ctx context.Context, operationID string) err
 // ExpireURLCaptures clears retry bodies at the retention boundary. Consumed
 // rows were cleared on success; failed rows retain source through expiry.
 func (s *Service) ExpireURLCaptures(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE url_captures SET state = ?, body = NULL, updated_at = ?
-		WHERE state IN ('ready','failed') AND expires_at < ?`, URLStateConsumed, now(), now())
-	return err
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE url_captures
+			SET state = ?, body = NULL, updated_at = ?
+			WHERE id IN (
+				SELECT id FROM url_captures
+				WHERE state IN ('ready','failed') AND expires_at < ?
+				ORDER BY expires_at, id
+				LIMIT ?
+			) AND state IN ('ready','failed')`, URLStateConsumed, now(), now(), cleanupBatchSize)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected < cleanupBatchSize {
+			return nil
+		}
+	}
 }

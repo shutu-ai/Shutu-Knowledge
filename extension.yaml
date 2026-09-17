@@ -35,7 +35,9 @@ health:
   timeout_ms: 1000
 lifecycle:
   enabled: true
-  startup_timeout_ms: 10000
+  # A cold managed-runtime install may run npm setup before the extension
+  # handshake; keep this aligned with the Knowledge runtime startup budget.
+  startup_timeout_ms: 120000
   shutdown_timeout_ms: 5000
   restart_policy: on-failure
   max_restarts: 3

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,18 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestSaveContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := SaveContext(ctx, path, Defaults()); err != context.Canceled {
+		t.Fatalf("cancelled save error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cancelled save created config: err=%v", err)
+	}
+}
 
 func TestDefaultsClamp(t *testing.T) {
 	cfg := Defaults()
@@ -116,6 +129,38 @@ func TestProcessingWorkflowAndAutoRetrievePersist(t *testing.T) {
 	if loaded.Captioning.Provider != "openai" || loaded.Captioning.Model != "vision-model" ||
 		loaded.Captioning.BaseURL != "https://vision.example" || loaded.Captioning.APIKey != "caption-secret" {
 		t.Fatalf("captioning did not persist: %+v", loaded.Captioning)
+	}
+}
+
+func TestSaveAtomicallyReplacesConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", home)
+	path := filepath.Join(home, "config.yaml")
+	first := Defaults()
+	first.Server.Addr = "127.0.0.1:7001"
+	if err := Save(path, first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.Server.Addr = "127.0.0.1:7002"
+	if err := Save(path, second); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Server.Addr != second.Server.Addr {
+		t.Fatalf("saved address = %q, want %q", loaded.Server.Addr, second.Server.Addr)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".config-") {
+			t.Fatalf("temporary config file remains: %s", entry.Name())
+		}
 	}
 }
 

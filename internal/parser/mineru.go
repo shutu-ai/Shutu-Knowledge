@@ -149,7 +149,9 @@ func ExtractPDFWithMineru(ctx context.Context, fileName string, pdf []byte, sett
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("mineru extract timed out")
 		}
-		time.Sleep(mineruPollInterval)
+		if err := waitForMineruPoll(ctx); err != nil {
+			return "", fmt.Errorf("mineru extraction aborted: %w", err)
+		}
 		poll, err := settings.apiJSON(ctx, http.MethodGet, host+"/api/v4/extract-results/batch/"+batch.BatchID, nil, nil)
 		if err != nil {
 			return "", err
@@ -176,6 +178,17 @@ func ExtractPDFWithMineru(ctx context.Context, fileName string, pdf []byte, sett
 		case "failed":
 			return "", fmt.Errorf("mineru extract failed: %s", result.ErrMsg)
 		}
+	}
+}
+
+func waitForMineruPoll(ctx context.Context) error {
+	timer := time.NewTimer(mineruPollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 

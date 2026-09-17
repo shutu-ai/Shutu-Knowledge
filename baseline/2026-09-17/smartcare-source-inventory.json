@@ -1,0 +1,428 @@
+{
+  "schemaVersion": 1,
+  "generatedAtUtc": "2026-09-17T09:59:33.0439931Z",
+  "reportFingerprint": "3e2d794b2e9898538536ac8fb03a8ef9cccc573086e4246a98df829901bc210a",
+  "tool": "shutu-knowledge/architecture-baseline-v1",
+  "host": {
+    "os": "windows",
+    "arch": "amd64",
+    "cpus": 16,
+    "goVersion": "go1.26.7",
+    "availableBytes": 250196852736,
+    "totalBytes": 988282875904,
+    "memoryBytes": 33751777280,
+    "resourcePath": "C:\\Documents\\SmartCare产品数据字典(全集-内部版)-20251030"
+  },
+  "datasets": [
+    {
+      "name": "product-dictionary",
+      "root": "C:\\Documents\\SmartCare产品数据字典(全集-内部版)-20251030",
+      "files": [
+        {
+          "path": "DataCube数据模型资产目录5.2.xlsx",
+          "bytes": 3923714,
+          "sha256": "2622af7c8a5aac5505c111934c19fb8cf92a964e71e125dbd7f9d57ef92a32d0",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/CCA\u0026CCH支持指标默认建模-V1.1.xlsx",
+          "bytes": 33143,
+          "sha256": "a3a21d9da63898b0cc8f2b9e9b4b5e05f4aede7cd4fbb63ae018cb5d81c631b5",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst  KPI (EPS FB) 01-zh.xlsm",
+          "bytes": 41088,
+          "sha256": "622dcd6fe0a172cf846045197f4ed7ef525e7db31a0677e43cc548111322f4d2",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst  KPI (VoNR) 01-zh .xlsm",
+          "bytes": 81779,
+          "sha256": "74e35ae0e72c1ace9b41facab5a32a62ea163e794cc5c891af67a873f6984695",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (CSFB) 01-zh.xlsm",
+          "bytes": 69251,
+          "sha256": "aee3d3871c183dcee4921842976913ee19d639c62eed80415da9c531355ea281",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (DNS) 01-zh.xls",
+          "bytes": 119808,
+          "sha256": "ad38d05547338972da2a504e4953b8e5192b144d51f1018e51c22848e90baac2",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (MBB Traffic) 01-zh.xls",
+          "bytes": 109568,
+          "sha256": "5585a3b114087c7f760d3a5a0869386fcc3611e4f7956f917de49de9beea18dc",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (PS Pipe HTTPS\u0026UDP\u0026QUIC) 01-zh.xls",
+          "bytes": 154624,
+          "sha256": "a4151ff395dc47a29932beb6a403250c03d1d9aebbc39aa72dea5678405fb95b",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (PS Pipe TCP) 01-zh.xls",
+          "bytes": 176128,
+          "sha256": "4fc8eba0aa4f03061d7197ba6b6f314c38292f7a41a2542af0156deb86382ee7",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (Roaming) 01-zh.xlsm",
+          "bytes": 206435,
+          "sha256": "163d8d870e6196a7eb7b58981e28974c4183d6d7ab4038b1977fc3eaa3dc8531",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI Definition (VoLTE) 01-zh.xlsx",
+          "bytes": 190450,
+          "sha256": "543e9e33822269b052aac1a5cb1f5621085f8580f7ae2cc96097f5855e8c3fe0",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (IM \u0026 VoIP \u0026 FileTransfer) 01-zh.xlsm",
+          "bytes": 110245,
+          "sha256": "63c99b5603f9bfa3cbfe7ee263388259aaebe189ead247e7a5e1e45caea4009e",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (OTT Experience Management) 01-zh.xlsx",
+          "bytes": 38784,
+          "sha256": "25ccda022597fd99a6cf5790db48cf83643a31231efbf847f5b446ebf7397fcb",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (SMS) 01-zh.xlsm",
+          "bytes": 107516,
+          "sha256": "3453467f827df9cd6d79baa623b1d31fe388b8ffbf92409c29940bd35dab8d1b",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (Streaming) 01-zh.xlsm",
+          "bytes": 86650,
+          "sha256": "bf4a903e97feba56603615740e3bc3778aa315c2ecfb06ca7c58ef9506247557",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (Voice) 01-zh.xlsm",
+          "bytes": 141165,
+          "sha256": "913dbd6176b6aae8bb54ef237774f03655797c91294d3b4ea88c3c9372f2c9f8",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst KPI-KQI Definition (WEB) 01-zh.xls",
+          "bytes": 316928,
+          "sha256": "71ec7cf38b0c0d6d67cb067dab45d44f65e27f45b2b4bd958b4c0b2d7fd8b7e1",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst Signaling KPI (2\u00263G CS) 01-zh.xls",
+          "bytes": 551424,
+          "sha256": "57266b0904b3da379b142260ffa93e7385ed8f0bc21d7c21dc2f3cbfd17012d9",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst Signaling KPI (2\u00263G PS) 01-zh.xls",
+          "bytes": 534016,
+          "sha256": "32ad2159304244201e5050138d1345efab961ac01e6ec6523ed2b455a217564c",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst Signaling KPI (5G SA) 01-zh.xlsm",
+          "bytes": 109462,
+          "sha256": "9eb28b4786b9608597ee22b2981ac37920375bcf58176c9c9ab0dc1c05b05a63",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst Signaling KPI (EPC \u0026 5G NSA) 01-zh.xlsm",
+          "bytes": 171819,
+          "sha256": "e8e95ba5f9e3ecea4dd837fa4b33f1d9f9bf1fb08c4d0659da9587d41ab009c4",
+          "kind": "file"
+        },
+        {
+          "path": "KPI-KQI Definition/HUAWEI SEQ Analyst Signaling KPI (interConnection) 01-zh.xls",
+          "bytes": 115200,
+          "sha256": "e575be84ca8eb0875874ba2bbe126839b711d5fff911148370c37c2d56f72347",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/4\u00265G AI流量预测数据字典说明_202210.pptx",
+          "bytes": 2819852,
+          "sha256": "0a300dddb453d9bcdebc95b79cc9b376cddc072c9618f760636a6b12e3e33711",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/4G AI流量预测数据字典_202210.xlsx",
+          "bytes": 88243,
+          "sha256": "4cbeced0fd1551f06392098b9f0645ae2bd0401f928fd752932ff2340c0290bb",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/5G AI流量预测数据字典_202210.xlsx",
+          "bytes": 88324,
+          "sha256": "068376f6f325449b9a29033fa2a9f9ae21f03d3b9e2d8e1da420d2f442049636",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/CEI+客户体验指数数据字典(内部版).xlsx",
+          "bytes": 323268,
+          "sha256": "e5eb261fcb7bde4c10926f83879bc46d674f7db8dddea5c85eaf63d140ff1848",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (5G) 01-zh.xlsm",
+          "bytes": 486274,
+          "sha256": "d9b2ef3f5127575fe64e9b5fb6bc63e4bc2269431665bb7d1e98c2d2e267f2a9",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (CEM) 01-zh.xlsm",
+          "bytes": 591727,
+          "sha256": "7ec4f888dc8c5107d893adc8f1cf25e398b9e1149e0b231cfef1afdf207c883a",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (EPS FB) 01-zh.xlsm",
+          "bytes": 377512,
+          "sha256": "8194718c01cd8e8d6bfd2657f8f7bc95d8bc16393807966733871f039c394f39",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (NPM) 01-zh.xlsm",
+          "bytes": 602438,
+          "sha256": "354777115e7180637832b4b6383010e70847109c91e84ae214fc1c31cce69af2",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (Roaming) 01-zh.xlsm",
+          "bytes": 382768,
+          "sha256": "9de36dc5c0309855ae8e7b4aa9af0d33deddaf4102616319b6ca740955e5ef4b",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (SQM) 01-zh.xlsm",
+          "bytes": 664512,
+          "sha256": "a4ce3fac713bc8fa61b5f7b60ae16f7b76106674f07bf160b002a298d946c6a6",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (VoLTE E2E Service Quality) 01-zh.xlsm",
+          "bytes": 83975,
+          "sha256": "274d5721b6f74cfd882ca60aca0784bfa07b88851d8549982d1c2923eb39d525",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/HUAWEI SEQ Analyst Service SDR Information (VoNR) 01-zh.xlsm",
+          "bytes": 297321,
+          "sha256": "54d86d08b7f063ac14b81fcaaf5d2dab5181765985cd09c9b43a8375e8eda449",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/ookla竞对-数据字典_202303.xlsx",
+          "bytes": 199346,
+          "sha256": "cbf45bc4969d5bbbf1f8e7ebeec4cbeb698af9e24c5beea5793de0ba91718430",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/敏捷库容-数据字典_202308.xlsx",
+          "bytes": 238299,
+          "sha256": "2d6004dfecec6f211dd275efd46f56aa92bdd6c9e03ea12ba441add3fc7e1764",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/智能洞察数据字典（内部版）.xls",
+          "bytes": 721408,
+          "sha256": "9479adee12bc849253a30d62c6dcef90b8bfa8f4f1397305fb88467ebb01d5d8",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/机网套数据字典（内部版）.xlsx",
+          "bytes": 2225404,
+          "sha256": "0d854445225b6bf1e48801f9723e991be3aa4beaec50078d4e208fd27f99ae0c",
+          "kind": "file"
+        },
+        {
+          "path": "SDR/高层视图.xlsx",
+          "bytes": 133449,
+          "sha256": "c68de83e16b6de6b0ebc350e2d701655b563d0bd21647f8f49a2890d353f2598",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/CCA Hbase xDR Definition For Common.xlsx",
+          "bytes": 1509552,
+          "sha256": "9fa89149bfd3e12d03a46c1f7bcfaaae1c504c035cef0e7f8b192a88d23843f6",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 5G 2B数据库详单定义.xlsx",
+          "bytes": 151537,
+          "sha256": "20df7c7048dad180d1f5915585e4b1752709daabb6a5f6a918c299a02becd982",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 5GS数据库详单定义.xlsm",
+          "bytes": 761669,
+          "sha256": "5145d0c84f4e4f089be432faa91bd86da31904c14ed8705554dfe1c769264863",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst CS数据库详单定义.xlsm",
+          "bytes": 913465,
+          "sha256": "0b4ef4bb489d59f056c2a58db277187f8e72d6a653744678c124ff5d9ec583d9",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst IMS数据库详单定义.xlsm",
+          "bytes": 1036036,
+          "sha256": "691db30f3717f45e4f85a2f17b8a8db9689033780c1741ddd71a303590267984",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst IoT DB xDR Definition.xlsm",
+          "bytes": 307816,
+          "sha256": "1425e7ff3fd4f95f89f1653c520eec1ce416587f37ca96d11dbc2efbbef32e68",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst PS数据库详单定义.xlsm",
+          "bytes": 5607119,
+          "sha256": "7dd4bea07daa69e1a0ee4ac4e7d63f1ff843a47ce697c0721cb7632315646866",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 特性业务表定义.xlsx",
+          "bytes": 111380,
+          "sha256": "e742816bcc0be45151d6439e8f40616babb329662a78451a21d9c54bf7518d68",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 用户快照表定义.xlsx",
+          "bytes": 74156,
+          "sha256": "e598274519e33b468b14619ff0207ac91fc4f91883e9d96d75295ab6135fda32",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 终端渗透率统计用户信息表.xlsx",
+          "bytes": 67201,
+          "sha256": "d5ffc35263130b56cabc8b7b7f35c0cc354d8e9244e8a9b47446515d41c9abe3",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/HUAWEI SEQ Analyst 综合单据数据库详单定义.xlsm",
+          "bytes": 415945,
+          "sha256": "476dab640b4cac230be941f78340de33859b1d22af0d14f9efd9472378ad1f0c",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/~$HUAWEI SEQ Analyst IMS数据库详单定义.xlsm",
+          "bytes": 165,
+          "sha256": "0666c3e57c7600bb3bf73072b04ef3f6ccd7f48f8abe866b1b84ac19201d5aa0",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/~$HUAWEI SEQ Analyst PS数据库详单定义.xlsm",
+          "bytes": 165,
+          "sha256": "0666c3e57c7600bb3bf73072b04ef3f6ccd7f48f8abe866b1b84ac19201d5aa0",
+          "kind": "file"
+        },
+        {
+          "path": "xDR/~$HUAWEI SEQ Analyst 综合单据数据库详单定义.xlsm",
+          "bytes": 165,
+          "sha256": "0666c3e57c7600bb3bf73072b04ef3f6ccd7f48f8abe866b1b84ac19201d5aa0",
+          "kind": "file"
+        },
+        {
+          "path": "体优一体融合数据模型设计 - v7.0.xlsx",
+          "bytes": 653485,
+          "sha256": "0bd29f015c8c13e86715b121755d087a6b4be4d8102099ec2ebe463488b31b05",
+          "kind": "file"
+        }
+      ],
+      "fileCount": 54,
+      "directoryCount": 3,
+      "totalBytes": 29323173,
+      "maxDepth": 2,
+      "text": {
+        "files": 0,
+        "bytes": 0,
+        "characters": 0,
+        "lines": 0
+      }
+    },
+    {
+      "name": "suite",
+      "root": "C:\\Documents\\SmartCare_Suite_7.1.0",
+      "files": [
+        {
+          "path": "SmartCare Suite_7.1.0_SmartCare文档包信息.pdf",
+          "bytes": 301602,
+          "sha256": "d09d83b708f54305a043c99abc221c5ac41303b8fbef166442119879d1a5edb4",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_参考信息.pdf",
+          "bytes": 58356886,
+          "sha256": "e53c340bfee9870f0e2c61175515da581f2a684b03f37736af7dd03c5b2aff26",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_安全管理.pdf",
+          "bytes": 8327611,
+          "sha256": "6120374e34ffb3c455e8bd41a48b71bb089f2f3df2b3b13ba236926632d5ce39",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_安装部署.pdf",
+          "bytes": 40112761,
+          "sha256": "2aa8ce2323510058f3b2bb402e260fe5502c5bbe2d059143e1554f670551adc2",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_对接配置.pdf",
+          "bytes": 7892695,
+          "sha256": "7f51e957d234c2b30ad0f776abec46b770005eb740c6f1dd3f9a19fe513717fc",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_故障管理.pdf",
+          "bytes": 69773578,
+          "sha256": "9e06a2608e0aab055669258d55c37bd39659cc9512123d9e2c151b9642cbf56c",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_特性指南.pdf",
+          "bytes": 56541344,
+          "sha256": "910c5dfeb1ffad843ae0777b2a7ec48f0800a0c7c135f5ca88b0030ebcc1ba09",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_解决方案描述.pdf",
+          "bytes": 8654204,
+          "sha256": "893fcf3ea5603150a943ee00fde912db77c22c952d408628eeffdba338a53e05",
+          "kind": "file"
+        },
+        {
+          "path": "SmartCare Suite_7.1.0_运维管理.pdf",
+          "bytes": 8210939,
+          "sha256": "1d62fa8fcdcee6ec30024d3e71d3e4b37e9db9ffee14a5b1ecf4275dd0acc43b",
+          "kind": "file"
+        }
+      ],
+      "fileCount": 9,
+      "directoryCount": 0,
+      "totalBytes": 258171620,
+      "maxDepth": 1,
+      "text": {
+        "files": 0,
+        "bytes": 0,
+        "characters": 0,
+        "lines": 0
+      }
+    }
+  ]
+}

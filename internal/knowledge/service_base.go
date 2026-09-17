@@ -3,7 +3,9 @@ package knowledge
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,7 +58,6 @@ type Service struct {
 	content      parser.HelperRunner
 	imageDecoder parser.ExecHelper
 	global       config.Config
-	jobMgr       *jobs.Manager
 	embedder     embedding.Provider
 	reranker     rerank.Provider
 	runtime      runtime.Caller
@@ -76,7 +77,7 @@ type Service struct {
 }
 
 // NewService builds the service over the shared database.
-func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config, jobMgr *jobs.Manager) *Service {
+func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config) *Service {
 	global = global.Normalized()
 	var registryOptions []parser.Option
 	if strings.TrimSpace(global.Helpers.LegacyOffice) != "" {
@@ -99,7 +100,6 @@ func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config,
 		raw:              raw,
 		parsers:          parser.NewRegistry(registryOptions...),
 		global:           global,
-		jobMgr:           jobMgr,
 		ingestSlots:      make(chan struct{}, ingestWorkers),
 		searchModelSlots: make(chan struct{}, global.Scheduler.Model),
 	}
@@ -268,7 +268,11 @@ func (s *Service) providersForConfig(cfg BaseConfig) providerSet {
 }
 
 func (s *Service) providersForBase(baseID string) (providerSet, error) {
-	base, err := s.store.getBase(baseID)
+	return s.providersForBaseContext(context.Background(), baseID)
+}
+
+func (s *Service) providersForBaseContext(ctx context.Context, baseID string) (providerSet, error) {
+	base, err := s.store.getBaseContext(ctx, baseID)
 	if err != nil {
 		return providerSet{}, err
 	}
@@ -302,9 +306,16 @@ func (s *Service) providersForBase(baseID string) (providerSet, error) {
 }
 
 func (s *Service) searchProviders(baseIDs []string) ([]string, map[string]providerSet, bool, error) {
+	return s.searchProvidersContext(context.Background(), baseIDs)
+}
+
+func (s *Service) searchProvidersContext(ctx context.Context, baseIDs []string) ([]string, map[string]providerSet, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ids := baseIDs
 	if ids == nil {
-		bases, err := s.store.listBases()
+		bases, err := s.store.listBasesContext(ctx)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -316,7 +327,7 @@ func (s *Service) searchProviders(baseIDs []string) ([]string, map[string]provid
 	providers := make(map[string]providerSet, len(ids))
 	active := false
 	for _, id := range ids {
-		set, err := s.providersForBase(id)
+		set, err := s.providersForBaseContext(ctx, id)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -648,6 +659,14 @@ func ResolveBaseConfig(global config.Config, cfg BaseConfig) BaseConfig {
 
 // CreateBase creates a knowledge base.
 func (s *Service) CreateBase(name, description, group string, cfg BaseConfig) (Base, error) {
+	return s.CreateBaseWithContext(context.Background(), name, description, group, cfg)
+}
+
+// CreateBaseWithContext binds base creation to the caller's request context.
+func (s *Service) CreateBaseWithContext(ctx context.Context, name, description, group string, cfg BaseConfig) (Base, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return Base{}, fmt.Errorf("base name is required")
@@ -656,8 +675,16 @@ func (s *Service) CreateBase(name, description, group string, cfg BaseConfig) (B
 	if err != nil {
 		return Base{}, err
 	}
+	return s.createBaseWithIDContext(ctx, id, name, description, group, cfg)
+}
+
+func (s *Service) createBaseWithID(id, name, description, group string, cfg BaseConfig) (Base, error) {
+	return s.createBaseWithIDContext(context.Background(), id, name, description, group, cfg)
+}
+
+func (s *Service) createBaseWithIDContext(ctx context.Context, id, name, description, group string, cfg BaseConfig) (Base, error) {
 	base := Base{ID: id, Name: name, Description: description, Group: group, Config: cfg, CreatedAt: now(), UpdatedAt: now()}
-	if err := s.store.putBase(base); err != nil {
+	if err := s.store.putBaseContext(ctx, base); err != nil {
 		return Base{}, err
 	}
 	return base, nil
@@ -666,9 +693,26 @@ func (s *Service) CreateBase(name, description, group string, cfg BaseConfig) (B
 // RestoreBase rebuilds source documents in a new base, optionally switching
 // the embedding/provider configuration before the rebuild.
 func (s *Service) RestoreBase(ctx context.Context, sourceBaseID, name string, cfg *BaseConfig) (Base, error) {
-	source, err := s.store.getBase(sourceBaseID)
+	targetBaseID, err := newID()
 	if err != nil {
 		return Base{}, err
+	}
+	return s.RestoreBaseWithID(ctx, sourceBaseID, targetBaseID, name, cfg, nil)
+}
+
+// RestoreBaseWithID is the replay-safe restore path used by Durable
+// Operations. The target and derived document IDs remain stable if a worker
+// dies after publishing business data but before writing the terminal state.
+func (s *Service) RestoreBaseWithID(ctx context.Context, sourceBaseID, targetBaseID, name string, cfg *BaseConfig, report func(jobs.ProgressUpdate)) (Base, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	source, err := s.store.getBaseContext(ctx, sourceBaseID)
+	if err != nil {
+		return Base{}, err
+	}
+	if strings.TrimSpace(targetBaseID) == "" {
+		return Base{}, fmt.Errorf("restore target base id is required")
 	}
 	targetConfig := source.Config
 	if cfg != nil {
@@ -677,33 +721,82 @@ func (s *Service) RestoreBase(ctx context.Context, sourceBaseID, name string, cf
 	if strings.TrimSpace(name) == "" {
 		name = source.Name + " (restored)"
 	}
-	base, err := s.CreateBase(name, source.Description, source.Group, targetConfig)
-	if err != nil {
+	base, err := s.store.getBaseContext(ctx, targetBaseID)
+	if errors.Is(err, ErrNotFound) {
+		base, err = s.createBaseWithIDContext(ctx, targetBaseID, name, source.Description, source.Group, targetConfig)
+		if err != nil {
+			return Base{}, err
+		}
+	} else if err != nil {
 		return Base{}, err
+	} else if base.LifecycleState != LifecycleActive {
+		return Base{}, fmt.Errorf("restore target base is not active")
 	}
 
-	docs, err := s.store.listDocuments(sourceBaseID)
+	total, err := s.store.countActiveNonDirectoryDocumentsContext(ctx, sourceBaseID)
 	if err != nil {
 		return base, err
 	}
-	for _, sourceDoc := range docs {
-		if sourceDoc.SourceType == "directory" {
-			continue
-		}
-		if err := s.restoreDocument(ctx, base, sourceDoc); err != nil {
+	completed := 0
+	var afterCreatedAt int64
+	afterID := ""
+	for {
+		docs, err := s.store.listDocumentsAfterContext(ctx, sourceBaseID, afterCreatedAt, afterID, 50)
+		if err != nil {
 			return base, err
+		}
+		if len(docs) == 0 {
+			break
+		}
+		for _, sourceDoc := range docs {
+			afterCreatedAt, afterID = sourceDoc.CreatedAt, sourceDoc.ID
+			if sourceDoc.SourceType == "directory" {
+				continue
+			}
+			// The page contains metadata only. Fetch one source document at a
+			// time because raw_text may be large; this keeps restore memory
+			// bounded by the largest active source rather than 50 sources.
+			fullSource, err := s.store.getDocumentContext(ctx, sourceDoc.ID)
+			if err != nil {
+				return base, err
+			}
+			if err := s.restoreDocumentWithID(ctx, base, fullSource, restoredDocumentID(base.ID, sourceDoc.ID)); err != nil {
+				return base, err
+			}
+			completed++
+			if report != nil {
+				report(jobs.ProgressUpdate{Phase: "restoring", Completed: completed, Total: total, File: sourceDoc.Title})
+			}
 		}
 	}
 	return base, nil
 }
 
 func (s *Service) restoreDocument(ctx context.Context, base Base, source Document) error {
+	id, err := newID()
+	if err != nil {
+		return err
+	}
+	return s.restoreDocumentWithID(ctx, base, source, id)
+}
+
+func restoredDocumentID(baseID, sourceID string) string {
+	sum := sha256.Sum256([]byte(baseID + "\x00" + sourceID))
+	return hex.EncodeToString(sum[:16])
+}
+
+func (s *Service) restoreDocumentWithID(ctx context.Context, base Base, source Document, id string) error {
+	if existing, err := s.store.getDocumentContext(ctx, id); err == nil && existing.Status == StatusReady {
+		return nil
+	} else if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
 	text := source.RawText
 	var fileBytes []byte
 	var err error
 	if source.SourceType == "file" {
 		if source.RawFilePath != "" {
-			fileBytes, err = s.raw.Read(source.RawFilePath)
+			fileBytes, err = s.raw.ReadContext(ctx, source.RawFilePath)
 			if err != nil {
 				return err
 			}
@@ -712,7 +805,7 @@ func (s *Service) restoreDocument(ctx context.Context, base Base, source Documen
 			return fmt.Errorf("raw source for %s is missing", source.ID)
 		}
 	} else if text == "" {
-		chunks, chunkErr := s.store.listChunksByDoc(source.ID, 0, 0)
+		chunks, chunkErr := s.store.listChunksByDocContext(ctx, source.ID, 0, 0)
 		if chunkErr != nil {
 			return chunkErr
 		}
@@ -726,10 +819,6 @@ func (s *Service) restoreDocument(ctx context.Context, base Base, source Documen
 		return nil
 	}
 
-	id, err := newID()
-	if err != nil {
-		return err
-	}
 	doc := source
 	doc.ID = id
 	doc.BaseID = base.ID
@@ -744,12 +833,23 @@ func (s *Service) restoreDocument(ctx context.Context, base Base, source Documen
 	doc.Incomplete = false
 	doc.ErrorCode = ""
 	doc.ErrorMessage = ""
+	if factory := itemCommitHookFactoryFromContext(ctx); factory != nil {
+		ctx = WithCommitHook(ctx, factory(source.ID))
+	}
 	return s.ingest(ctx, &doc, base.Config, fileBytes)
 }
 
 // RenameBase updates name/description/group/config.
 func (s *Service) RenameBase(id string, name, description, group *string, cfg *BaseConfig) (Base, error) {
-	base, err := s.store.getBase(id)
+	return s.RenameBaseWithContext(context.Background(), id, name, description, group, cfg)
+}
+
+// RenameBaseWithContext binds base inspection and update to the caller.
+func (s *Service) RenameBaseWithContext(ctx context.Context, id string, name, description, group *string, cfg *BaseConfig) (Base, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, id)
 	if err != nil {
 		return Base{}, err
 	}
@@ -766,7 +866,7 @@ func (s *Service) RenameBase(id string, name, description, group *string, cfg *B
 		base.Config = *cfg
 	}
 	base.UpdatedAt = now()
-	if err := s.store.putBase(base); err != nil {
+	if err := s.store.putBaseContext(ctx, base); err != nil {
 		return Base{}, err
 	}
 	return base, nil
@@ -774,25 +874,54 @@ func (s *Service) RenameBase(id string, name, description, group *string, cfg *B
 
 // DeleteBase removes the base with its documents, chunks, and raw files.
 func (s *Service) DeleteBase(id string) error {
-	base, err := s.store.markBaseDeleting(id)
+	return s.DeleteBaseWithContext(context.Background(), id)
+}
+
+// DeleteBaseWithContext resumes a previously fenced base after a cleanup
+// interruption. The lifecycle fence is durable; physical raw/chunk cleanup is
+// bounded and may be retried without reopening the base.
+func (s *Service) DeleteBaseWithContext(ctx context.Context, id string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.markBaseDeletingWithContext(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		base, err = s.store.getBaseIncludingDeletingContext(ctx, id)
+		if err == nil && base.LifecycleState != LifecycleDeleting {
+			err = ErrNotFound
+		}
+	}
 	if err != nil {
 		return err
 	}
-	refs, err := s.store.listBaseCleanupRefs(base.ID)
-	if err != nil {
-		return err
-	}
-	for _, ref := range refs {
-		if err := s.store.deleteDocumentGeneration(ref.ID, ref.ActiveIndexGen); err != nil {
+	afterID := ""
+	for {
+		refs, err := s.store.listBaseCleanupRefsContext(ctx, base.ID, afterID, cleanupDocumentPageSize)
+		if err != nil {
 			return err
 		}
-		if ref.RawFilePath != "" {
-			if err := s.raw.Delete(ref.RawFilePath); err != nil {
+		if len(refs) == 0 {
+			break
+		}
+		for _, ref := range refs {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if err := s.store.deleteDocumentGenerationWithContext(ctx, ref.ID, ref.ActiveIndexGen); err != nil {
+				return err
+			}
+			if ref.RawFilePath != "" {
+				if err := s.raw.Delete(ref.RawFilePath); err != nil {
+					return err
+				}
+			}
+		}
+		afterID = refs[len(refs)-1].ID
+		if len(refs) < cleanupDocumentPageSize {
+			break
 		}
 	}
-	if err := s.store.deleteChunksByBase(id); err != nil {
+	if err := s.store.deleteChunksByBaseWithContext(ctx, id); err != nil {
 		return err
 	}
 	if err := s.raw.DeleteBase(id); err != nil {
@@ -805,48 +934,71 @@ func (s *Service) DeleteBase(id string) error {
 // immutable generation layout. The document and its generation mapping change
 // together; the file was written and verified by the caller first.
 func (s *store) setGenerationRawPath(docID string, generation int64, rawPath string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	return s.setGenerationRawPathContext(context.Background(), docID, generation, rawPath)
+}
+
+func (s *store) setGenerationRawPathContext(ctx context.Context, docID string, generation int64, rawPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer func() { _ = tx.Rollback() }()
-	docResult, err := tx.Exec(`UPDATE documents SET raw_file_path = ?
+	return s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		docResult, err := tx.ExecContext(ctx, `UPDATE documents SET raw_file_path = ?
 		WHERE id = ? AND active_index_generation = ? AND lifecycle_state = ?`,
-		rawPath, docID, generation, LifecycleActive)
-	if err != nil {
-		return err
-	}
-	if affected, err := docResult.RowsAffected(); err != nil {
-		return err
-	} else if affected != 1 {
-		return ErrConflict
-	}
-	mapResult, err := tx.Exec(`UPDATE document_generations SET raw_file_path = ?
+			rawPath, docID, generation, LifecycleActive)
+		if err != nil {
+			return err
+		}
+		if affected, err := docResult.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return ErrConflict
+		}
+		mapResult, err := tx.ExecContext(ctx, `UPDATE document_generations SET raw_file_path = ?
 		WHERE doc_id = ? AND index_generation = ?`,
-		rawPath, docID, generation)
-	if err != nil {
-		return err
-	}
-	if affected, err := mapResult.RowsAffected(); err != nil {
-		return err
-	} else if affected != 1 {
-		return ErrConflict
-	}
-	return tx.Commit()
+			rawPath, docID, generation)
+		if err != nil {
+			return err
+		}
+		if affected, err := mapResult.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return ErrConflict
+		}
+		return nil
+	})
 }
 
 // GetBase returns one base.
-func (s *Service) GetBase(id string) (Base, error) { return s.store.getBase(id) }
+func (s *Service) GetBase(id string) (Base, error) {
+	return s.GetBaseWithContext(context.Background(), id)
+}
+
+// GetBaseWithContext keeps operation admission and worker reads cancellable.
+func (s *Service) GetBaseWithContext(ctx context.Context, id string) (Base, error) {
+	return s.store.getBaseContext(ctx, id)
+}
+
+// GetBaseIncludingDeletingWithContext is used by durable delete replay to
+// distinguish an active base from a committed lifecycle fence whose physical
+// cleanup still needs to resume.
+func (s *Service) GetBaseIncludingDeletingWithContext(ctx context.Context, id string) (Base, error) {
+	return s.store.getBaseIncludingDeletingContext(ctx, id)
+}
 
 // ListBases returns summaries with document/chunk counts.
 func (s *Service) ListBases() ([]BaseSummary, error) {
-	bases, err := s.store.listBases()
+	return s.ListBasesContext(context.Background())
+}
+
+// ListBasesContext returns summaries while honoring the caller context.
+func (s *Service) ListBasesContext(ctx context.Context) ([]BaseSummary, error) {
+	bases, err := s.store.listBasesContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]BaseSummary, 0, len(bases))
 	for _, base := range bases {
-		stats, err := s.store.statsFor(base.ID)
+		stats, err := s.store.statsForContext(ctx, base.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -857,7 +1009,15 @@ func (s *Service) ListBases() ([]BaseSummary, error) {
 
 // Stats returns aggregate stats for a base or all bases.
 func (s *Service) Stats(baseID string) (Stats, error) {
-	stats, err := s.store.statsFor(baseID)
+	return s.StatsContext(context.Background(), baseID)
+}
+
+// StatsContext returns aggregate stats while honoring the caller context.
+func (s *Service) StatsContext(ctx context.Context, baseID string) (Stats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stats, err := s.store.statsForContext(ctx, baseID)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -869,7 +1029,13 @@ func (s *Service) Stats(baseID string) (Stats, error) {
 		return stats, nil
 	}
 	modelKey := s.EmbeddingModelKey()
-	if providers, providerErr := s.providersForBase(baseID); providerErr == nil && providers.embeddingActive && providers.embedder != nil {
+	providers, providerErr := s.providersForBaseContext(ctx, baseID)
+	if providerErr != nil {
+		if ctx.Err() != nil {
+			return Stats{}, ctx.Err()
+		}
+		modelKey = ""
+	} else if providers.embeddingActive && providers.embedder != nil {
 		modelKey = providers.embedder.ModelKey()
 	} else {
 		modelKey = ""
@@ -877,7 +1043,7 @@ func (s *Service) Stats(baseID string) (Stats, error) {
 	if modelKey == "" {
 		return stats, nil
 	}
-	counts, err := s.store.VectorModelCounts(baseID)
+	counts, err := s.store.VectorModelCountsContext(ctx, baseID)
 	if err != nil {
 		return Stats{}, err
 	}
@@ -891,7 +1057,12 @@ func (s *Service) Stats(baseID string) (Stats, error) {
 	}
 	stats.Embedded = embedded > 0
 	stats.StaleChunks = stale
-	if dimensions, err := s.store.VectorDimensions(baseID); err == nil {
+	dimensions, err := s.store.VectorDimensionsContext(ctx, baseID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return Stats{}, ctx.Err()
+		}
+	} else {
 		stats.Dimensions = dimensions
 	}
 	return stats, nil
@@ -899,8 +1070,13 @@ func (s *Service) Stats(baseID string) (Stats, error) {
 
 // ListGroups returns the persisted plus implicit group names.
 func (s *Service) ListGroups() ([]string, error) {
+	return s.ListGroupsContext(context.Background())
+}
+
+// ListGroupsContext keeps group and implicit-base reads cancellable.
+func (s *Service) ListGroupsContext(ctx context.Context) ([]string, error) {
 	var out []string
-	if err := s.kvGet("groups", &out); err != nil {
+	if err := s.kvGetContext(ctx, "groups", &out); err != nil {
 		return nil, err
 	}
 	seen := map[string]bool{}
@@ -911,7 +1087,7 @@ func (s *Service) ListGroups() ([]string, error) {
 			unique = append(unique, g)
 		}
 	}
-	bases, err := s.store.listBases()
+	bases, err := s.store.listBasesContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -926,11 +1102,16 @@ func (s *Service) ListGroups() ([]string, error) {
 
 // CreateGroup registers an empty group.
 func (s *Service) CreateGroup(name string) ([]string, error) {
+	return s.CreateGroupWithContext(context.Background(), name)
+}
+
+// CreateGroupWithContext binds group discovery and persistence to the caller.
+func (s *Service) CreateGroupWithContext(ctx context.Context, name string) ([]string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, fmt.Errorf("group name is required")
 	}
-	groups, err := s.ListGroups()
+	groups, err := s.ListGroupsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -940,12 +1121,17 @@ func (s *Service) CreateGroup(name string) ([]string, error) {
 		}
 	}
 	next := append(groups, name)
-	return next, s.kvSet("groups", next)
+	return next, s.kvSetContext(ctx, "groups", next)
 }
 
 // RenameGroup renames a group and every base inside it.
 func (s *Service) RenameGroup(from, to string) ([]string, error) {
-	groups, err := s.ListGroups()
+	return s.RenameGroupWithContext(context.Background(), from, to)
+}
+
+// RenameGroupWithContext binds group/base reads and updates to the caller.
+func (s *Service) RenameGroupWithContext(ctx context.Context, from, to string) ([]string, error) {
+	groups, err := s.ListGroupsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -956,7 +1142,7 @@ func (s *Service) RenameGroup(from, to string) ([]string, error) {
 		}
 		next = append(next, g)
 	}
-	bases, err := s.store.listBases()
+	bases, err := s.store.listBasesContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -964,17 +1150,22 @@ func (s *Service) RenameGroup(from, to string) ([]string, error) {
 		if b.Group == from {
 			b.Group = to
 			b.UpdatedAt = now()
-			if err := s.store.putBase(b); err != nil {
+			if err := s.store.putBaseContext(ctx, b); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return next, s.kvSet("groups", next)
+	return next, s.kvSetContext(ctx, "groups", next)
 }
 
 // DeleteGroup removes a group; member bases become ungrouped.
 func (s *Service) DeleteGroup(name string) error {
-	groups, err := s.ListGroups()
+	return s.DeleteGroupWithContext(context.Background(), name)
+}
+
+// DeleteGroupWithContext binds group/base reads and updates to the caller.
+func (s *Service) DeleteGroupWithContext(ctx context.Context, name string) error {
+	groups, err := s.ListGroupsContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -984,7 +1175,7 @@ func (s *Service) DeleteGroup(name string) error {
 			next = append(next, g)
 		}
 	}
-	bases, err := s.store.listBases()
+	bases, err := s.store.listBasesContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -992,17 +1183,22 @@ func (s *Service) DeleteGroup(name string) error {
 		if b.Group == name {
 			b.Group = ""
 			b.UpdatedAt = now()
-			if err := s.store.putBase(b); err != nil {
+			if err := s.store.putBaseContext(ctx, b); err != nil {
 				return err
 			}
 		}
 	}
-	return s.kvSet("groups", next)
+	return s.kvSetContext(ctx, "groups", next)
 }
 
 // EnabledScope returns the invocation switch and the pinned base ids.
 func (s *Service) EnabledScope() (bool, []string, error) {
-	state, err := s.EnabledScopeState()
+	return s.EnabledScopeContext(context.Background())
+}
+
+// EnabledScopeContext reads the invocation scope with the caller context.
+func (s *Service) EnabledScopeContext(ctx context.Context) (bool, []string, error) {
+	state, err := s.EnabledScopeStateContext(ctx)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1012,14 +1208,24 @@ func (s *Service) EnabledScope() (bool, []string, error) {
 // EnabledScopeState distinguishes the default all-bases state from an
 // explicitly saved empty pinned scope, which must match zero bases.
 func (s *Service) EnabledScopeState() (EnabledScopeState, error) {
+	return s.EnabledScopeStateContext(context.Background())
+}
+
+// EnabledScopeStateContext distinguishes explicit scope state while honoring
+// the caller cancellation boundary.
+func (s *Service) EnabledScopeStateContext(ctx context.Context) (EnabledScopeState, error) {
 	var scope struct {
 		Enabled        bool     `json:"enabled"`
 		EnabledBaseIDs []string `json:"enabledBaseIds"`
 	}
-	if !s.kvHas("scope") {
+	exists, err := s.kvExistsContext(ctx, "scope")
+	if err != nil {
+		return EnabledScopeState{}, err
+	}
+	if !exists {
 		return EnabledScopeState{Enabled: true}, nil
 	}
-	if err := s.kvGet("scope", &scope); err != nil {
+	if err := s.kvGetContext(ctx, "scope", &scope); err != nil {
 		return EnabledScopeState{}, err
 	}
 	if scope.EnabledBaseIDs == nil {
@@ -1030,12 +1236,17 @@ func (s *Service) EnabledScopeState() (EnabledScopeState, error) {
 
 // SetEnabledScope updates the invocation switch and/or pinned base ids.
 func (s *Service) SetEnabledScope(enabled *bool, baseIDs *[]string) error {
+	return s.SetEnabledScopeWithContext(context.Background(), enabled, baseIDs)
+}
+
+// SetEnabledScopeWithContext binds scope read/update to the caller.
+func (s *Service) SetEnabledScopeWithContext(ctx context.Context, enabled *bool, baseIDs *[]string) error {
 	var scope struct {
 		Enabled        bool     `json:"enabled"`
 		EnabledBaseIDs []string `json:"enabledBaseIds"`
 	}
 	scope.Enabled = true
-	if err := s.kvGet("scope", &scope); err != nil {
+	if err := s.kvGetContext(ctx, "scope", &scope); err != nil {
 		return err
 	}
 	if enabled != nil {
@@ -1047,14 +1258,21 @@ func (s *Service) SetEnabledScope(enabled *bool, baseIDs *[]string) error {
 	if scope.EnabledBaseIDs == nil {
 		scope.EnabledBaseIDs = []string{}
 	}
-	return s.kvSet("scope", scope)
+	return s.kvSetContext(ctx, "scope", scope)
 }
 
 // ── key-value storage ────────────────────────────────────────────────────────
 
 func (s *Service) kvGet(key string, out any) error {
+	return s.kvGetContext(context.Background(), key, out)
+}
+
+func (s *Service) kvGetContext(ctx context.Context, key string, out any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var value string
-	err := s.store.db.QueryRow(`SELECT value FROM kv WHERE key = ?`, key).Scan(&value)
+	err := s.store.db.QueryRowContext(ctx, `SELECT value FROM kv WHERE key = ?`, key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -1068,11 +1286,18 @@ func (s *Service) kvGet(key string, out any) error {
 }
 
 func (s *Service) kvSet(key string, value any) error {
+	return s.kvSetContext(context.Background(), key, value)
+}
+
+func (s *Service) kvSetContext(ctx context.Context, key string, value any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	_, err = s.store.db.Exec(
+	_, err = s.store.db.ExecContext(ctx,
 		`INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, string(data),
 	)
@@ -1081,7 +1306,25 @@ func (s *Service) kvSet(key string, value any) error {
 
 // kvHas reports whether a key exists.
 func (s *Service) kvHas(key string) bool {
+	return s.kvHasContext(context.Background(), key)
+}
+
+func (s *Service) kvHasContext(ctx context.Context, key string) bool {
+	exists, _ := s.kvExistsContext(ctx, key)
+	return exists
+}
+
+func (s *Service) kvExistsContext(ctx context.Context, key string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var value string
-	err := s.store.db.QueryRow(`SELECT value FROM kv WHERE key = ?`, key).Scan(&value)
-	return err == nil
+	err := s.store.db.QueryRowContext(ctx, `SELECT value FROM kv WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }

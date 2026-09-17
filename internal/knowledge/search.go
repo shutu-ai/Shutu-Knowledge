@@ -164,10 +164,13 @@ type ContextOptions struct {
 // one document. The anchor (by id or index) is authoritative; neighbors come
 // from contiguous storage ranges.
 func (s *Service) GetDocumentContext(ctx context.Context, docID string, opts ContextOptions) (*evidence.Window, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if (opts.IndexGeneration == nil) != (opts.SourceVersion == nil) {
 		return nil, fmt.Errorf("indexGeneration and sourceVersion must be supplied together")
 	}
-	doc, _, err := s.GetDocument(docID, false)
+	doc, _, err := s.GetDocumentWithContext(ctx, docID, false)
 	if err != nil {
 		if opts.IndexGeneration != nil && errors.Is(err, ErrNotFound) {
 			// The mapping identifies the citation, but a tombstone forbids
@@ -328,21 +331,21 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	if query == "" {
 		return SearchResult{Query: req.Query, Mode: s.resolveMode(req.Mode, false), Hits: []SearchHit{}}, nil
 	}
-	baseIDs, err := s.resolveSearchScope(req)
+	baseIDs, err := s.resolveSearchScope(ctx, req)
 	if err != nil {
 		return SearchResult{}, err
 	}
 	if baseIDs != nil && len(baseIDs) == 0 {
 		return SearchResult{Query: query, Mode: s.resolveMode(req.Mode, s.embedderActive()), Hits: []SearchHit{}}, nil
 	}
-	docIDs, err := s.resolveDocFilter(req.Filter)
+	docIDs, err := s.resolveDocFilter(ctx, req.Filter)
 	if err != nil {
 		return SearchResult{}, err
 	}
 	if docIDs != nil && len(docIDs) == 0 {
 		return SearchResult{Query: query, Mode: s.resolveMode(req.Mode, s.embedderActive()), Hits: []SearchHit{}}, nil
 	}
-	searchBaseIDs, providersByBase, embeddingActive, err := s.searchProviders(baseIDs)
+	searchBaseIDs, providersByBase, embeddingActive, err := s.searchProvidersContext(ctx, baseIDs)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -350,7 +353,9 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	// One WAL read transaction pins lexical recall, vector recall, context,
 	// titles, and diagnostics to the same SQLite snapshot. Reindex or cleanup
 	// committed during this bounded request cannot mix generations.
+	dbWaitStarted := Now()
 	snapshot, err := s.store.db.ReadDB().BeginTx(ctx, nil)
+	s.recordMetric(func(m *MetricsSnapshot) { m.DBWaitMS += durationMS(dbWaitStarted) })
 	if err != nil {
 		return SearchResult{}, fmt.Errorf("begin search snapshot: %w", err)
 	}
@@ -390,7 +395,9 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	seenGenerations := map[string]bool{}
 
 	for _, variant := range variants {
+		ftsStarted := Now()
 		lexicalHits, err := s.store.LexicalSearch(ctx, snapshot, variant, baseIDs, docIDs, poolSize)
+		s.recordMetric(func(m *MetricsSnapshot) { m.FTSTimeMS += durationMS(ftsStarted) })
 		if err != nil {
 			return SearchResult{}, err
 		}
@@ -441,7 +448,9 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 				if variant == query && queryVector == nil {
 					queryVector = toFloat32(queryVectorForModel)
 				}
+				vectorStarted := Now()
 				vectorHits, err := s.store.VectorSearch(ctx, snapshot, queryVectorForModel, []string{baseID}, docIDs, poolSize, modelKey)
+				s.recordMetric(func(m *MetricsSnapshot) { m.VectorTimeMS += durationMS(vectorStarted) })
 				if err != nil {
 					return SearchResult{}, err
 				}
@@ -758,6 +767,7 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	s.recordMetric(func(m *MetricsSnapshot) {
 		m.Searches++
 		m.SearchDurationMS += result.ElapsedMS
+		m.RunTimeMS += result.ElapsedMS
 		m.CandidateCount += int64(len(ordered))
 		m.ContextCount += int64(len(result.Hits))
 		if result.Rerank != nil {
@@ -889,8 +899,8 @@ func (s *Service) resolveMode(requested string, vectorAvailable bool) string {
 
 // resolveSearchScope intersects the request with the pinned enabled scope.
 // Returns nil for "all bases", or a possibly-empty explicit set.
-func (s *Service) resolveSearchScope(req SearchRequest) ([]string, error) {
-	state, err := s.EnabledScopeState()
+func (s *Service) resolveSearchScope(ctx context.Context, req SearchRequest) ([]string, error) {
+	state, err := s.EnabledScopeStateContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -926,7 +936,7 @@ func (s *Service) resolveSearchScope(req SearchRequest) ([]string, error) {
 }
 
 // resolveDocFilter converts metadata filters into document ids (nil = all).
-func (s *Service) resolveDocFilter(filter *SearchFilter) ([]string, error) {
+func (s *Service) resolveDocFilter(ctx context.Context, filter *SearchFilter) ([]string, error) {
 	if filter == nil {
 		return nil, nil
 	}
@@ -963,7 +973,7 @@ func (s *Service) resolveDocFilter(filter *SearchFilter) ([]string, error) {
 		clauses += " AND COALESCE(updated_at, created_at) <= ?"
 		args = append(args, filter.UpdatedBefore)
 	}
-	rows, err := s.store.db.Query(`SELECT id FROM documents WHERE lifecycle_state = 'active'`+clauses, args...)
+	rows, err := s.store.db.QueryContext(ctx, `SELECT id FROM documents WHERE lifecycle_state = 'active'`+clauses, args...)
 	if err != nil {
 		return nil, err
 	}

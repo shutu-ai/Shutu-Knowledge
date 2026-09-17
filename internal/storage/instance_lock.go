@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -55,15 +56,30 @@ func AcquireInstanceLock(path string) (*InstanceLock, error) {
 	return lock, nil
 }
 
-// Release ends the exclusive transaction and closes the lock database. It is
-// safe to call more than once, including during startup-error cleanup.
+// Release ends the exclusive transaction and closes the lock database using a
+// bounded compatibility budget. It is safe to call more than once, including
+// during startup-error cleanup.
 func (l *InstanceLock) Release() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return l.ReleaseWithContext(ctx)
+}
+
+// ReleaseWithContext ends the exclusive transaction and closes the lock
+// database within the caller's shutdown budget. The connection and database
+// are closed even when the rollback observes cancellation, because closing a
+// SQLite connection is the final ownership release.
+func (l *InstanceLock) ReleaseWithContext(ctx context.Context) error {
 	if l == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	l.releaseOnce.Do(func() {
+		var rollbackErr error
 		if l.conn != nil {
-			_, _ = l.conn.ExecContext(context.Background(), `ROLLBACK`)
+			_, rollbackErr = l.conn.ExecContext(ctx, `ROLLBACK`)
 			if err := l.conn.Close(); err != nil && l.releaseErr == nil {
 				l.releaseErr = err
 			}
@@ -72,6 +88,9 @@ func (l *InstanceLock) Release() error {
 			if err := l.db.Close(); err != nil && l.releaseErr == nil {
 				l.releaseErr = err
 			}
+		}
+		if l.releaseErr == nil && rollbackErr != nil {
+			l.releaseErr = rollbackErr
 		}
 	})
 	return l.releaseErr

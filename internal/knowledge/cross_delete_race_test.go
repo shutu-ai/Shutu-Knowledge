@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,23 @@ type deleteRaceMoveResult struct {
 	DocumentID string `json:"documentId"`
 	Conflict   bool   `json:"conflict"`
 	Error      string `json:"error,omitempty"`
+}
+
+type synchronizedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestCrossProcessDeleteFenceRejectsStaleSnapshot(t *testing.T) {
@@ -58,7 +76,7 @@ func TestCrossProcessDeleteFenceRejectsStaleSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := exec.Command(testBinary, "-test.run=^TestCrossProcessDeleteFenceRejectsStaleSnapshot$")
-	var childLog bytes.Buffer
+	var childLog synchronizedBuffer
 	child.Stdout = &childLog
 	child.Stderr = &childLog
 	child.Env = append(os.Environ(),

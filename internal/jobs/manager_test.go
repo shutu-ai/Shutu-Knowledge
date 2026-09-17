@@ -209,3 +209,45 @@ func TestSubmitDoesNotWaitForSQLiteWriter(t *testing.T) {
 		t.Fatal("job did not start after the SQLite writer was released")
 	}
 }
+
+func TestStopWithContextBoundsNonCooperativeLegacyTask(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "knowledge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	manager := New(db, 1)
+	startCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(startCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	_, err = manager.SubmitWithProgress("legacy-stuck", "base", 1, func(context.Context, func(ProgressUpdate)) error {
+		close(started)
+		<-release
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy task did not start")
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer stopCancel()
+	startedAt := time.Now()
+	manager.StopWithContext(stopCtx)
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("StopWithContext waited for non-cooperative task: %s", elapsed)
+	}
+
+	close(release)
+	manager.StopWithContext(context.Background())
+}

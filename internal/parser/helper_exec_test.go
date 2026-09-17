@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,6 +71,45 @@ func TestRegistrySetLegacyHelperFailClosed(t *testing.T) {
 	registry.SetLegacyHelper(nil)
 	if _, err := registry.Parse("legacy.ppt", []byte("legacy")); err == nil || !strings.Contains(err.Error(), "unsupported") {
 		t.Fatalf("removed helper should fail closed: %v", err)
+	}
+}
+
+type cancelAwareParserHelper struct {
+	started chan struct{}
+}
+
+func (h *cancelAwareParserHelper) Available() bool { return true }
+
+func (h *cancelAwareParserHelper) Run(ctx context.Context, _ string, _ []byte) (string, error) {
+	close(h.started)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestRegistryParseContextPropagatesCancellationToLegacyHelper(t *testing.T) {
+	helper := &cancelAwareParserHelper{started: make(chan struct{})}
+	registry := NewRegistry(WithLegacyHelper(helper))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := registry.ParseContext(ctx, "legacy.doc", []byte("legacy"))
+		done <- err
+	}()
+
+	select {
+	case <-helper.started:
+	case <-time.After(time.Second):
+		t.Fatal("legacy helper did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("parse error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parse did not stop after cancellation")
 	}
 }
 

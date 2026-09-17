@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -416,11 +417,9 @@ func TestDirectoryTreeIncrementalImport(t *testing.T) {
 	write("sub/b.txt", "second document body")
 	write("skip.xyz", "unsupported format")
 
-	jobID, err := service.ImportDirectoryTree(context.Background(), base.ID, root)
-	if err != nil {
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitJob(t, service, jobID)
 
 	docs, err := service.ListDocuments(base.ID)
 	if err != nil {
@@ -452,11 +451,9 @@ func TestDirectoryTreeIncrementalImport(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "sub", "b.txt")); err != nil {
 		t.Fatal(err)
 	}
-	jobID, err = service.ImportDirectoryTree(context.Background(), base.ID, root)
-	if err != nil {
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitJob(t, service, jobID)
 
 	docs, _ = service.ListDocuments(base.ID)
 	seen := map[string]string{}
@@ -509,11 +506,9 @@ func TestDirectoryRescanRepointFailureAndRecursiveDelete(t *testing.T) {
 		}
 	}
 	write(rootA, "nested/old.txt", "old tracked content")
-	jobID, err := service.ImportDirectoryTree(context.Background(), base.ID, rootA)
-	if err != nil {
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, rootA, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitJob(t, service, jobID)
 	docs, err := service.ListDocuments(base.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -537,11 +532,9 @@ func TestDirectoryRescanRepointFailureAndRecursiveDelete(t *testing.T) {
 	if err != nil || repointed.SourcePath != rootB {
 		t.Fatalf("repoint directory: %+v %v", repointed, err)
 	}
-	jobID, err = service.RescanDirectory(rootDoc.ID)
-	if err != nil {
+	if _, err := service.RunDirectoryRescan(context.Background(), rootDoc.ID, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitJob(t, service, jobID)
 	docs, _ = service.ListDocuments(base.ID)
 	byTitle := map[string]DocumentSummary{}
 	for _, doc := range docs {
@@ -558,11 +551,9 @@ func TestDirectoryRescanRepointFailureAndRecursiveDelete(t *testing.T) {
 	failureRoot := t.TempDir()
 	write(failureRoot, "empty.md", "   ")
 	write(failureRoot, "good.txt", "usable content")
-	jobID, err = service.ImportDirectoryTree(context.Background(), base.ID, failureRoot)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, failureRoot, nil); err == nil {
+		t.Fatal("directory import should report an entry failure")
 	}
-	waitJobAllowFailed(t, service, jobID)
 	docs, _ = service.ListDocuments(base.ID)
 	byTitle = map[string]DocumentSummary{}
 	for _, doc := range docs {
@@ -644,6 +635,16 @@ func TestLegacyHelperRegistration(t *testing.T) {
 	exec := newExecHelper("")
 	if exec.Available() {
 		t.Fatal("empty template must be unavailable")
+	}
+}
+
+func TestParseFileContentHonorsCanceledContextBeforeParser(t *testing.T) {
+	service := newFixture(t).service
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := service.parseFileContent(ctx, &Document{FileName: "note.txt"}, BaseConfig{}, []byte("text"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("parse error = %v, want context cancellation", err)
 	}
 }
 

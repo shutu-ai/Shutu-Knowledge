@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -43,8 +44,12 @@ func normalizeHuggingFaceID(id string) (string, error) {
 
 // ListCustomRerankers returns user-registered experimental rerankers.
 func (s *Service) ListCustomRerankers() ([]CustomReranker, error) {
+	return s.ListCustomRerankersContext(context.Background())
+}
+
+func (s *Service) ListCustomRerankersContext(ctx context.Context) ([]CustomReranker, error) {
 	out := []CustomReranker{}
-	if err := s.kvGet("custom_rerankers", &out); err != nil {
+	if err := s.kvGetContext(ctx, "custom_rerankers", &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -73,11 +78,17 @@ func (s *Service) RegisterCustomReranker(id string) (CustomReranker, error) {
 
 // DeleteCustomReranker removes an experimental registration.
 func (s *Service) DeleteCustomReranker(id string) error {
+	return s.DeleteCustomRerankerContext(context.Background(), id)
+}
+
+// DeleteCustomRerankerContext keeps model-registration cleanup within an
+// operation worker's cancellation boundary.
+func (s *Service) DeleteCustomRerankerContext(ctx context.Context, id string) error {
 	id, err := normalizeHuggingFaceID(id)
 	if err != nil {
 		return err
 	}
-	items, err := s.ListCustomRerankers()
+	items, err := s.ListCustomRerankersContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -87,35 +98,47 @@ func (s *Service) DeleteCustomReranker(id string) error {
 			next = append(next, item)
 		}
 	}
-	if err := s.kvSet("custom_rerankers", next); err != nil {
+	if err := s.kvSetContext(ctx, "custom_rerankers", next); err != nil {
 		return err
 	}
-	tests, err := s.rerankSelfTests()
+	tests, err := s.rerankSelfTestsContext(ctx)
 	if err != nil {
 		return err
 	}
 	delete(tests, id)
-	return s.kvSet("rerank_self_tests", tests)
+	return s.kvSetContext(ctx, "rerank_self_tests", tests)
 }
 
 // SaveRerankSelfTest persists the latest validation result for an artifact set.
 func (s *Service) SaveRerankSelfTest(result RerankSelfTest) error {
+	return s.SaveRerankSelfTestContext(context.Background(), result)
+}
+
+// SaveRerankSelfTestContext persists the latest validation result while
+// honoring the caller's cancellation boundary.
+func (s *Service) SaveRerankSelfTestContext(ctx context.Context, result RerankSelfTest) error {
 	if strings.TrimSpace(result.ID) == "" {
 		return fmt.Errorf("reranker id is required")
 	}
-	tests, err := s.rerankSelfTests()
+	tests, err := s.rerankSelfTestsContext(ctx)
 	if err != nil {
 		return err
 	}
 	result.CheckedAt = Now().UnixMilli()
 	tests[result.ID] = result
-	return s.kvSet("rerank_self_tests", tests)
+	return s.kvSetContext(ctx, "rerank_self_tests", tests)
 }
 
 // GetRerankSelfTest returns the latest persisted result and marks whether it
 // still matches the supplied artifact envelope.
 func (s *Service) GetRerankSelfTest(id string, artifactBytes, downloadedAt int64, artifactCount int) (RerankSelfTest, error) {
-	tests, err := s.rerankSelfTests()
+	return s.GetRerankSelfTestContext(context.Background(), id, artifactBytes, downloadedAt, artifactCount)
+}
+
+// GetRerankSelfTestContext returns the latest persisted result while honoring
+// the caller's cancellation boundary.
+func (s *Service) GetRerankSelfTestContext(ctx context.Context, id string, artifactBytes, downloadedAt int64, artifactCount int) (RerankSelfTest, error) {
+	tests, err := s.rerankSelfTestsContext(ctx)
 	if err != nil {
 		return RerankSelfTest{}, err
 	}
@@ -126,8 +149,12 @@ func (s *Service) GetRerankSelfTest(id string, artifactBytes, downloadedAt int64
 }
 
 func (s *Service) rerankSelfTests() (map[string]RerankSelfTest, error) {
+	return s.rerankSelfTestsContext(context.Background())
+}
+
+func (s *Service) rerankSelfTestsContext(ctx context.Context) (map[string]RerankSelfTest, error) {
 	out := map[string]RerankSelfTest{}
-	if err := s.kvGet("rerank_self_tests", &out); err != nil {
+	if err := s.kvGetContext(ctx, "rerank_self_tests", &out); err != nil {
 		return nil, err
 	}
 	return out, nil

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -18,7 +19,13 @@ type DB struct {
 	*sql.DB
 	path   string
 	readDB *sql.DB
+	writer *Writer
 }
+
+const (
+	controlWriteTimeout = 5 * time.Second
+	dataWriteTimeout    = 30 * time.Second
+)
 
 // Open creates the parent directory if needed, opens the database in WAL
 // mode, and applies pending migrations.
@@ -70,16 +77,46 @@ func Open(path string) (*DB, error) {
 	// the main database out of world/group-readable default locations.
 	_ = os.Chmod(path, 0o600)
 	db.readDB = readHandle
+	db.writer = NewWriter(handle, defaultWriterQueueCapacity)
+	if err := db.writer.Start(); err != nil {
+		_ = readHandle.Close()
+		_ = handle.Close()
+		return nil, fmt.Errorf("start sqlite writer: %w", err)
+	}
 	return db, nil
 }
 
 // Close releases the database handle.
 func (db *DB) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return db.CloseWithContext(ctx)
+}
+
+// CloseWithContext releases the database handle within the caller's shutdown
+// budget. The writer is stopped before either SQLite handle is closed so an
+// admitted callback cannot race handle teardown. If the writer does not drain
+// before the deadline, the handles are still closed and the context error is
+// returned for the caller's bounded-shutdown diagnostics.
+func (db *DB) CloseWithContext(ctx context.Context) error {
+	if db == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	writerErr := error(nil)
+	if db.writer != nil {
+		writerErr = db.writer.Stop(ctx)
+	}
 	readErr := error(nil)
 	if db.readDB != nil {
 		readErr = db.readDB.Close()
 	}
 	writeErr := db.DB.Close()
+	if writerErr != nil {
+		return writerErr
+	}
 	if writeErr != nil {
 		return writeErr
 	}
@@ -89,6 +126,14 @@ func (db *DB) Close() error {
 // ReadDB exposes the dedicated read connection for checks that accept a
 // standard database handle, such as schema probes.
 func (db *DB) ReadDB() *sql.DB { return db.readDB }
+
+// WriterStats returns aggregate mutation queue and execution timings.
+func (db *DB) WriterStats() WriterStats {
+	if db.writer == nil {
+		return WriterStats{}
+	}
+	return db.writer.Stats()
+}
 
 // Query routes read-only statements to the dedicated WAL reader. Writes and
 // transactions continue to use the embedded writer connection below.
@@ -117,22 +162,62 @@ func (db *DB) Ping() error { return db.readDB.Ping() }
 // PingContext routes readiness probes to the dedicated WAL reader.
 func (db *DB) PingContext(ctx context.Context) error { return db.readDB.PingContext(ctx) }
 
-// Exec keeps all mutations on the single writer connection.
+// Exec admits a mutation through the normal bounded writer queue.
 func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	return db.DB.Exec(query, args...)
+	return db.ExecContext(context.Background(), query, args...)
 }
 
-// ExecContext keeps all mutations on the single writer connection.
+// ExecContext admits a mutation through the normal bounded writer queue.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return db.DB.ExecContext(ctx, query, args...)
+	return db.ExecPriority(ctx, NormalWrite, query, args...)
 }
 
-// Begin starts a transaction on the single writer connection.
-func (db *DB) Begin() (*sql.Tx, error) { return db.DB.Begin() }
+// ExecPriority admits a mutation with an explicit writer priority. Control
+// state transitions should use ControlWrite; bulk data changes should use
+// NormalWrite and maintenance should use MaintenanceWrite.
+func (db *DB) ExecPriority(ctx context.Context, priority WritePriority, query string, args ...any) (sql.Result, error) {
+	if db.writer == nil {
+		return nil, ErrWriterStopped
+	}
+	bounded, cancel := boundedWriteContext(ctx, priority)
+	defer cancel()
+	return db.writer.Exec(bounded, priority, query, args...)
+}
 
-// BeginTx starts a transaction on the single writer connection.
-func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
-	return db.DB.BeginTx(ctx, opts)
+// Write admits a mutation with an explicit resource priority. New production
+// writes should use this or WriteTx; a DB without a started writer fails closed
+// instead of falling back to the embedded raw handle.
+func (db *DB) Write(ctx context.Context, priority WritePriority, fn func(context.Context, *sql.DB) error) error {
+	if db.writer == nil {
+		return ErrWriterStopped
+	}
+	bounded, cancel := boundedWriteContext(ctx, priority)
+	defer cancel()
+	return db.writer.Do(bounded, priority, func(runCtx context.Context) error { return fn(runCtx, db.DB) })
+}
+
+// WriteTx runs a short transaction through the single writer queue.
+func (db *DB) WriteTx(ctx context.Context, priority WritePriority, opts *sql.TxOptions, fn func(*sql.Tx) error) error {
+	if db.writer == nil {
+		return ErrWriterStopped
+	}
+	bounded, cancel := boundedWriteContext(ctx, priority)
+	defer cancel()
+	return db.writer.Tx(bounded, priority, opts, fn)
+}
+
+func boundedWriteContext(ctx context.Context, priority WritePriority) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	timeout := dataWriteTimeout
+	if priority == ControlWrite {
+		timeout = controlWriteTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // Path returns the database file path.

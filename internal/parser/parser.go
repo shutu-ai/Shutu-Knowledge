@@ -7,6 +7,7 @@ package parser
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -31,6 +32,14 @@ type Parser interface {
 	Extensions() []string
 	// Parse converts raw bytes into normalized text.
 	Parse(fileName string, data []byte) (Result, error)
+}
+
+// contextParser is implemented by parsers that may perform blocking work.
+// The legacy Parser method remains available for synchronous callers, while
+// the registry can preserve a worker's cancellation boundary when a parser
+// invokes an external helper.
+type contextParser interface {
+	ParseContext(ctx context.Context, fileName string, data []byte) (Result, error)
 }
 
 // Registry dispatches documents to parsers by extension.
@@ -65,6 +74,10 @@ func NewRegistry(opts ...Option) *Registry {
 	r.byExt["docx"] = office
 	r.byExt["pptx"] = office
 	r.byExt["xlsx"] = office
+	// Macro-enabled workbooks use the same OOXML container as XLSX. The
+	// parser extracts workbook text and deliberately ignores executable VBA
+	// parts; importing an XLSM must not require macro execution.
+	r.byExt["xlsm"] = office
 	r.byExt["epub"] = office
 	pdf := &pdfParser{}
 	r.byExt["pdf"] = pdf
@@ -118,6 +131,20 @@ func ExtensionOf(fileName string) string {
 // Parse dispatches on the file's extension. A pdf MIME type with a mismatched
 // extension still parses as PDF, mirroring the reference behavior.
 func (r *Registry) Parse(fileName string, data []byte) (Result, error) {
+	return r.ParseContext(context.Background(), fileName, data)
+}
+
+// ParseContext dispatches a bounded parse while preserving cancellation for
+// parsers that call external runtimes. Built-in in-memory parsers still run to
+// completion, but cancellation is checked before dispatch and before the
+// result is returned so callers never continue an already-cancelled worker.
+func (r *Registry) ParseContext(ctx context.Context, fileName string, data []byte) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	ext := ExtensionOf(fileName)
 	parser, ok := r.byExt[ext]
 	if !ok && (strings.EqualFold(filepath.Ext(fileName), "") && looksLikePDF(data)) {
@@ -126,9 +153,20 @@ func (r *Registry) Parse(fileName string, data []byte) (Result, error) {
 	if !ok {
 		return Result{}, &UnsupportedError{Ext: ext}
 	}
-	result, err := parser.Parse(fileName, data)
+	var (
+		result Result
+		err    error
+	)
+	if contextual, ok := parser.(contextParser); ok {
+		result, err = contextual.ParseContext(ctx, fileName, data)
+	} else {
+		result, err = parser.Parse(fileName, data)
+	}
 	if err != nil {
 		return result, fmt.Errorf("%s: %w", ext, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	return result, nil
 }

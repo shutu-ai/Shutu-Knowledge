@@ -6,12 +6,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 const operationColumns = `id, type, command_schema_version, base_id, document_id, parent_operation_id,
-	state, state_revision, phase, resource_class, priority, attempt, cancel_requested, retryable,
-	completed_units, total_units, completed_bytes, total_bytes, error_code, error_message, result,
-	requested_at, started_at, finished_at, idempotency_expires_at`
+	principal_ref, scope_ref, input_ref, input_sha256, source_version, config_snapshot_ref,
+	model_snapshot_ref, expected_target_epoch, expected_ancestor_epoch, allocated_document_id,
+	allocated_generation, state, state_revision, phase, resource_class, priority, attempt,
+	cancel_requested, retryable, completed_units, total_units, completed_bytes, total_bytes,
+	error_code, error_message, result, requested_at, started_at, finished_at,
+	idempotency_expires_at, memory_bytes, disk_bytes, temp_bytes, next_attempt_at,
+	recovery_basis, result_ref, result_expires_at, retained_until`
 
 // ListFilter bounds status and scope queries. Nil slices mean unrestricted;
 // explicitly empty slices fail closed.
@@ -26,7 +32,15 @@ type ListFilter struct {
 
 // Get returns one operation snapshot.
 func (s *Service) Get(id string) (Operation, error) {
-	op, err := scanOperation(s.db.QueryRow(`SELECT `+operationColumns+` FROM operations WHERE id = ?`, id))
+	return s.GetContext(context.Background(), id)
+}
+
+// GetContext returns one operation snapshot while honoring ctx.
+func (s *Service) GetContext(ctx context.Context, id string) (Operation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	op, err := scanOperation(s.db.QueryRowContext(ctx, `SELECT `+operationColumns+` FROM operations WHERE id = ?`, id))
 	if err == sql.ErrNoRows {
 		return Operation{}, ErrNotFound
 	}
@@ -89,51 +103,63 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]Operation, str
 
 // Cancel records intent durably before notifying a process-local worker.
 func (s *Service) Cancel(id string) (Operation, error) {
-	op, err := s.Get(id)
+	return s.CancelContext(context.Background(), id)
+}
+
+// CancelContext records intent durably before notifying a process-local
+// worker, honoring cancellation while reading and writing the control state.
+func (s *Service) CancelContext(ctx context.Context, id string) (Operation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	op, err := s.GetContext(ctx, id)
 	if err != nil {
 		return Operation{}, err
 	}
 	if terminal(op.State) {
 		return op, nil
 	}
-	tx, err := s.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		return Operation{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	nextRevision := op.StateRevision + 1
-	result, err := tx.Exec(`UPDATE operations SET cancel_requested = 1, state = ?,
+	changed := false
+	err = s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		nextRevision := op.StateRevision + 1
+		result, err := tx.ExecContext(ctx, `UPDATE operations SET cancel_requested = 1, state = ?,
 		state_revision = ?, updated_at = ?
 		WHERE id = ? AND state IN ('queued','running') AND state_revision = ?`,
-		StateCancelling, nextRevision, now(), id, op.StateRevision)
-	if err != nil {
-		return Operation{}, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return Operation{}, err
-	}
-	if affected == 0 {
-		return s.Get(id)
-	}
-	if err := insertEvent(context.Background(), tx, id, nextRevision, "cancel_requested", nil); err != nil {
-		return Operation{}, err
-	}
-	if op.State == StateQueued {
-		if _, err := tx.Exec(`UPDATE operations SET state = ?,
+			StateCancelling, nextRevision, now(), id, op.StateRevision)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return nil
+		}
+		changed = true
+		if err := insertEvent(ctx, tx, id, nextRevision, "cancel_requested", nil); err != nil {
+			return err
+		}
+		if op.State == StateQueued {
+			if _, err := tx.ExecContext(ctx, `UPDATE operations SET state = ?,
 			state_revision = ?, finished_at = ?, updated_at = ?
 			WHERE id = ? AND state = ? AND cancel_requested = 1`,
-			StateCancelled, nextRevision+1, now(), now(), id, StateCancelling); err != nil {
-			return Operation{}, err
+				StateCancelled, nextRevision+1, now(), now(), id, StateCancelling); err != nil {
+				return err
+			}
+			if err := insertEvent(ctx, tx, id, nextRevision+1, "finished", map[string]any{
+				"state": StateCancelled, "errorCode": "cancelled",
+			}); err != nil {
+				return err
+			}
 		}
-		if err := insertEvent(context.Background(), tx, id, nextRevision+1, "finished", map[string]any{
-			"state": StateCancelled, "errorCode": "cancelled",
-		}); err != nil {
-			return Operation{}, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return Operation{}, err
+	}
+	if !changed {
+		return s.GetContext(ctx, id)
 	}
 	s.mu.RLock()
 	run := s.active[id]
@@ -141,12 +167,21 @@ func (s *Service) Cancel(id string) (Operation, error) {
 	if run != nil {
 		run.cancel()
 	}
-	return s.Get(id)
+	return s.GetContext(ctx, id)
 }
 
 // Retry returns a failed or interrupted operation to the durable queue.
 func (s *Service) Retry(id string) (Operation, error) {
-	op, err := s.Get(id)
+	return s.RetryContext(context.Background(), id)
+}
+
+// RetryContext returns a failed or interrupted operation to the durable queue,
+// honoring cancellation while reading and writing the control state.
+func (s *Service) RetryContext(ctx context.Context, id string) (Operation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	op, err := s.GetContext(ctx, id)
 	if err != nil {
 		return Operation{}, err
 	}
@@ -159,28 +194,28 @@ func (s *Service) Retry(id string) (Operation, error) {
 	if op.Attempt >= DefaultMaxAttempts {
 		return Operation{}, fmt.Errorf("operation reached the maximum of %d attempts", DefaultMaxAttempts)
 	}
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	revision := op.StateRevision + 1
+	err = s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		retryAt := now()
+		if _, err := tx.ExecContext(ctx, `UPDATE operations SET state = ?, cancel_requested = 0,
+		state_revision = ?, error_code = NULL, error_message = NULL,
+		result = NULL, finished_at = NULL, next_attempt_at = ?, updated_at = ?
+		WHERE id = ? AND state = ?`,
+			StateQueued, revision, retryAt, retryAt, id, op.State); err != nil {
+			return err
+		}
+		if err := insertEvent(ctx, tx, id, revision, "retry_queued", map[string]any{
+			"attempt": op.Attempt,
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return Operation{}, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	revision := op.StateRevision + 1
-	if _, err := tx.Exec(`UPDATE operations SET state = ?, cancel_requested = 0,
-		state_revision = ?, error_code = NULL, error_message = NULL,
-		result = NULL, finished_at = NULL, updated_at = ? WHERE id = ? AND state = ?`,
-		StateQueued, revision, now(), id, op.State); err != nil {
-		return Operation{}, err
-	}
-	if err := insertEvent(context.Background(), tx, id, revision, "retry_queued", map[string]any{
-		"attempt": op.Attempt,
-	}); err != nil {
-		return Operation{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Operation{}, err
-	}
 	s.wakeupClass(op.ResourceClass)
-	return s.Get(id)
+	return s.GetContext(ctx, id)
 }
 
 type operationEvent struct {
@@ -224,23 +259,40 @@ type rowScanner interface {
 
 func scanOperation(row rowScanner) (Operation, error) {
 	var op Operation
-	var baseID, documentID, parentID, phase, errorCode, errorMessage sql.NullString
+	var baseID, documentID, parentID sql.NullString
+	var principalRef, scopeRef, inputRef, inputSHA256, sourceVersion sql.NullString
+	var configSnapshotRef, modelSnapshotRef, allocatedDocumentID sql.NullString
+	var phase, errorCode, errorMessage, recoveryBasis, resultRef sql.NullString
+	var expectedTargetEpoch, expectedAncestorEpoch, allocatedGeneration sql.NullInt64
 	var totalUnits, totalBytes sql.NullInt64
 	var startedAt, finishedAt sql.NullInt64
 	var idempotencyExpiresAt sql.NullInt64
+	var memoryBytes, diskBytes, tempBytes sql.NullInt64
+	var nextAttemptAt, resultExpiresAt, retainedUntil sql.NullInt64
 	var result []byte
 	var cancelRequested, retryable int
 	err := row.Scan(&op.ID, &op.Type, &op.CommandSchemaVersion, &baseID, &documentID, &parentID,
-		&op.State, &op.StateRevision, &phase, &op.ResourceClass, &op.Priority, &op.Attempt,
+		&principalRef, &scopeRef, &inputRef, &inputSHA256, &sourceVersion, &configSnapshotRef,
+		&modelSnapshotRef, &expectedTargetEpoch, &expectedAncestorEpoch, &allocatedDocumentID,
+		&allocatedGeneration, &op.State, &op.StateRevision, &phase, &op.ResourceClass, &op.Priority, &op.Attempt,
 		&cancelRequested, &retryable, &op.CompletedUnits, &totalUnits, &op.CompletedBytes, &totalBytes,
 		&errorCode, &errorMessage, &result, &op.RequestedAt, &startedAt, &finishedAt,
-		&idempotencyExpiresAt)
+		&idempotencyExpiresAt, &memoryBytes, &diskBytes, &tempBytes, &nextAttemptAt,
+		&recoveryBasis, &resultRef, &resultExpiresAt, &retainedUntil)
 	if err != nil {
 		return Operation{}, err
 	}
 	op.BaseID = baseID.String
 	op.DocumentID = documentID.String
 	op.ParentOperationID = parentID.String
+	op.PrincipalRef = principalRef.String
+	op.ScopeRef = scopeRef.String
+	op.InputRef = inputRef.String
+	op.InputSHA256 = inputSHA256.String
+	op.SourceVersion = sourceVersion.String
+	op.ConfigSnapshotRef = configSnapshotRef.String
+	op.ModelSnapshotRef = modelSnapshotRef.String
+	op.AllocatedDocumentID = allocatedDocumentID.String
 	op.Phase = phase.String
 	op.CancelRequested = cancelRequested != 0
 	op.Cancellable = (op.State == StateQueued || op.State == StateRunning) && !op.CancelRequested
@@ -257,10 +309,58 @@ func scanOperation(row rowScanner) (Operation, error) {
 	op.ErrorMessage = errorMessage.String
 	op.StartedAt = startedAt.Int64
 	op.FinishedAt = finishedAt.Int64
+	if op.StartedAt > 0 {
+		op.QueueWaitMS = maxDurationMS(op.StartedAt - op.RequestedAt)
+		end := op.FinishedAt
+		if end == 0 {
+			end = now()
+		}
+		op.RunTimeMS = maxDurationMS(end - op.StartedAt)
+	} else if op.FinishedAt > 0 {
+		// Queued cancellation never claims the operation, so its complete
+		// lifetime is the admission wait rather than executor runtime.
+		op.QueueWaitMS = maxDurationMS(op.FinishedAt - op.RequestedAt)
+	}
 	if idempotencyExpiresAt.Valid {
 		value := idempotencyExpiresAt.Int64
 		op.IdempotencyExpiresAt = &value
 	}
 	op.Result = result
+	op.MemoryBytes = memoryBytes.Int64
+	op.DiskBytes = diskBytes.Int64
+	op.TempBytes = tempBytes.Int64
+	if expectedTargetEpoch.Valid {
+		value := expectedTargetEpoch.Int64
+		op.ExpectedTargetEpoch = &value
+	}
+	if expectedAncestorEpoch.Valid {
+		value := expectedAncestorEpoch.Int64
+		op.ExpectedAncestorEpoch = &value
+	}
+	if allocatedGeneration.Valid {
+		value := allocatedGeneration.Int64
+		op.AllocatedGeneration = &value
+	}
+	if nextAttemptAt.Valid {
+		value := nextAttemptAt.Int64
+		op.NextAttemptAt = &value
+	}
+	op.RecoveryBasis = recoveryBasis.String
+	op.ResultRef = resultRef.String
+	if resultExpiresAt.Valid {
+		value := resultExpiresAt.Int64
+		op.ResultExpiresAt = &value
+	}
+	if retainedUntil.Valid {
+		value := retainedUntil.Int64
+		op.RetainedUntil = &value
+	}
 	return op, nil
+}
+
+func maxDurationMS(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/models"
 	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 )
 
@@ -297,6 +298,14 @@ func TestStatusExposesSchedulerCapacity(t *testing.T) {
 	if _, ok := scheduler["lanes"].(map[string]any); !ok {
 		t.Fatalf("scheduler lanes missing: %+v", scheduler)
 	}
+	operationMetrics, ok := scheduler["operations"].(map[string]any)
+	if !ok || operationMetrics["total"].(float64) < 0 {
+		t.Fatalf("scheduler operation metrics missing: %+v", scheduler)
+	}
+	resources, ok := scheduler["resources"].(map[string]any)
+	if !ok || resources["databaseBytes"].(float64) <= 0 || resources["peakRssBytes"].(float64) <= 0 {
+		t.Fatalf("scheduler resource measurements missing: %+v", scheduler)
+	}
 	format := payload["storageFormat"].(map[string]any)
 	if format["formatVersion"].(float64) != 2 || format["migrationStatus"] != "ready" {
 		t.Fatalf("storage format: %+v", format)
@@ -361,6 +370,29 @@ func TestModelCacheMigrationOperationIsDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	target := filepath.Join(t.TempDir(), "migrated-models")
+	planRequest := map[string]any{
+		"type":                 "plan_model_cache_migration",
+		"commandSchemaVersion": 1,
+		"target":               map[string]any{},
+		"input":                map[string]any{"targetDir": target},
+		"idempotencyKey":       "model-cache-plan-key",
+	}
+	code, payload := call(t, s, "POST", "/api/operations", planRequest)
+	if code != http.StatusAccepted {
+		t.Fatalf("submit migration plan: %d %v", code, payload)
+	}
+	planID := valueMap(t, payload)["operationId"].(string)
+	planOperation := waitOperation(t, s, planID)
+	if planOperation.State != operations.StateSucceeded {
+		t.Fatalf("migration plan failed: %+v", planOperation)
+	}
+	var plan models.MigrationPlan
+	if err := json.Unmarshal(planOperation.Result, &plan); err != nil {
+		t.Fatalf("decode migration plan result: %v", err)
+	}
+	if len(plan.Models) != 1 || plan.TargetDir != filepath.Clean(target) {
+		t.Fatalf("migration plan result: %+v", plan)
+	}
 	request := map[string]any{
 		"type":                 "migrate_model_cache",
 		"commandSchemaVersion": 1,
@@ -368,7 +400,7 @@ func TestModelCacheMigrationOperationIsDurable(t *testing.T) {
 		"input":                map[string]any{"targetDir": target, "removeSource": true},
 		"idempotencyKey":       "model-cache-migration-key",
 	}
-	code, payload := call(t, s, "POST", "/api/operations", request)
+	code, payload = call(t, s, "POST", "/api/operations", request)
 	if code != http.StatusAccepted {
 		t.Fatalf("submit migration: %d %v", code, payload)
 	}
@@ -407,6 +439,21 @@ func TestModelCacheMigrationOperationIsDurable(t *testing.T) {
 	code, payload = call(t, s, "POST", "/api/operations", request)
 	if code != http.StatusOK || valueMap(t, payload)["operationId"] != operationID {
 		t.Fatalf("idempotent migration: %d %v", code, payload)
+	}
+	nestedRequest := map[string]any{
+		"type":                 "migrate_model_cache",
+		"commandSchemaVersion": 1,
+		"target":               map[string]any{},
+		"input":                map[string]any{"targetDir": filepath.Join(target, "nested")},
+		"idempotencyKey":       "model-cache-migration-nested-key",
+	}
+	code, payload = call(t, s, "POST", "/api/operations", nestedRequest)
+	if code != http.StatusAccepted {
+		t.Fatalf("nested migration should be deferred: %d %v", code, payload)
+	}
+	nestedID := valueMap(t, payload)["operationId"].(string)
+	if op := waitOperation(t, s, nestedID); op.State != operations.StateFailed {
+		t.Fatalf("nested migration should fail in executor: %+v", op)
 	}
 }
 
@@ -452,7 +499,11 @@ func TestOperationFileUploadImportIsDurable(t *testing.T) {
 	if code != http.StatusAccepted {
 		t.Fatalf("submit import: %d %v", code, payload)
 	}
-	operationID := valueMap(t, payload)["operationId"].(string)
+	accepted := valueMap(t, payload)
+	operationID := accepted["operationId"].(string)
+	if accepted["totalBytes"] != float64(len(content)) {
+		t.Fatalf("import totalBytes = %v, want %d", accepted["totalBytes"], len(content))
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		op, err := s.app.Operations.Get(operationID)

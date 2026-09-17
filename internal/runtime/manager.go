@@ -11,11 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/safety"
 )
 
 // ProtocolVersion is the helper wire contract version.
@@ -38,10 +41,12 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	if e.Code == "" {
-		return e.Message
+	code := safety.SafeErrorMessage(e.Code)
+	message := safety.SafeErrorMessage(e.Message)
+	if code == "" {
+		return message
 	}
-	return e.Code + ": " + e.Message
+	return code + ": " + message
 }
 
 type request struct {
@@ -129,6 +134,13 @@ type Controller interface {
 	Close()
 }
 
+// StatusSnapshotter exposes the last known helper state without issuing a
+// health/inference request. Control-plane catalog pages use it to remain
+// bounded while a model helper is loading or unavailable.
+type StatusSnapshotter interface {
+	CachedStatus() map[string]Health
+}
+
 var _ Controller = (*Manager)(nil)
 
 // ManagedModelController exposes model lifecycle operations owned by the
@@ -177,23 +189,27 @@ type Options struct {
 }
 
 type helperProcess struct {
-	command   string
-	cancel    context.CancelFunc
-	stdin     io.WriteCloser
-	scanner   *bufio.Scanner
-	wait      chan struct{}
-	lastUsed  time.Time
-	stderr    captureBuffer
-	lastError string
-	stop      func()
-	stopMu    sync.RWMutex
-	closeOnce sync.Once
-	mu        sync.Mutex
+	command       string
+	cancel        context.CancelFunc
+	stdin         io.WriteCloser
+	stdout        io.ReadCloser
+	scanner       *bufio.Scanner
+	wait          chan struct{}
+	lastUsed      time.Time
+	stderr        captureBuffer
+	lastError     string
+	stop          func()
+	stopMu        sync.RWMutex
+	stopRequested atomic.Bool
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	mu            sync.Mutex
 }
 
 var (
 	errHelperBusy       = errors.New("runtime helper is busy")
 	errHelperNotStarted = errors.New("runtime helper is not running")
+	errHelperClosed     = errors.New("runtime helper is closed")
 )
 
 // captureBuffer is safe for a helper process to write while the supervisor
@@ -253,9 +269,10 @@ type Manager struct {
 	stopOnce         sync.Once
 	done             chan struct{}
 
-	mu        sync.Mutex
-	processes map[string]*helperProcess
-	warmed    map[string]bool
+	mu         sync.Mutex
+	processes  map[string]*helperProcess
+	warmed     map[string]bool
+	lastStatus map[string]Health
 }
 
 // NewManager creates a supervisor and starts its idle reaper.
@@ -290,6 +307,7 @@ func NewManager(options Options) *Manager {
 		done:             make(chan struct{}),
 		processes:        map[string]*helperProcess{},
 		warmed:           map[string]bool{},
+		lastStatus:       map[string]Health{},
 	}
 	go manager.reap()
 	return manager
@@ -485,8 +503,36 @@ func (m *Manager) Status(ctx context.Context) map[string]Health {
 			}
 		}
 		status[capability] = health
+		m.mu.Lock()
+		if m.lastStatus == nil {
+			m.lastStatus = make(map[string]Health)
+		}
+		m.lastStatus[capability] = cloneHealth(health)
+		m.mu.Unlock()
 	}
 	return status
+}
+
+// CachedStatus returns the most recent status reports and never contacts a
+// helper process. An empty result is expected before the first live probe.
+func (m *Manager) CachedStatus() map[string]Health {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	status := make(map[string]Health, len(m.lastStatus))
+	for capability, health := range m.lastStatus {
+		status[capability] = cloneHealth(health)
+	}
+	return status
+}
+
+func cloneHealth(health Health) Health {
+	if health.Details != nil {
+		health.Details = maps.Clone(health.Details)
+	}
+	if health.Capabilities != nil {
+		health.Capabilities = append([]string(nil), health.Capabilities...)
+	}
+	return health
 }
 
 // probeStatus is the non-blocking health path used by status pages and
@@ -558,6 +604,16 @@ func remediation(capability string) string {
 
 // Close stops idle reaping and all active helper processes.
 func (m *Manager) Close() {
+	_ = m.CloseWithContext(context.Background())
+}
+
+// CloseWithContext bounds runtime shutdown. The manager owns every helper it
+// closes; if a helper ignores cancellation past the deadline, the caller can
+// release other application resources while the reaper completes cleanup.
+func (m *Manager) CloseWithContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.stopOnce.Do(func() { close(m.stop) })
 	m.mu.Lock()
 	helpers := make([]*helperProcess, 0, len(m.processes))
@@ -567,12 +623,21 @@ func (m *Manager) Close() {
 	m.processes = map[string]*helperProcess{}
 	m.mu.Unlock()
 	for _, helper := range helpers {
-		helper.close()
-		if helper.wait != nil {
-			<-helper.wait
+		wait := helper.requestStop()
+		if wait != nil {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
-	<-m.done
+	select {
+	case <-m.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // HasProcess is a test hook for observing process retirement.
@@ -685,6 +750,9 @@ func (p *helperProcess) callLocked(parent context.Context, method, capability st
 	if err := parent.Err(); err != nil {
 		return err
 	}
+	if p.closed.Load() {
+		return errHelperClosed
+	}
 	if !p.runningLocked() {
 		if err := p.startLocked(startupTimeout); err != nil {
 			p.closeLocked()
@@ -717,8 +785,27 @@ func (p *helperProcess) callLocked(parent context.Context, method, capability st
 	}
 	var reply response
 	for {
-		if !p.scanner.Scan() {
-			scanErr := p.scanner.Err()
+		// Scanner.Scan is a blocking pipe read. Run only this serialized
+		// read in a short-lived goroutine so shutdown can observe either the
+		// request deadline or the owned process exiting. The buffered result
+		// channel lets the reader finish after the caller has returned.
+		scanDone := make(chan bool, 1)
+		scanner := p.scanner
+		go func() { scanDone <- scanner.Scan() }()
+		wait := p.waitChannel()
+		var scanned bool
+		select {
+		case <-callCtx.Done():
+			p.stopProcess()
+			p.closeLocked()
+			return fmt.Errorf("%s request: %w", capability, callCtx.Err())
+		case <-wait:
+			p.closeLocked()
+			return p.withStderr(fmt.Errorf("%s helper exited", capability))
+		case scanned = <-scanDone:
+		}
+		if !scanned {
+			scanErr := scanner.Err()
 			p.closeLocked()
 			if scanErr != nil {
 				return p.withStderr(fmt.Errorf("read %s response: %w", capability, scanErr))
@@ -766,6 +853,13 @@ func (p *helperProcess) callLocked(parent context.Context, method, capability st
 	return nil
 }
 
+func (p *helperProcess) waitChannel() <-chan struct{} {
+	p.stopMu.RLock()
+	wait := p.wait
+	p.stopMu.RUnlock()
+	return wait
+}
+
 func (p *helperProcess) runningLocked() bool {
 	select {
 	case <-p.wait:
@@ -776,6 +870,9 @@ func (p *helperProcess) runningLocked() bool {
 }
 
 func (p *helperProcess) startLocked(startupTimeout time.Duration) error {
+	if p.closed.Load() {
+		return errHelperClosed
+	}
 	words, ok := splitCommand(p.command)
 	if !ok || len(words) == 0 {
 		return &Error{Code: "runtime_unconfigured", Message: "helper command is empty"}
@@ -804,22 +901,35 @@ func (p *helperProcess) startLocked(startupTimeout time.Duration) error {
 		cancel()
 		return fmt.Errorf("start helper: %w", err)
 	}
-	p.cancel = cancel
+	if p.closed.Load() {
+		terminateProcessTree(cmd)
+		_ = stdin.Close()
+		_ = stdout.Close()
+		cancel()
+		return errHelperClosed
+	}
+	p.stopRequested.Store(false)
+	wait := make(chan struct{})
 	p.stopMu.Lock()
+	p.cancel = cancel
+	p.stdout = stdout
 	p.stop = func() {
 		terminateProcessTree(cmd)
 		cancel()
 	}
+	p.wait = wait
 	p.stopMu.Unlock()
 	p.stdin = stdin
 	p.scanner = bufio.NewScanner(stdout)
 	p.scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
-	wait := make(chan struct{})
-	p.wait = wait
 	go func(wait chan struct{}) {
 		_ = cmd.Wait()
 		close(wait)
 	}(wait)
+	if p.closed.Load() {
+		p.stopProcess()
+		return errHelperClosed
+	}
 
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, startupTimeout)
 	defer handshakeCancel()
@@ -934,20 +1044,28 @@ func (p *helperProcess) closeLocked() {
 		_ = p.stdin.Close()
 		p.stopMu.RLock()
 		stop := p.stop
+		cancel := p.cancel
+		stdout := p.stdout
 		p.stopMu.RUnlock()
-		if stop != nil {
-			stop()
-		} else if p.cancel != nil {
-			p.cancel()
+		if stdout != nil {
+			_ = stdout.Close()
 		}
-		p.lastError = strings.TrimSpace(p.stderr.String())
+		if p.stopRequested.CompareAndSwap(false, true) {
+			if stop != nil {
+				stop()
+			} else if cancel != nil {
+				cancel()
+			}
+		}
+		p.lastError = safety.SafeErrorMessage(p.stderr.String())
 	})
 	// A reaper may have recreated the process object after an idle close.
 	// This object is terminal until a new process replaces it by call.
 	p.stdin = nil
 	p.scanner = nil
-	p.cancel = nil
 	p.stopMu.Lock()
+	p.cancel = nil
+	p.stdout = nil
 	p.stop = nil
 	p.stopMu.Unlock()
 	p.closeOnce = sync.Once{}
@@ -956,18 +1074,66 @@ func (p *helperProcess) closeLocked() {
 func (p *helperProcess) stopProcess() {
 	p.stopMu.RLock()
 	stop := p.stop
+	cancel := p.cancel
 	p.stopMu.RUnlock()
+	if stop == nil && cancel == nil {
+		return
+	}
+	if !p.stopRequested.CompareAndSwap(false, true) {
+		return
+	}
 	if stop != nil {
 		stop()
+	} else {
+		cancel()
 	}
 }
 
-func (p *helperProcess) withStderr(err error) error {
-	if p.lastError == "" {
-		return err
+// requestStop deliberately does not acquire p.mu. A capability call holds
+// that lock while waiting for helper stdout; acquiring it here would make
+// shutdown wait for the very request that shutdown must terminate. The
+// process wait channel is read under stopMu so CloseWithContext can wait for
+// the owned process without entering the request critical section.
+func (p *helperProcess) requestStop() <-chan struct{} {
+	p.closed.Store(true)
+	p.stopMu.RLock()
+	stop := p.stop
+	cancel := p.cancel
+	stdout := p.stdout
+	wait := p.wait
+	p.stopMu.RUnlock()
+	// Closing the read end explicitly wakes a goroutine blocked in Scanner
+	// even on platforms where cmd.Wait reports process exit before the pipe
+	// wrapper has been closed.
+	if !p.stopRequested.CompareAndSwap(false, true) {
+		return wait
 	}
-	return fmt.Errorf("%w (helper stderr: %s)", err, p.lastError)
+	if stdout != nil {
+		_ = stdout.Close()
+	}
+	if stop != nil {
+		stop()
+	} else if cancel != nil {
+		cancel()
+	}
+	return wait
 }
+
+func (p *helperProcess) withStderr(err error) error {
+	message := safety.SafeErrorMessage(err.Error())
+	if p.lastError != "" {
+		message += " (helper stderr: " + safety.SafeErrorMessage(p.lastError) + ")"
+	}
+	return &safeWrappedError{cause: err, message: message}
+}
+
+type safeWrappedError struct {
+	cause   error
+	message string
+}
+
+func (e *safeWrappedError) Error() string { return e.message }
+func (e *safeWrappedError) Unwrap() error { return e.cause }
 
 var requestID atomic.Uint64
 

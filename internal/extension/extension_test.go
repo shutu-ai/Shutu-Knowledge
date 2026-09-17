@@ -24,6 +24,7 @@ import (
 func testApp(t *testing.T) *app.App {
 	t.Helper()
 	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	t.Setenv("SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME", "1")
 	application, err := app.New(context.Background())
 	if err != nil {
 		t.Fatalf("app: %v", err)
@@ -284,6 +285,26 @@ func TestToolLifecycleAndContext(t *testing.T) {
 	}
 	if list.Error != "" || !strings.Contains(list.Value.(map[string]any)["documents"].([]documentSummary)[0].ID, "") {
 		t.Fatalf("list documents: %#v", list)
+	}
+	page, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name: "knowledge_list_documents", Arguments: map[string]any{"baseId": base.ID, "limit": 1, "offset": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageValue := page.Value.(map[string]any)
+	if page.Error != "" || len(pageValue["documents"].([]documentSummary)) > 1 || pageValue["limit"].(int) != 1 || pageValue["offset"].(int) != 1 {
+		t.Fatalf("bounded list documents: %#v", page)
+	}
+	outline, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name: "knowledge_list_bases", Arguments: map[string]any{"baseId": base.ID, "limit": 1, "offset": 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outlineValue := outline.Value.(map[string]any)
+	if outline.Error != "" || len(outlineValue["documents"].([]documentSummary)) != 1 || outlineValue["limit"].(int) != 1 {
+		t.Fatalf("bounded base outline: %#v", outline)
 	}
 
 	emptyScope := []string{}

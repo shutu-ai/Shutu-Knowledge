@@ -75,7 +75,10 @@ func fileNameForURL(rawURL string) string {
 
 // AddUrlDocument fetches a page and imports it (title from the page when absent).
 func (s *Service) AddUrlDocument(ctx context.Context, baseID, rawURL, title string) (Document, error) {
-	if _, err := s.store.getBase(baseID); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := s.store.getBaseContext(ctx, baseID); err != nil {
 		return Document{}, err
 	}
 	rawURL = strings.TrimSpace(rawURL)
@@ -100,7 +103,10 @@ func (s *Service) AddUrlDocument(ctx context.Context, baseID, rawURL, title stri
 // durable operation preallocates the ID so a restart after publish returns the
 // same document instead of fetching and creating a second copy.
 func (s *Service) AddUrlDocumentWithID(ctx context.Context, baseID, id, rawURL, title string, body []byte) (Document, error) {
-	if _, err := s.store.getBase(baseID); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := s.store.getBaseContext(ctx, baseID); err != nil {
 		return Document{}, err
 	}
 	rawURL = strings.TrimSpace(rawURL)
@@ -115,7 +121,7 @@ func (s *Service) AddUrlDocumentWithID(ctx context.Context, baseID, id, rawURL, 
 		}
 	}
 	var doc Document
-	existing, err := s.store.getDocument(id)
+	existing, err := s.store.getDocumentContext(ctx, id)
 	if err == nil {
 		if doc.Status == StatusReady {
 			return existing, nil
@@ -146,7 +152,10 @@ func (s *Service) AddUrlDocumentWithID(ctx context.Context, baseID, id, rawURL, 
 // RefreshUrlDocument re-fetches one URL document; unchanged content skips
 // re-chunking (incremental update).
 func (s *Service) RefreshUrlDocument(ctx context.Context, id string) (bool, Document, error) {
-	doc, err := s.store.getDocument(id)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err != nil {
 		return false, Document{}, err
 	}
@@ -171,7 +180,10 @@ func (s *Service) RefreshUrlDocument(ctx context.Context, id string) (bool, Docu
 // RefreshUrlDocumentFromCapture replays a fixed captured source. It is the
 // crash-safe branch used by persistent URL refresh operations.
 func (s *Service) RefreshUrlDocumentFromCapture(ctx context.Context, id, finalURL string, body []byte) (bool, Document, error) {
-	doc, err := s.store.getDocument(id)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err != nil {
 		return false, Document{}, err
 	}
@@ -194,13 +206,13 @@ func (s *Service) RefreshUrlDocumentFromCapture(ctx context.Context, id, finalUR
 
 // ingestFetched parses fetched bytes and runs the standard ingest path.
 func (s *Service) ingestFetched(ctx context.Context, doc *Document, body []byte) error {
-	base, err := s.store.getBase(doc.BaseID)
+	base, err := s.store.getBaseContext(ctx, doc.BaseID)
 	if err != nil {
 		return err
 	}
-	parsed, err := s.parsers.Parse(doc.FileName, body)
+	parsed, err := s.parsers.ParseContext(ctx, doc.FileName, body)
 	if err != nil {
-		return s.failDocument(doc, ErrParseFailed, err)
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
 	if parsed.Title != "" && !doc.TitleLocked {
 		doc.Title = parsed.Title
@@ -214,7 +226,10 @@ func (s *Service) ingestFetched(ctx context.Context, doc *Document, body []byte)
 // RefreshStaleURLs refreshes every URL document older than its base's
 // configured interval (urlRefreshHours; 0 = off). Returns per-doc errors.
 func (s *Service) RefreshStaleURLs(ctx context.Context, now int64) []error {
-	bases, err := s.store.listBases()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	bases, err := s.store.listBasesContext(ctx)
 	if err != nil {
 		return []error{err}
 	}
@@ -225,24 +240,43 @@ func (s *Service) RefreshStaleURLs(ctx context.Context, now int64) []error {
 			continue
 		}
 		cutoff := now - int64(intervalHours)*3_600_000
-		docs, err := s.store.listDocumentMetadata(base.ID)
-		if err != nil {
-			failures = append(failures, err)
-			continue
-		}
-		for _, doc := range docs {
-			if doc.SourceType != "url" {
-				continue
+		afterCreatedAt, afterID := int64(0), ""
+		for {
+			if err := ctx.Err(); err != nil {
+				failures = append(failures, err)
+				break
 			}
-			updatedAt := doc.UpdatedAt
-			if updatedAt == 0 {
-				updatedAt = doc.CreatedAt
+			docs, err := s.store.listDocumentsAfterContext(ctx, base.ID, afterCreatedAt, afterID, cleanupDocumentPageSize)
+			if err != nil {
+				failures = append(failures, err)
+				break
 			}
-			if updatedAt > cutoff {
-				continue
+			if len(docs) == 0 {
+				break
 			}
-			if _, _, err := s.RefreshUrlDocument(ctx, doc.ID); err != nil {
-				failures = append(failures, fmt.Errorf("refresh %s: %w", doc.URL, err))
+			for _, doc := range docs {
+				if err := ctx.Err(); err != nil {
+					failures = append(failures, err)
+					break
+				}
+				if doc.SourceType != "url" {
+					continue
+				}
+				updatedAt := doc.UpdatedAt
+				if updatedAt == 0 {
+					updatedAt = doc.CreatedAt
+				}
+				if updatedAt > cutoff {
+					continue
+				}
+				if _, _, err := s.RefreshUrlDocument(ctx, doc.ID); err != nil {
+					failures = append(failures, fmt.Errorf("refresh %s: %w", doc.URL, err))
+				}
+			}
+			last := docs[len(docs)-1]
+			afterCreatedAt, afterID = last.CreatedAt, last.ID
+			if len(docs) < cleanupDocumentPageSize {
+				break
 			}
 		}
 	}

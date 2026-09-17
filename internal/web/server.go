@@ -210,7 +210,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	report := s.app.HealthSnapshot(r.Context())
 	var scheduler any
 	if s.app.Operations != nil {
-		snapshot, err := s.app.Operations.Scheduler()
+		snapshot, err := s.app.Operations.SchedulerContext(r.Context())
 		if err != nil {
 			scheduler = map[string]string{"error": err.Error()}
 		} else {
@@ -229,7 +229,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"commandSchemaVersion": 1,
 			"maxUploadBytes":       operations.MaxUploadBytes,
 		},
-		"storageFormat": storageFormatReport(s.app),
+		"storageFormat": storageFormatReport(s.app, r.Context()),
 		"scheduler":     scheduler,
 	})
 }
@@ -239,8 +239,8 @@ type versionPayload struct {
 	WebBuild string `json:"webBuild"`
 }
 
-func storageFormatReport(a *app.App) any {
-	format, err := storage.StorageFormat(a.DB.DB)
+func storageFormatReport(a *app.App, ctx context.Context) any {
+	format, err := storage.StorageFormatContext(ctx, a.DB.ReadDB())
 	if err != nil {
 		return map[string]string{"error": err.Error()}
 	}

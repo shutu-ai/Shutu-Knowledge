@@ -3,8 +3,6 @@ package knowledge
 import (
 	"archive/zip"
 	"bytes"
-	"testing"
-	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
@@ -29,44 +27,4 @@ func zipWithMarkdown() []byte {
 	}
 	_ = writer.Close()
 	return buf.Bytes()
-}
-
-func waitJob(t *testing.T, service *Service, jobID string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		job, ok := service.jobMgr.Status(jobID)
-		if !ok {
-			t.Fatal("job missing")
-		}
-		switch job.Status {
-		case "done":
-			return
-		case "failed":
-			t.Fatalf("job failed: %s", job.Error)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("job timeout: %+v", job)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-func waitJobAllowFailed(t *testing.T, service *Service, jobID string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		job, ok := service.jobMgr.Status(jobID)
-		if !ok {
-			t.Fatal("job missing")
-		}
-		switch job.Status {
-		case "done", "failed":
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("job timeout: %+v", job)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

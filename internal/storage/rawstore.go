@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -150,6 +151,19 @@ func (s *RawFileStore) writeRel(relativePath string, data []byte) error {
 
 // Read returns the stored bytes, or nil when absent.
 func (s *RawFileStore) Read(relativePath string) ([]byte, error) {
+	return s.ReadContext(context.Background(), relativePath)
+}
+
+// ReadContext reads one stored source while honoring cancellation before the
+// filesystem operation. The OS read itself remains bounded by the immutable
+// file size established at ingest time.
+func (s *RawFileStore) ReadContext(ctx context.Context, relativePath string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	full, err := s.pathOf(relativePath)
 	if err != nil {
 		return nil, err
@@ -205,11 +219,20 @@ func (s *RawFileStore) DeleteBase(baseID string) error {
 	return os.RemoveAll(full)
 }
 
-// ListAll returns every stored base-relative path (orphan reconciliation).
-func (s *RawFileStore) ListAll() ([]string, error) {
-	var out []string
-	err := filepath.WalkDir(s.root, func(p string, d fs.DirEntry, err error) error {
+// WalkAll visits every stored base-relative path without materializing the
+// complete file list. Quarantine contents are excluded from the active scan.
+func (s *RawFileStore) WalkAll(ctx context.Context, visit func(string) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if visit == nil {
+		return fmt.Errorf("raw file visitor is required")
+	}
+	return filepath.WalkDir(s.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if d.IsDir() {
@@ -223,7 +246,26 @@ func (s *RawFileStore) ListAll() ([]string, error) {
 		if relSlash == QuarantineDir || strings.HasPrefix(relSlash+"/", QuarantineDir+"/") {
 			return nil
 		}
-		out = append(out, relSlash)
+		return visit(relSlash)
+	})
+}
+
+// CountAll counts active raw files without retaining their paths.
+func (s *RawFileStore) CountAll(ctx context.Context) (int, error) {
+	count := 0
+	err := s.WalkAll(ctx, func(string) error {
+		count++
+		return nil
+	})
+	return count, err
+}
+
+// ListAll returns every stored base-relative path (orphan reconciliation).
+// New maintenance code should prefer WalkAll to keep memory bounded.
+func (s *RawFileStore) ListAll() ([]string, error) {
+	var out []string
+	err := s.WalkAll(context.Background(), func(rel string) error {
+		out = append(out, rel)
 		return nil
 	})
 	return out, err

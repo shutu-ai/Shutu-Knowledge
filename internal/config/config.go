@@ -4,6 +4,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -137,7 +138,17 @@ type Config struct {
 		ModelWaitMS int `yaml:"modelWaitMs" json:"modelWaitMs"`
 		Maintenance int `yaml:"maintenance" json:"maintenance"`
 		MaxPerBase  int `yaml:"maxPerBase" json:"maxPerBase"`
-		QueueLimit  int `yaml:"queueLimit" json:"queueLimit"`
+		// MemoryBytes and DiskBytes cap the aggregate declared peak footprint
+		// of concurrently executing durable operations.
+		MemoryBytes       int64 `yaml:"memoryBytes" json:"memoryBytes"`
+		DiskBytes         int64 `yaml:"diskBytes" json:"diskBytes"`
+		DiskLowWaterBytes int64 `yaml:"diskLowWaterBytes" json:"diskLowWaterBytes"`
+		// UploadBytes caps the aggregate bytes retained by uploading, complete,
+		// and bound staging sessions.
+		UploadBytes int64 `yaml:"uploadBytes" json:"uploadBytes"`
+		// TempBytes caps in-process temporary staging reservations.
+		TempBytes  int64 `yaml:"tempBytes" json:"tempBytes"`
+		QueueLimit int   `yaml:"queueLimit" json:"queueLimit"`
 		// IdempotencyRetentionHours bounds the terminal response retry window.
 		// Zero retains bindings indefinitely.
 		IdempotencyRetentionHours int `yaml:"idempotencyRetentionHours" json:"idempotencyRetentionHours"`
@@ -249,6 +260,11 @@ func Defaults() Config {
 	c.Scheduler.ModelWaitMS = 2000
 	c.Scheduler.Maintenance = 1
 	c.Scheduler.MaxPerBase = 2
+	c.Scheduler.MemoryBytes = 2 << 30
+	c.Scheduler.DiskBytes = 10 << 30
+	c.Scheduler.DiskLowWaterBytes = 256 << 20
+	c.Scheduler.UploadBytes = 512 << 20
+	c.Scheduler.TempBytes = 1 << 30
 	c.Scheduler.QueueLimit = 1000
 	c.Scheduler.IdempotencyRetentionHours = 168
 	c.Models.WorkerIdleTimeoutMS = 60000
@@ -297,15 +313,68 @@ func (c Config) Normalized() Config {
 
 // Save writes the Knowledge-owned config file with private file permissions.
 func Save(path string, c Config) error {
+	return SaveContext(context.Background(), path, c)
+}
+
+// SaveContext atomically writes the Knowledge-owned config file while
+// honoring cancellation between filesystem operations.
+func SaveContext(ctx context.Context, path string, c Config) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c = c.Normalized()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	temporary, err := os.CreateTemp(directory, ".config-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	removeTemporary = false
+	return nil
 }
 
 func applyEnv(cfg *Config) {
@@ -395,6 +464,11 @@ func (c *Config) clamp() {
 	c.Scheduler.ModelWaitMS = clampInt(c.Scheduler.ModelWaitMS, 100, 60000, 2000)
 	c.Scheduler.Maintenance = clampInt(c.Scheduler.Maintenance, 1, 2, 1)
 	c.Scheduler.MaxPerBase = clampInt(c.Scheduler.MaxPerBase, 1, 16, 2)
+	c.Scheduler.MemoryBytes = clampInt64(c.Scheduler.MemoryBytes, 64<<20, 100<<30, 2<<30)
+	c.Scheduler.DiskBytes = clampInt64(c.Scheduler.DiskBytes, 256<<20, 100<<30, 10<<30)
+	c.Scheduler.DiskLowWaterBytes = clampInt64(c.Scheduler.DiskLowWaterBytes, 16<<20, 100<<30, 256<<20)
+	c.Scheduler.UploadBytes = clampInt64(c.Scheduler.UploadBytes, 100<<20, 100<<30, 512<<20)
+	c.Scheduler.TempBytes = clampInt64(c.Scheduler.TempBytes, 1<<20, 100<<30, 1<<30)
 	c.Scheduler.QueueLimit = clampInt(c.Scheduler.QueueLimit, 1, 100000, 1000)
 	c.Scheduler.IdempotencyRetentionHours = clampInt(c.Scheduler.IdempotencyRetentionHours, 0, 87600, 168)
 	c.Models.WorkerIdleTimeoutMS = clampInt(c.Models.WorkerIdleTimeoutMS, 0, 24*3600*1000, 60000)
@@ -433,6 +507,16 @@ func (c *Config) clamp() {
 }
 
 func clampInt(v, lo, hi, fallback int) int {
+	if v < lo {
+		return fallback
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clampInt64(v, lo, hi, fallback int64) int64 {
 	if v < lo {
 		return fallback
 	}

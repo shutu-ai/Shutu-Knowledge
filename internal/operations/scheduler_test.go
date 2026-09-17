@@ -15,6 +15,40 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
+func TestSchedulerReservesDeclaredByteBudgets(t *testing.T) {
+	scheduler := newScheduler(ResourceLimits{
+		IO: 1, DBWrite: 1, Disk: 1, Network: 1, Model: 1, Maintenance: 1,
+		MaxPerBase: 2, MemoryBytes: 100, DiskBytes: 100, TempBytes: 100,
+	})
+	budget := ResourceBudget{MemoryBytes: 60, DiskBytes: 70, TempBytes: 80}
+	if !scheduler.reserve("base-a", budget) {
+		t.Fatal("first byte reservation was rejected")
+	}
+	if scheduler.reserve("base-b", ResourceBudget{MemoryBytes: 41, DiskBytes: 30, TempBytes: 20}) {
+		t.Fatal("reservation exceeded aggregate byte budget")
+	}
+	snapshot := scheduler.snapshot(nil)
+	if snapshot.ReservedMemoryBytes != 60 || snapshot.ReservedDiskBytes != 70 || snapshot.ReservedTempBytes != 80 {
+		t.Fatalf("reserved bytes = %d/%d/%d, want 60/70/80", snapshot.ReservedMemoryBytes, snapshot.ReservedDiskBytes, snapshot.ReservedTempBytes)
+	}
+	scheduler.release("base-a", budget)
+	if !scheduler.reserve("base-b", ResourceBudget{MemoryBytes: 41, DiskBytes: 30, TempBytes: 20}) {
+		t.Fatal("reservation was not released after operation completion")
+	}
+}
+
+func TestPriorityAgingPreventsStarvation(t *testing.T) {
+	const at int64 = 20 * 1000
+	oldLow := effectivePriority(0, 0, at)
+	newHigh := effectivePriority(10, 19*1000, at)
+	if oldLow < newHigh {
+		t.Fatalf("aged low priority = %d, new high priority = %d", oldLow, newHigh)
+	}
+	if effectivePriority(0, at, at) != 0 {
+		t.Fatal("future or current requests must not receive an aging bonus")
+	}
+}
+
 func TestResourceLanesRunIndependently(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "scheduler.db"))
 	if err != nil {
@@ -534,4 +568,78 @@ func TestModelOperationsShareAdmission(t *testing.T) {
 		t.Fatalf("operation did not release shared admission: %v", err)
 	}
 	releaseAfterOperation()
+}
+
+func TestPerBaseQuotaDoesNotStarveAnotherBase(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "per-base-fairness.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := New(db, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetResourceLimits(ResourceLimits{IO: 2, DBWrite: 1, Disk: 1, Network: 1, Model: 1, Maintenance: 1, MaxPerBase: 1})
+	startedA := make(chan struct{})
+	startedB := make(chan struct{})
+	releaseA := make(chan struct{})
+	var startedAOnce sync.Once
+	service.Register("blocked_base_work", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		startedAOnce.Do(func() { close(startedA) })
+		<-releaseA
+		return map[string]any{"ok": true}, nil
+	})
+	service.Register("quick_base_work", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		close(startedB)
+		return map[string]any{"ok": true}, nil
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(service.Stop)
+
+	first, err := service.Submit(context.Background(), Request{
+		Type: "blocked_base_work", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-a", ResourceClass: ResourceIO, Payload: json.RawMessage(`{"slot":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-startedA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("base-a work did not start")
+	}
+	second, err := service.Submit(context.Background(), Request{
+		Type: "blocked_base_work", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-a", ResourceClass: ResourceIO, Payload: json.RawMessage(`{"slot":2}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State != StateQueued {
+		t.Fatalf("same-base work state = %s, want queued", second.State)
+	}
+	other, err := service.Submit(context.Background(), Request{
+		Type: "quick_base_work", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-b", ResourceClass: ResourceIO, Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-startedB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("base-b work was starved by base-a quota")
+	}
+	if current, err := service.Get(second.ID); err != nil {
+		t.Fatal(err)
+	} else if current.State != StateQueued {
+		t.Fatalf("same-base queued work started early: %+v", current)
+	}
+	waitForState(t, service, other.ID, StateSucceeded)
+	close(releaseA)
+	waitForState(t, service, first.ID, StateSucceeded)
+	waitForState(t, service, second.ID, StateSucceeded)
 }

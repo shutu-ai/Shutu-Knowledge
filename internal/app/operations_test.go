@@ -2,8 +2,15 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,17 +23,18 @@ type gatedBatchEmbedder struct {
 	firstRelease  chan struct{}
 	secondStarted chan struct{}
 	secondRelease chan struct{}
+	firstOnce     sync.Once
+	secondOnce    sync.Once
+	calls         atomic.Int32
 }
 
 func (e *gatedBatchEmbedder) Embed(_ context.Context, texts []string) ([][]float64, error) {
-	switch {
-	case e.firstStarted != nil:
-		close(e.firstStarted)
-		e.firstStarted = nil
+	switch e.calls.Add(1) {
+	case 1:
+		e.firstOnce.Do(func() { close(e.firstStarted) })
 		<-e.firstRelease
-	case e.secondStarted != nil:
-		close(e.secondStarted)
-		e.secondStarted = nil
+	case 2:
+		e.secondOnce.Do(func() { close(e.secondStarted) })
 		<-e.secondRelease
 	default:
 		return nil, context.Canceled
@@ -58,6 +66,376 @@ func waitForAppOperation(t *testing.T, application *App, id, want string) operat
 			t.Fatalf("operation %s state = %s, want %s", id, op.State, want)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAppOperationEnricherCapturesNonSecretReplayMetadata(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	application, err := New(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("Envelope Base", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.Config.Embedding.APIKey = "secret-api-key"
+	payload, err := json.Marshal(importTextCommand{Title: "Envelope", Content: "replay metadata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := application.Operations.Submit(context.Background(), operations.Request{
+		Type: "import_text", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: payload, IdempotencyKey: "app-envelope-key",
+		PreallocateDocument: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.PrincipalRef == "" || op.ScopeRef != "base:"+base.ID || op.InputSHA256 == "" ||
+		!strings.HasPrefix(op.ConfigSnapshotRef, "config:") || !strings.HasPrefix(op.ModelSnapshotRef, "model:") ||
+		op.SourceVersion == "" || op.ExpectedTargetEpoch == nil || op.ExpectedAncestorEpoch == nil ||
+		!strings.HasPrefix(op.SourceVersion, "base:") || strings.Contains(op.ConfigSnapshotRef, "secret-api-key") {
+		t.Fatalf("operation replay metadata = %+v", op)
+	}
+	if recovered := waitForAppOperation(t, application, op.ID, operations.StateSucceeded); recovered.ID != op.ID {
+		t.Fatalf("completed operation changed identity: %+v", recovered)
+	}
+	items, err := application.Operations.ListItems(context.Background(), op.ID, 10)
+	if err != nil || len(items) != 1 || items[0].ItemKey != op.DocumentID || !items[0].Committed {
+		t.Fatalf("import publication marker = %+v, err=%v", items, err)
+	}
+	if err := application.Knowledge.DeleteBase(base.ID); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := application.Operations.Submit(context.Background(), operations.Request{
+		Type: "import_text", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: payload, IdempotencyKey: "app-envelope-key",
+		PreallocateDocument: true,
+	})
+	if err != nil || replayed.ID != op.ID {
+		t.Fatalf("replay after target deletion = %+v, err=%v", replayed, err)
+	}
+}
+
+func TestImportFilesOperationPersistsStableItemAllocations(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("Batch envelope", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []knowledge.AddFilesItem{
+		{FileName: "first.txt", ContentBase64: base64.StdEncoding.EncodeToString([]byte("first batch file"))},
+		{FileName: "second.txt", ContentBase64: base64.StdEncoding.EncodeToString([]byte("second batch file"))},
+	}
+	payload, err := json.Marshal(importFilesCommand{Files: files, Conflict: "rename"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := len(files)
+	op, err := application.Operations.Submit(ctx, operations.Request{
+		Type: "import_files", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: payload, TotalUnits: &total, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op = waitForAppOperation(t, application, op.ID, operations.StateSucceeded)
+	items, err := application.Operations.ListItems(ctx, op.ID, 10)
+	if err != nil || len(items) != len(files) {
+		t.Fatalf("batch item markers = %+v, err=%v", items, err)
+	}
+	seenIDs := map[string]bool{}
+	allocatedIDs := make([]string, len(items))
+	for index, item := range items {
+		if item.State != operations.ItemCommitted || !item.Committed {
+			t.Fatalf("batch item %d not committed: %+v", index, item)
+		}
+		var allocation importFileAllocation
+		if err := json.Unmarshal(item.Result, &allocation); err != nil || allocation.DocumentID == "" || seenIDs[allocation.DocumentID] {
+			t.Fatalf("batch item %d allocation = %s, err=%v", index, item.Result, err)
+		}
+		allocatedIDs[index] = allocation.DocumentID
+		seenIDs[allocation.DocumentID] = true
+	}
+	replayFiles := []knowledge.AddFilesItem{
+		{FileName: "first.txt", ContentBase64: files[0].ContentBase64},
+		{FileName: "second.txt", ContentBase64: files[1].ContentBase64},
+	}
+	replay := op
+	replay.Attempt++
+	if err := application.prepareImportFilesOperation(ctx, replay, replayFiles); err != nil {
+		t.Fatal(err)
+	}
+	for index, file := range replayFiles {
+		if file.DocumentID != allocatedIDs[index] {
+			t.Fatalf("replay changed item %d allocation: got %q want %q", index, file.DocumentID, allocatedIDs[index])
+		}
+	}
+	documents, err := application.Knowledge.ListDocuments(base.ID)
+	if err != nil || len(documents) != len(files) {
+		t.Fatalf("batch documents = %d, err=%v", len(documents), err)
+	}
+}
+
+func TestImportFilesExecutorSkipsResolvedItems(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("Resolved batch", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []knowledge.AddFilesItem{{
+		FileName:      "already-committed.txt",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte("must not be imported")),
+	}}
+	payload, err := json.Marshal(importFilesCommand{Files: files, Conflict: "replace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations.SetTestPreDispatchHook(func(op operations.Operation) {
+		if op.Type != "import_files" {
+			return
+		}
+		if err := application.Operations.MarkItem(ctx, op.ID, op.Attempt,
+			importFilesItemKey(0, files[0].FileName), operations.ItemCommitted,
+			importFileAllocation{DocumentID: "historical-document-id"}, "", ""); err != nil {
+			t.Errorf("seed resolved batch item: %v", err)
+		}
+	})
+	t.Cleanup(func() { operations.SetTestPreDispatchHook(nil) })
+	total := 1
+	op, err := application.Operations.Submit(ctx, operations.Request{
+		Type: "import_files", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: payload, TotalUnits: &total, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op = waitForAppOperation(t, application, op.ID, operations.StateSucceeded); op.State != operations.StateSucceeded {
+		t.Fatalf("resolved batch operation: %+v", op)
+	}
+	documents, err := application.Knowledge.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(documents) != 0 {
+		t.Fatalf("resolved batch item produced business effect: %+v", documents)
+	}
+}
+
+func TestDirectoryExecutorsSkipResolvedAggregates(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("Resolved directory", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "tracked-directory")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := application.Knowledge.CreateDirectory(base.ID, "tracked-directory", "", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	operations.SetTestPreDispatchHook(func(op operations.Operation) {
+		var itemKey string
+		switch op.Type {
+		case "import_directory":
+			tracked, findErr := application.Knowledge.FindDirectoryByPath(op.BaseID, root)
+			if findErr != nil {
+				t.Errorf("find tracked directory for import marker: %v", findErr)
+				return
+			}
+			itemKey = tracked.ID
+		case "rescan_directory", "delete_directory":
+			itemKey = op.DocumentID
+		default:
+			return
+		}
+		if err := application.Operations.MarkItem(ctx, op.ID, op.Attempt, itemKey,
+			operations.ItemCommitted, nil, "", ""); err != nil {
+			t.Errorf("seed directory aggregate marker: %v", err)
+		}
+	})
+	t.Cleanup(func() { operations.SetTestPreDispatchHook(nil) })
+
+	pathPayload, err := json.Marshal(importDirectoryCommand{Path: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	importOp, err := application.Operations.Submit(ctx, operations.Request{
+		Type: "import_directory", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, Payload: pathPayload, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForAppOperation(t, application, importOp.ID, operations.StateSucceeded)
+
+	for _, kind := range []string{"rescan_directory", "delete_directory"} {
+		payload, err := json.Marshal(documentCommand{DocumentID: directory.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		op, err := application.Operations.Submit(ctx, operations.Request{
+			Type: kind, CommandSchemaVersion: operations.CommandSchemaV1,
+			BaseID: base.ID, DocumentID: directory.ID, Payload: payload,
+			ResourceClass: operations.ResourceIO,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitForAppOperation(t, application, op.ID, operations.StateSucceeded)
+	}
+	if current, _, err := application.Knowledge.GetDocument(directory.ID, false); err != nil || current.Status != knowledge.StatusReady {
+		t.Fatalf("resolved directory operations changed the document: %+v %v", current, err)
+	}
+}
+
+func TestSingletonExecutorsSkipResolvedEffects(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	target := filepath.Join(t.TempDir(), "model-cache")
+	markers := map[string]string{
+		"download_ocr_model":         "effect:download_ocr_model",
+		"remove_ocr_model":           "effect:remove_ocr_model",
+		"download_model":             "effect:download_model:embedding:fixture-model",
+		"remove_model":               "effect:remove_model:fixture-model",
+		"self_test_reranker":         "effect:self_test_reranker:fixture-reranker",
+		"plan_model_cache_migration": "effect:plan_model_cache_migration:" + target,
+		"migrate_model_cache":        "effect:migrate_model_cache:" + target + ":false",
+		"ollama_pull":                "effect:ollama_pull:fixture:latest",
+		"ollama_delete":              "effect:ollama_delete:fixture:latest",
+		"maintenance_storage":        "effect:maintenance_storage:false:false:true:false:false:0",
+	}
+	operations.SetTestPreDispatchHook(func(op operations.Operation) {
+		itemKey := markers[op.Type]
+		if itemKey == "" {
+			return
+		}
+		if err := application.Operations.MarkItem(ctx, op.ID, op.Attempt, itemKey,
+			operations.ItemCommitted, map[string]any{"replayed": true, "operationType": op.Type}, "", ""); err != nil {
+			t.Errorf("seed %s marker: %v", op.Type, err)
+		}
+	})
+	t.Cleanup(func() { operations.SetTestPreDispatchHook(nil) })
+	cases := []struct {
+		kind    string
+		payload any
+		class   string
+	}{
+		{"download_ocr_model", map[string]any{}, operations.ResourceModel},
+		{"remove_ocr_model", map[string]any{}, operations.ResourceModel},
+		{"download_model", map[string]any{"id": "fixture-model", "kind": "embedding"}, operations.ResourceModel},
+		{"remove_model", map[string]any{"id": "fixture-model", "kind": "embedding"}, operations.ResourceModel},
+		{"self_test_reranker", map[string]any{"id": "fixture-reranker"}, operations.ResourceModel},
+		{"plan_model_cache_migration", map[string]any{"targetDir": target}, operations.ResourceIO},
+		{"migrate_model_cache", map[string]any{"targetDir": target}, operations.ResourceIO},
+		{"ollama_pull", map[string]any{"model": "fixture:latest"}, operations.ResourceNetwork},
+		{"ollama_delete", map[string]any{"model": "fixture:latest"}, operations.ResourceNetwork},
+		{"maintenance_storage", map[string]any{"sqliteOnly": true}, operations.ResourceMaintenance},
+	}
+	for index, testCase := range cases {
+		payload, err := json.Marshal(testCase.payload)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", testCase.kind, err)
+		}
+		op, err := application.Operations.Submit(ctx, operations.Request{
+			Type: testCase.kind, CommandSchemaVersion: operations.CommandSchemaV1,
+			Payload: payload, ResourceClass: testCase.class,
+			IdempotencyKey: fmt.Sprintf("resolved-singleton-%d", index),
+		})
+		if err != nil {
+			t.Fatalf("submit %s: %v", testCase.kind, err)
+		}
+		completed := waitForAppOperation(t, application, op.ID, operations.StateSucceeded)
+		items, err := application.Operations.ListItems(ctx, op.ID, 5)
+		if err != nil || len(items) != 1 || len(items[0].Result) == 0 {
+			t.Fatalf("resolved %s marker result = %+v, err=%v", testCase.kind, items, err)
+		}
+		if string(completed.Result) != string(items[0].Result) {
+			t.Fatalf("resolved %s result was not recovered from marker: operation=%s marker=%s", testCase.kind, completed.Result, items[0].Result)
+		}
+	}
+}
+
+func TestResolvedURLOperationConsumesLeftoverCapture(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("URL cleanup", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := application.Knowledge.AddTextDocument(ctx, base.ID, "already published", "published body")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	operations.SetTestPreDispatchHook(func(op operations.Operation) {
+		if op.Type != "import_url" {
+			return
+		}
+		if _, err := application.Operations.EnsureURLCapture(ctx, op.ID,
+			"https://example.invalid/source", "https://example.invalid/source", "text/plain",
+			[]byte("captured body")); err != nil {
+			t.Errorf("seed URL capture: %v", err)
+			return
+		}
+		if err := application.Operations.MarkItem(ctx, op.ID, op.Attempt, op.DocumentID,
+			operations.ItemCommitted, map[string]any{"published": true}, "", ""); err != nil {
+			t.Errorf("seed URL marker: %v", err)
+		}
+	})
+	t.Cleanup(func() { operations.SetTestPreDispatchHook(nil) })
+
+	payload, err := json.Marshal(importURLCommand{URL: "https://example.invalid/source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := application.Operations.Submit(ctx, operations.Request{
+		Type: "import_url", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, DocumentID: doc.ID, Payload: payload,
+		ResourceClass: operations.ResourceNetwork, IdempotencyKey: "url-cleanup-replay",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForAppOperation(t, application, op.ID, operations.StateSucceeded)
+	capture, err := application.Operations.GetURLCapture(ctx, op.ID)
+	if err != nil || capture.State != operations.URLStateConsumed || len(capture.Body) != 0 {
+		t.Fatalf("resolved URL capture = %+v, err=%v", capture, err)
 	}
 }
 
@@ -152,6 +530,14 @@ func TestCancelBatchReindexKeepsCommittedPartialResult(t *testing.T) {
 	}
 	if result.Succeeded != 1 || result.Failed != 0 || result.Skipped != 0 || !result.Partial {
 		t.Fatalf("partial result = %+v", result)
+	}
+	items, err := application.Operations.ListItems(context.Background(), op.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].ItemKey != first.ID || !items[0].Committed ||
+		items[1].ItemKey != second.ID || items[1].State != operations.ItemCancelled || items[1].Committed {
+		t.Fatalf("partial operation items = %+v", items)
 	}
 	ready, _, err := application.Knowledge.GetDocument(first.ID, false)
 	if err != nil || ready.Status != knowledge.StatusReady {
@@ -676,5 +1062,94 @@ func TestDurableDeleteCleanupContinuesAfterCommittedCancel(t *testing.T) {
 	}
 	if _, err := application.Operations.Retry(operationID); err == nil {
 		t.Fatal("successful cleanup accepted retry after committed cancel intent")
+	}
+}
+
+func TestDurableDeleteReplayResumesCommittedPhysicalCleanup(t *testing.T) {
+	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	ctx := context.Background()
+	application, err := New(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(application.Close)
+	base, err := application.Knowledge.CreateBase("Replay Cleanup", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := application.Knowledge.AddFileDocument(ctx, base.ID, "replay.txt", []byte("logical fence and physical cleanup"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.RawFilePath == "" {
+		t.Fatal("file document did not publish a raw path")
+	}
+	rawPath := filepath.Join(application.RawStore.Root(), filepath.FromSlash(document.RawFilePath))
+	if err := os.Remove(rawPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rawPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rawPath, "blocker"), []byte("keep cleanup failing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The directory-shaped raw path makes the logical fence commit but forces
+	// the subsequent physical remove to fail. This is the crash/cleanup window
+	// that a committed item marker must not hide on replay.
+	payload, err := json.Marshal(documentCommand{DocumentID: document.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 1
+	op, err := application.Operations.Submit(ctx, operations.Request{
+		Type: "delete_document", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: base.ID, DocumentID: document.ID, Payload: payload,
+		TotalUnits: &total, ResourceClass: operations.ResourceIO,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		current, getErr := application.Operations.Get(op.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if current.State == operations.StateFailed {
+			op = current
+			break
+		}
+		if current.State == operations.StateSucceeded || current.State == operations.StateCancelled || time.Now().After(deadline) {
+			t.Fatalf("initial cleanup failure state = %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	items, err := application.Operations.ListItems(ctx, op.ID, 10)
+	if err != nil || len(items) != 1 || !items[0].Committed {
+		t.Fatalf("logical delete marker after cleanup failure = %+v, err=%v", items, err)
+	}
+	if err := os.RemoveAll(rawPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Operations.Retry(op.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		current, getErr := application.Operations.Get(op.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if current.State == operations.StateSucceeded {
+			break
+		}
+		if current.State == operations.StateFailed || current.State == operations.StateCancelled || time.Now().After(deadline) {
+			t.Fatalf("cleanup replay state = %+v", current)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(rawPath); !os.IsNotExist(err) {
+		t.Fatalf("raw cleanup replay left path, err=%v", err)
 	}
 }

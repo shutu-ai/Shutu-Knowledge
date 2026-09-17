@@ -292,7 +292,7 @@ func TestSlowModelAndSustainedQueueDemandStayResourceBounded(t *testing.T) {
 	submitP95 := percentileLatency(submitLatencies, .95)
 	rejectP95 := percentileLatency(rejectionLatencies, .95)
 	readerP95 := percentileLatency(readerLatencies, .95)
-	if submitP95 > time.Second || rejectP95 > time.Second || readerP95 > time.Second || drain > 3*time.Second {
+	if submitP95 > time.Second || rejectP95 > time.Second || readerP95 > time.Second || drain > resourceDrainBudget {
 		t.Fatalf("unbounded slow-model control path: submitP95=%s rejectP95=%s readerP95=%s drain=%s",
 			submitP95, rejectP95, readerP95, drain)
 	}

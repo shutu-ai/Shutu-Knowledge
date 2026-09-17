@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestFormatListenErrorExplainsAddressConflict(t *testing.T) {
@@ -19,5 +21,23 @@ func TestFormatListenErrorExplainsAddressConflict(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Fatalf("listen error missing %q: %s", want, message)
 		}
+	}
+}
+
+type blockingHTTPShutdowner struct{}
+
+func (blockingHTTPShutdowner) Shutdown(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestShutdownServerWithTimeoutBoundsUncooperativeHandler(t *testing.T) {
+	started := time.Now()
+	err := shutdownServerWithTimeout(blockingHTTPShutdowner{}, 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("shutdown exceeded bounded test budget: %s", elapsed)
 	}
 }

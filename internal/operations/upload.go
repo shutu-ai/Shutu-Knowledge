@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 // MaxUploadBytes is the P1 static admission budget for one staged input.
@@ -25,6 +27,8 @@ var (
 	ErrUploadSizeMismatch  = errors.New("uploaded size does not match the declared size")
 	ErrUploadHashMismatch  = errors.New("uploaded hash does not match the declared hash")
 	ErrUploadTooLarge      = errors.New("upload exceeds the configured size limit")
+	ErrUploadQuotaExceeded = errors.New("aggregate upload quota exceeded")
+	ErrTempQuotaExceeded   = errors.New("temporary staging quota exceeded")
 	ErrUploadStorageNotSet = errors.New("upload staging storage is not configured")
 )
 
@@ -69,6 +73,9 @@ func (s *Service) CreateUpload(ctx context.Context, create UploadCreate) (Upload
 	if create.ExpectedSize != nil && (*create.ExpectedSize < 0 || *create.ExpectedSize > MaxUploadBytes) {
 		return Upload{}, fmt.Errorf("%w (%d bytes)", ErrUploadTooLarge, MaxUploadBytes)
 	}
+	if create.ExpectedSize != nil && *create.ExpectedSize > s.uploadBytesLimit {
+		return Upload{}, fmt.Errorf("%w: expected upload is %d bytes, aggregate limit is %d bytes", ErrUploadQuotaExceeded, *create.ExpectedSize, s.uploadBytesLimit)
+	}
 	if create.ExpectedSHA256 != "" && len(create.ExpectedSHA256) != 64 {
 		return Upload{}, fmt.Errorf("expectedSha256 must be a SHA-256 hex digest")
 	}
@@ -88,7 +95,7 @@ func (s *Service) CreateUpload(ctx context.Context, create UploadCreate) (Upload
 	if err != nil {
 		return Upload{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO upload_sessions
+	if _, err := s.db.ExecPriority(ctx, storage.ControlWrite, `INSERT INTO upload_sessions
 		(id, base_id, parent_directory_id, file_name, state, expected_size, expected_sha256,
 		 staging_path, created_at, updated_at, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -106,7 +113,7 @@ func (s *Service) PutUploadContent(ctx context.Context, id string, body io.Reade
 	if s.uploadRoot == "" {
 		return Upload{}, ErrUploadStorageNotSet
 	}
-	session, err := s.GetUpload(id)
+	session, err := s.GetUploadContext(ctx, id)
 	if err != nil {
 		return Upload{}, err
 	}
@@ -117,6 +124,19 @@ func (s *Service) PutUploadContent(ctx context.Context, id string, body io.Reade
 	if err != nil {
 		return Upload{}, err
 	}
+	reservation := int64(MaxUploadBytes)
+	if session.ExpectedSize != nil && *session.ExpectedSize > 0 && *session.ExpectedSize < reservation {
+		reservation = *session.ExpectedSize
+	}
+	if !s.reserveTemp(reservation) {
+		return Upload{}, fmt.Errorf("%w: requested=%d limit=%d", ErrTempQuotaExceeded, reservation, s.tempBytesLimit)
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			s.releaseTemp(reservation)
+		}
+	}()
 	// Stage in the same directory and publish by rename. Never unlink the old
 	// staging file first: an unbound retry may safely replace it, but a crash
 	// must not expose a missing or truncated durable input.
@@ -157,52 +177,111 @@ func (s *Service) PutUploadContent(ctx context.Context, id string, body io.Reade
 		_ = os.Remove(tempPath)
 		return Upload{}, err
 	}
+	s.releaseTemp(reservation)
+	reserved = false
 	if testUploadAfterPublish != nil {
 		testUploadAfterPublish()
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE upload_sessions SET size_bytes = ?, sha256 = ?,
+	if _, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE upload_sessions SET size_bytes = ?, sha256 = ?,
 		updated_at = ? WHERE id = ? AND state = ?`, size, checksum, now(), id, UploadStateUploading); err != nil {
 		_ = os.Remove(stagingPath)
 		return Upload{}, err
 	}
-	return s.GetUpload(id)
+	return s.GetUploadContext(ctx, id)
+}
+
+func (s *Service) reserveTemp(bytes int64) bool {
+	s.tempMu.Lock()
+	defer s.tempMu.Unlock()
+	// The in-process reservation is atomic. Existing on-disk partials are
+	// removed during startup ownership recovery; avoiding a recursive disk
+	// walk here keeps every upload admission bounded on a large raw corpus.
+	if s.tempBytesLimit > 0 && s.tempReserved+bytes > s.tempBytesLimit {
+		return false
+	}
+	s.tempReserved += bytes
+	return true
+}
+
+func (s *Service) releaseTemp(bytes int64) {
+	s.tempMu.Lock()
+	s.tempReserved -= bytes
+	if s.tempReserved < 0 {
+		s.tempReserved = 0
+	}
+	s.tempMu.Unlock()
 }
 
 func (s *Service) CompleteUpload(ctx context.Context, id string) (Upload, error) {
-	session, err := s.GetUpload(id)
-	if err != nil {
-		return Upload{}, err
-	}
-	if session.State == UploadStateComplete || session.State == UploadStateBound {
-		return session, nil
-	}
-	if session.State != UploadStateUploading {
-		return Upload{}, fmt.Errorf("%w: %s", ErrUploadState, session.State)
-	}
-	if session.SizeBytes <= 0 || session.SHA256 == "" {
-		return Upload{}, ErrUploadNotComplete
-	}
-	if session.ExpectedSize != nil && session.SizeBytes != *session.ExpectedSize {
-		return Upload{}, ErrUploadSizeMismatch
-	}
-	if session.ExpectedSHA256 != "" && session.SHA256 != session.ExpectedSHA256 {
-		return Upload{}, ErrUploadHashMismatch
-	}
 	if _, err := s.uploadPath(id); err != nil {
 		return Upload{}, err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE upload_sessions SET state = ?, updated_at = ?
-		WHERE id = ? AND state = ?`, UploadStateComplete, now(), id, UploadStateUploading); err != nil {
+	err := s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		var state, sha, expectedSHA string
+		var size int64
+		var expectedSize sql.NullInt64
+		if err := tx.QueryRow(`SELECT state, size_bytes, sha256, expected_size, COALESCE(expected_sha256, '')
+			FROM upload_sessions WHERE id = ?`, id).Scan(&state, &size, &sha, &expectedSize, &expectedSHA); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrUploadNotFound
+			}
+			return err
+		}
+		if state == UploadStateComplete || state == UploadStateBound {
+			return nil
+		}
+		if state != UploadStateUploading {
+			return fmt.Errorf("%w: %s", ErrUploadState, state)
+		}
+		if size <= 0 || sha == "" {
+			return ErrUploadNotComplete
+		}
+		if expectedSize.Valid && size != expectedSize.Int64 {
+			return ErrUploadSizeMismatch
+		}
+		if expectedSHA != "" && sha != expectedSHA {
+			return ErrUploadHashMismatch
+		}
+		var retained int64
+		if err := tx.QueryRow(`SELECT COALESCE(SUM(size_bytes), 0) FROM upload_sessions
+			WHERE id <> ? AND state IN (?, ?, ?)`, id, UploadStateUploading, UploadStateComplete, UploadStateBound).Scan(&retained); err != nil {
+			return err
+		}
+		if s.uploadBytesLimit > 0 && retained+size > s.uploadBytesLimit {
+			return fmt.Errorf("%w: retained=%d requested=%d limit=%d", ErrUploadQuotaExceeded, retained, size, s.uploadBytesLimit)
+		}
+		result, err := tx.Exec(`UPDATE upload_sessions SET state = ?, updated_at = ?
+			WHERE id = ? AND state = ?`, UploadStateComplete, now(), id, UploadStateUploading)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			return ErrUploadState
+		}
+		return nil
+	})
+	if err != nil {
 		return Upload{}, err
 	}
-	return s.GetUpload(id)
+	return s.GetUploadContext(ctx, id)
 }
 
 func (s *Service) GetUpload(id string) (Upload, error) {
+	return s.GetUploadContext(context.Background(), id)
+}
+
+func (s *Service) GetUploadContext(ctx context.Context, id string) (Upload, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var session Upload
 	var parentDirectory, expectedSHA, sha, operationID sql.NullString
 	var expectedSize sql.NullInt64
-	err := s.db.QueryRow(`SELECT id, base_id, parent_directory_id, file_name, state,
+	err := s.db.QueryRowContext(ctx, `SELECT id, base_id, parent_directory_id, file_name, state,
 		expected_size, expected_sha256, size_bytes, sha256, operation_id, created_at, updated_at, expires_at
 		FROM upload_sessions WHERE id = ?`, id).Scan(
 		&session.ID, &session.BaseID, &parentDirectory, &session.FileName, &session.State,
@@ -228,7 +307,11 @@ func (s *Service) GetUpload(id string) (Upload, error) {
 // UploadForOperation validates that a bound immutable input belongs to this
 // operation and returns its stable staging path.
 func (s *Service) UploadForOperation(operationID, uploadID string) (Upload, string, error) {
-	session, err := s.GetUpload(uploadID)
+	return s.UploadForOperationContext(context.Background(), operationID, uploadID)
+}
+
+func (s *Service) UploadForOperationContext(ctx context.Context, operationID, uploadID string) (Upload, string, error) {
+	session, err := s.GetUploadContext(ctx, uploadID)
 	if err != nil {
 		return Upload{}, "", err
 	}
@@ -243,8 +326,15 @@ func (s *Service) UploadForOperation(operationID, uploadID string) (Upload, stri
 }
 
 func (s *Service) releaseUpload(operationID string) error {
+	return s.releaseUploadContext(context.Background(), operationID)
+}
+
+func (s *Service) releaseUploadContext(ctx context.Context, operationID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var uploadID string
-	err := s.db.QueryRow(`SELECT id FROM upload_sessions WHERE operation_id = ? AND state = ?`,
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM upload_sessions WHERE operation_id = ? AND state = ?`,
 		operationID, UploadStateBound).Scan(&uploadID)
 	if err == sql.ErrNoRows {
 		return nil
@@ -256,11 +346,18 @@ func (s *Service) releaseUpload(operationID string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`UPDATE upload_sessions SET state = ?, updated_at = ?
+	// Publish the released lease only after the staging bytes are gone. This
+	// makes a terminal operation snapshot a safe observation point for callers:
+	// once the lease is released, no staging file can remain from this cleanup.
+	// A crash after removal but before the state update is recovered by the
+	// terminal-bound lease sweep during the next startup.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE upload_sessions SET state = ?, updated_at = ?
 		WHERE id = ? AND state = ?`, UploadStateReleased, now(), uploadID, UploadStateBound); err != nil {
 		return err
 	}
-	_ = os.Remove(path)
 	return nil
 }
 

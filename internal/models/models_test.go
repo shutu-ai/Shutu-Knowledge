@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,21 @@ import (
 	"testing"
 	"time"
 )
+
+func TestModelReadContextHonorsCancellation(t *testing.T) {
+	manager := NewManager(t.TempDir(), "https://huggingface.co", http.DefaultClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.GetContext(ctx, "owner/model"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled model lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := manager.ListPageContext(ctx, 10, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled model page lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := manager.OCRStatusContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled OCR status error = %v, want context.Canceled", err)
+	}
+}
 
 func TestManagerDownloadListAndRemove(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +75,77 @@ func TestManagerDownloadListAndRemove(t *testing.T) {
 	models, _ = manager.List()
 	if len(models) != 0 {
 		t.Fatalf("model was not removed: %+v", models)
+	}
+}
+
+func TestManagerListPageBoundsAndAdvances(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(root, "https://huggingface.co", http.DefaultClient)
+	for _, id := range []string{"owner/a", "owner/b", "owner/c"} {
+		dir, err := manager.modelDir(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "model.onnx"), []byte(id), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest := fmt.Sprintf(`{"id":%q,"kind":"embedding","artifacts":["model.onnx"]}`, id)
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := manager.ListPage(2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Models) != 2 || page.Models[0].ID != "owner/a" || page.Models[1].ID != "owner/b" || !page.HasMore || page.NextOffset != 2 {
+		t.Fatalf("first model page: %+v", page)
+	}
+	next, err := manager.ListPage(2, page.NextOffset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Models) != 1 || next.Models[0].ID != "owner/c" || next.HasMore || next.NextOffset != 0 {
+		t.Fatalf("last model page: %+v", next)
+	}
+	if _, err := manager.ListPage(2, -1); err == nil {
+		t.Fatal("negative model page offset should fail")
+	}
+
+	missing := NewManager(filepath.Join(t.TempDir(), "not-created"), "https://huggingface.co", http.DefaultClient)
+	empty, err := missing.ListPage(2, 0)
+	if err != nil || len(empty.Models) != 0 || empty.HasMore {
+		t.Fatalf("missing cache should be an empty page: %+v %v", empty, err)
+	}
+}
+
+func TestManagerCountContextDoesNotDecodeCatalog(t *testing.T) {
+	root := t.TempDir()
+	manager := NewManager(root, "https://huggingface.co", http.DefaultClient)
+	for _, id := range []string{"owner/a", "owner/b"} {
+		dir, err := manager.modelDir(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("not-json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count, err := manager.CountContext(context.Background())
+	if err != nil || count != 2 {
+		t.Fatalf("manifest count: %d %v", count, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.CountContext(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled count: %v", err)
 	}
 }
 
@@ -164,6 +251,101 @@ func TestManagerMigrateRemovesSourceExplicitly(t *testing.T) {
 	}
 	if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("empty source should be removed: %v", err)
+	}
+}
+
+func TestManagerMigrationCommitFailureRetainsSource(t *testing.T) {
+	source := t.TempDir()
+	modelDir := filepath.Join(source, "example", "model")
+	if err := os.MkdirAll(modelDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	modelFile := filepath.Join(modelDir, "model.onnx")
+	if err := os.WriteFile(modelFile, []byte("weights"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"id":"example/model","kind":"embedding","artifacts":["model.onnx"],"status":"ready"}`
+	if err := os.WriteFile(filepath.Join(modelDir, "manifest.json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(source, "https://huggingface.co", http.DefaultClient)
+	target := filepath.Join(t.TempDir(), "models")
+	commitErr := errors.New("config persistence failed")
+	if _, err := manager.MigrateContext(context.Background(), target, true, func() error { return commitErr }); !errors.Is(err, commitErr) {
+		t.Fatalf("migration commit error = %v", err)
+	}
+	if manager.Root() != filepath.Clean(source) {
+		t.Fatalf("active root changed after rejected commit: %s", manager.Root())
+	}
+	if _, err := os.Stat(modelFile); err != nil {
+		t.Fatalf("source model was not retained: %v", err)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted target remains: %v", err)
+	}
+}
+
+func TestManagerMigrationHonorsCanceledContext(t *testing.T) {
+	source := t.TempDir()
+	modelDir := filepath.Join(source, "example", "model")
+	if err := os.MkdirAll(modelDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "model.onnx"), []byte("weights"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"id":"example/model","kind":"embedding","artifacts":["model.onnx"],"status":"ready"}`
+	if err := os.WriteFile(filepath.Join(modelDir, "manifest.json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(source, "https://huggingface.co", http.DefaultClient)
+	target := filepath.Join(t.TempDir(), "models")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.MigrateContext(ctx, target, false, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled migration error = %v", err)
+	}
+	if manager.Root() != filepath.Clean(source) {
+		t.Fatalf("active root changed after cancellation: %s", manager.Root())
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled target remains: %v", err)
+	}
+}
+
+func TestManagerPlanMigrationHonorsCanceledContext(t *testing.T) {
+	manager := NewManager(t.TempDir(), "https://huggingface.co", http.DefaultClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.PlanMigrationContext(ctx, filepath.Join(t.TempDir(), "target")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled migration plan error = %v", err)
+	}
+}
+
+func TestManagerRemoveHonorsCanceledContext(t *testing.T) {
+	source := t.TempDir()
+	modelDir := filepath.Join(source, "example", "model")
+	if err := os.MkdirAll(filepath.Join(modelDir, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	modelFile := filepath.Join(modelDir, "nested", "weights.bin")
+	if err := os.WriteFile(modelFile, []byte("weights"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(source, "https://huggingface.co", http.DefaultClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.RemoveContext(ctx, "example/model"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled removal error = %v", err)
+	}
+	if _, err := os.Stat(modelFile); err != nil {
+		t.Fatalf("canceled removal changed model tree: %v", err)
+	}
+	if err := manager.RemoveContext(context.Background(), "example/model"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(modelDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retry did not remove model tree: %v", err)
 	}
 }
 

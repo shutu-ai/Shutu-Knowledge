@@ -25,6 +25,7 @@ import (
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	t.Setenv("SHUTU_KNOWLEDGE_HOME", t.TempDir())
+	t.Setenv("SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME", "1")
 	application, err := app.New(context.Background())
 	if err != nil {
 		t.Fatalf("app: %v", err)
@@ -70,6 +71,25 @@ func valueMap(t *testing.T, payload map[string]any) map[string]any {
 		t.Fatalf("expected object value: %v", payload)
 	}
 	return value
+}
+
+func waitOperation(t *testing.T, s *Server, operationID string) operations.Operation {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		op, err := s.app.Operations.Get(operationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch op.State {
+		case operations.StateSucceeded, operations.StateFailed, operations.StateCancelled, operations.StateInterrupted:
+			return op
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %s timeout: %+v", operationID, op)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func createTextDocument(t *testing.T, s *Server, baseID, title, content string) string {
@@ -204,6 +224,53 @@ func TestKnowledgeAPIRoundTrip(t *testing.T) {
 	code, payload = call(t, s, "GET", "/api/bases/does-not-exist", nil)
 	if code != http.StatusNotFound {
 		t.Fatalf("missing base: %d %v", code, payload)
+	}
+}
+
+func TestLegacyDocumentListProvidesBoundedCompatibilityMode(t *testing.T) {
+	s := newTestServer(t)
+	base, err := s.app.Knowledge.CreateBase("Paged documents", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	titles := []string{"one", "two", "three"}
+	for i := 0; i < 51; i++ {
+		titles = append(titles, fmt.Sprintf("bulk-%02d", i))
+	}
+	for _, title := range titles {
+		if _, err := s.app.Knowledge.AddTextDocument(context.Background(), base.ID, title, title+" body"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/bases/"+base.ID+"/documents?limit=2&offset=0", nil)
+	rec := httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bounded list status: %d %s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Value knowledge.DocumentListPage `json:"value"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Value.Total != len(titles) || len(envelope.Value.Documents) != 2 || !envelope.Value.HasMore {
+		t.Fatalf("bounded list = %+v", envelope.Value)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/bases/"+base.ID+"/documents", nil)
+	rec = httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || rec.Header().Get("Deprecation") != "true" {
+		t.Fatalf("legacy list status/header: %d %q", rec.Code, rec.Header().Get("Deprecation"))
+	}
+	var legacy struct {
+		Value []knowledge.DocumentSummary `json:"value"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Value) != 50 {
+		t.Fatalf("legacy compatibility page size = %d, want 50", len(legacy.Value))
 	}
 }
 
@@ -557,6 +624,7 @@ func TestManagedRuntimeModelAppearsInLocalModelList(t *testing.T) {
 	}
 	t.Cleanup(application.Close)
 	modelID := "onnx-community/Qwen3-Embedding-0.6B-ONNX"
+	application.Config.Embedding.Model = modelID
 	application.Runtime = &fakeManagedModelRuntime{health: runtime.Health{
 		Capability: runtime.CapabilityEmbedding, Model: modelID,
 		Status: "installed", Lifecycle: "INSTALLED", Version: "transformers.js/onnxruntime-node",
@@ -573,10 +641,22 @@ func TestManagedRuntimeModelAppearsInLocalModelList(t *testing.T) {
 	if item["id"] != modelID || item["status"] != "installed" || item["lifecycle"] != "INSTALLED" {
 		t.Fatalf("managed model state: %v", item)
 	}
-
-	code, _ := call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": modelID})
+	code, payload := call(t, s, "GET", "/api/local-models?limit=1&offset=0", nil)
 	if code != http.StatusOK {
-		t.Fatalf("remove managed model: %d", code)
+		t.Fatalf("paged managed model list: %d %v", code, payload)
+	}
+	paged := valueMap(t, payload)
+	if paged["hasMore"] != false || paged["nextOffset"] != float64(0) {
+		t.Fatalf("paged managed model metadata: %v", paged)
+	}
+
+	code, payload = call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": modelID})
+	if code != http.StatusAccepted {
+		t.Fatalf("remove managed model: %d %v", code, payload)
+	}
+	op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string))
+	if op.State != operations.StateSucceeded {
+		t.Fatalf("remove managed model operation: %+v", op)
 	}
 	if !application.Runtime.(*fakeManagedModelRuntime).removed {
 		t.Fatal("managed runtime remove was not called")
@@ -694,9 +774,12 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 		t.Fatalf("model/self-test state: %v", model)
 	}
 
-	code, _ = call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": "owner/custom-reranker"})
-	if code != http.StatusOK {
-		t.Fatalf("remove downloaded custom reranker: %d", code)
+	code, payload = call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": "owner/custom-reranker"})
+	if code != http.StatusAccepted {
+		t.Fatalf("remove downloaded custom reranker: %d %v", code, payload)
+	}
+	if op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string)); op.State != operations.StateSucceeded {
+		t.Fatalf("remove downloaded custom reranker operation: %+v", op)
 	}
 	_, payload = call(t, s, "GET", "/api/local-models", nil)
 	if models := valueMap(t, payload)["models"].([]any); len(models) != 0 {
@@ -707,9 +790,12 @@ func TestCustomRerankerRegistrationAndSelfTest(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("register missing reranker: %d", code)
 	}
-	code, _ = call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": "owner/missing-reranker"})
-	if code != http.StatusOK {
-		t.Fatalf("unregister missing reranker: %d", code)
+	code, payload = call(t, s, "POST", "/api/local-models/remove", map[string]any{"id": "owner/missing-reranker"})
+	if code != http.StatusAccepted {
+		t.Fatalf("unregister missing reranker: %d %v", code, payload)
+	}
+	if op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string)); op.State != operations.StateSucceeded {
+		t.Fatalf("unregister missing reranker operation: %+v", op)
 	}
 	_, payload = call(t, s, "GET", "/api/local-models", nil)
 	if models := valueMap(t, payload)["models"].([]any); len(models) != 0 {
@@ -775,12 +861,20 @@ func TestModelCacheMigrationAPI(t *testing.T) {
 
 	code, payload, raw := callRaw(t, s, "GET",
 		"/api/local-models/cache-migration?targetDir="+filepath.ToSlash(target), nil)
-	if code != http.StatusOK || strings.Contains(string(raw), "weights") {
+	if code != http.StatusAccepted || strings.Contains(string(raw), "weights") {
 		t.Fatalf("migration plan: %d %s", code, raw)
 	}
-	plan := valueMap(t, payload)
-	if len(plan["models"].([]any)) != 1 || plan["targetDir"] != filepath.Clean(target) {
-		t.Fatalf("migration plan value: %v", plan)
+	planOperationID := valueMap(t, payload)["operationId"].(string)
+	planOperation := waitOperation(t, s, planOperationID)
+	if planOperation.State != operations.StateSucceeded || strings.Contains(string(planOperation.Result), "weights") {
+		t.Fatalf("migration plan operation: %+v", planOperation)
+	}
+	var plan models.MigrationPlan
+	if err := json.Unmarshal(planOperation.Result, &plan); err != nil {
+		t.Fatalf("decode migration plan: %v", err)
+	}
+	if len(plan.Models) != 1 || plan.TargetDir != filepath.Clean(target) {
+		t.Fatalf("migration plan value: %+v", plan)
 	}
 
 	code, payload = call(t, s, "POST", "/api/local-models/cache-migration", map[string]any{
@@ -828,11 +922,14 @@ func TestModelCacheMigrationAPI(t *testing.T) {
 		t.Fatalf("migrated model list: %v", cache)
 	}
 
-	code, _ = call(t, s, "POST", "/api/local-models/cache-migration", map[string]any{
+	code, payload = call(t, s, "POST", "/api/local-models/cache-migration", map[string]any{
 		"targetDir": filepath.Join(target, "nested"), "removeSource": false,
 	})
-	if code != http.StatusBadRequest {
-		t.Fatalf("nested target should fail: %d", code)
+	if code != http.StatusAccepted {
+		t.Fatalf("nested target should be deferred to operation: %d %v", code, payload)
+	}
+	if op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string)); op.State != operations.StateFailed {
+		t.Fatalf("nested target operation should fail: %+v", op)
 	}
 }
 
@@ -866,12 +963,74 @@ func TestOCRModelAPIStatusAndRemove(t *testing.T) {
 	}
 
 	code, payload := call(t, s, "POST", "/api/ocr/model/remove", nil)
-	if code != http.StatusOK || valueMap(t, payload)["removed"] != true {
+	if code != http.StatusAccepted {
 		t.Fatalf("remove OCR model: %d %v", code, payload)
+	}
+	if op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string)); op.State != operations.StateSucceeded {
+		t.Fatalf("remove OCR model operation: %+v", op)
 	}
 	_, payload = call(t, s, "GET", "/api/ocr/model", nil)
 	if valueMap(t, payload)["status"] != "not-downloaded" {
 		t.Fatalf("OCR model was not removed: %v", payload)
+	}
+}
+
+func TestOCRModelDownloadHonorsRequestCancellation(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/ocr/model/download", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(rec, req)
+	if rec.Code == http.StatusAccepted {
+		t.Fatalf("cancelled OCR download request was accepted: %s", rec.Body.String())
+	}
+	var count int
+	if err := s.app.DB.QueryRow(`SELECT COUNT(*) FROM operations WHERE type = 'download_ocr_model'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cancelled OCR download created %d durable operations", count)
+	}
+}
+
+func TestOllamaModelRemoveUsesDurableOperation(t *testing.T) {
+	s := newTestServer(t)
+	requested := make(chan string, 1)
+	ollama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/delete" {
+			http.Error(w, "unexpected Ollama request", http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		requested <- body.Model
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(ollama.Close)
+	s.app.Ollama = models.NewOllama(ollama.URL, ollama.Client())
+
+	code, payload := call(t, s, "POST", "/api/ollama/delete", map[string]any{"model": "nomic-embed-text"})
+	if code != http.StatusAccepted {
+		t.Fatalf("delete Ollama model: %d %v", code, payload)
+	}
+	op := waitOperation(t, s, valueMap(t, payload)["jobId"].(string))
+	if op.State != operations.StateSucceeded {
+		t.Fatalf("delete Ollama operation: %+v", op)
+	}
+	select {
+	case model := <-requested:
+		if model != "nomic-embed-text" {
+			t.Fatalf("deleted Ollama model: %q", model)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Ollama delete request was not sent")
 	}
 }
 
@@ -1036,8 +1195,33 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 		t.Fatalf("raw inline: code=%d disposition=%q", rec.Code, disposition)
 	}
 
-	_, payload = call(t, s, "POST", "/api/bases/"+sourceID+"/restore", map[string]any{"name": "Restored"})
-	restored := valueMap(t, payload)
+	code, payload = call(t, s, "POST", "/api/bases/"+sourceID+"/restore", map[string]any{"name": "Restored"})
+	if code != http.StatusAccepted {
+		t.Fatalf("restore accepted: %d %v", code, payload)
+	}
+	restoreOperationID := valueMap(t, payload)["operationId"].(string)
+	deadline := time.Now().Add(8 * time.Second)
+	var restoreOperation operations.Operation
+	for {
+		restoreOperation, err = s.app.Operations.Get(restoreOperationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if restoreOperation.State == operations.StateSucceeded {
+			break
+		}
+		if restoreOperation.State == operations.StateFailed || restoreOperation.State == operations.StateCancelled {
+			t.Fatalf("restore operation ended %s: %s", restoreOperation.State, restoreOperation.ErrorMessage)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restore operation state = %s", restoreOperation.State)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var restored map[string]any
+	if err := json.Unmarshal(restoreOperation.Result, &restored); err != nil {
+		t.Fatalf("decode restore result: %v", err)
+	}
 	restoredID := restored["id"].(string)
 	if restoredID == sourceID || restored["name"] != "Restored" {
 		t.Fatalf("restore base: %v", restored)
@@ -1046,6 +1230,10 @@ func TestRawRestoreProbeAndIndexingAPI(t *testing.T) {
 	docs := payload["value"].([]any)
 	if len(docs) != 1 || docs[0].(map[string]any)["status"] != "ready" {
 		t.Fatalf("restored documents: %v", docs)
+	}
+	items, err := s.app.Operations.ListItems(context.Background(), restoreOperationID, 10)
+	if err != nil || len(items) != 1 || items[0].ItemKey != docID || !items[0].Committed {
+		t.Fatalf("restore item markers: %+v, err=%v", items, err)
 	}
 	code, payload = call(t, s, "POST", "/api/search", map[string]any{"query": "retry budget", "baseId": restoredID})
 	if code != http.StatusOK || valueMap(t, payload)["total"].(float64) != 1 {

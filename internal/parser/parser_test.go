@@ -985,7 +985,7 @@ func TestPDFReplacementRuneIsMarkedUnhealthy(t *testing.T) {
 func TestRegistryDispatchAndRejections(t *testing.T) {
 	registry := NewRegistry()
 	got := registry.SupportedExtensions()
-	if len(got) < 12 || !contains(got, "pdf") || !contains(got, "epub") {
+	if len(got) < 13 || !contains(got, "pdf") || !contains(got, "epub") || !contains(got, "xlsm") {
 		t.Fatalf("supported: %v", got)
 	}
 	if _, err := registry.Parse("archive.rar", []byte("x")); err == nil || !strings.Contains(err.Error(), "unsupported") {

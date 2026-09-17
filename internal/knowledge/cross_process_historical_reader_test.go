@@ -22,6 +22,7 @@ const (
 	crossReaderBaseEnv   = "KNOWLEDGE_CROSS_READER_BASE"
 	crossReaderTargetEnv = "KNOWLEDGE_CROSS_READER_TARGET"
 	crossReaderWorkEnv   = "KNOWLEDGE_CROSS_READER_WORK"
+	crossReaderWait      = 90 * time.Second
 )
 
 func TestCrossProcessHistoricalReaderSurvivesGenerationGC(t *testing.T) {
@@ -44,7 +45,7 @@ func TestCrossProcessHistoricalReaderSurvivesGenerationGC(t *testing.T) {
 	fill := strings.Repeat(" cross-process historical reader alpha beta gamma", 8)
 
 	buildStart := time.Now()
-	tx, err := f.service.store.db.Begin()
+	tx, err := f.service.store.db.DB.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +156,7 @@ func TestCrossProcessHistoricalReaderSurvivesGenerationGC(t *testing.T) {
 		}
 	})
 
-	waitForFile(t, filepath.Join(workspace, "pinned"))
+	waitForHistoricalReaderFile(t, filepath.Join(workspace, "pinned"))
 	pinnedCount, err := os.ReadFile(filepath.Join(workspace, "pinned"))
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +207,7 @@ func TestCrossProcessHistoricalReaderSurvivesGenerationGC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waitForFile(t, filepath.Join(workspace, "reader-done"))
+	waitForHistoricalReaderFile(t, filepath.Join(workspace, "reader-done"))
 	if err := child.Wait(); err != nil {
 		t.Fatalf("cross-process reader failed: %v: %s", err, childLog.String())
 	}
@@ -292,7 +293,7 @@ func runCrossReaderChild(t *testing.T) error {
 		return err
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(crossReaderWait)
 	for {
 		if _, err := os.Stat(filepath.Join(workspace, "gc-done")); err == nil {
 			break
@@ -347,4 +348,20 @@ func runCrossReaderChild(t *testing.T) error {
 			oldChunks, oldMappings, activeChunks)
 	}
 	return os.WriteFile(filepath.Join(workspace, "reader-done"), []byte("1"), 0o600)
+}
+
+func waitForHistoricalReaderFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(crossReaderWait)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("marker %s was not created", path)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }

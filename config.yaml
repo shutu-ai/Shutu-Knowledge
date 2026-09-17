@@ -73,6 +73,11 @@ scheduler:
   modelWaitMs: 2000
   maintenance: 1
   maxPerBase: 2
+  memoryBytes: 2147483648
+  diskBytes: 10737418240
+  diskLowWaterBytes: 268435456
+  uploadBytes: 536870912
+  tempBytes: 1073741824
   queueLimit: 1000
   idempotencyRetentionHours: 168
 maintenance:

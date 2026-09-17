@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -140,15 +141,147 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Payload = encoded
 	}
+	if body.Type == "import_files" {
+		var input struct {
+			Files             []json.RawMessage `json:"files"`
+			Conflict          string            `json:"conflict"`
+			ParentDirectoryID string            `json:"parentDirectoryId"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		if req.BaseID == "" || len(input.Files) == 0 {
+			writeOperationErr(w, errors.New("import_files requires baseId and at least one file"))
+			return
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		totalUnits := len(input.Files)
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceIO
+	}
+	if body.Type == "import_directory" {
+		var input struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		input.Path = strings.TrimSpace(input.Path)
+		if req.BaseID == "" || input.Path == "" {
+			writeOperationErr(w, errors.New("import_directory requires baseId and path"))
+			return
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		req.ResourceClass = operations.ResourceIO
+	}
+	if body.Type == "delete_documents" {
+		var input struct {
+			DocumentIDs []string `json:"documentIds"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		if req.BaseID == "" || len(input.DocumentIDs) == 0 {
+			writeOperationErr(w, errors.New("delete_documents requires baseId and documentIds"))
+			return
+		}
+		sort.Strings(input.DocumentIDs)
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		totalUnits := len(input.DocumentIDs)
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceIO
+	}
+	if body.Type == "delete_directory" || body.Type == "rescan_directory" || body.Type == "refresh_url" {
+		if req.DocumentID == "" {
+			var input struct {
+				DocumentID string `json:"documentId"`
+			}
+			if err := json.Unmarshal(body.Input, &input); err == nil {
+				req.DocumentID = strings.TrimSpace(input.DocumentID)
+			}
+		}
+		if req.DocumentID == "" {
+			writeOperationErr(w, errors.New("operation requires documentId"))
+			return
+		}
+		encoded, err := json.Marshal(map[string]string{"documentId": req.DocumentID})
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		req.ResourceClass = operations.ResourceIO
+		if body.Type == "refresh_url" {
+			req.ResourceClass = operations.ResourceNetwork
+		}
+		if body.Type != "rescan_directory" {
+			totalUnits := 1
+			req.TotalUnits = &totalUnits
+		}
+	}
+	if body.Type == "restore_base" {
+		var input struct {
+			Name   string           `json:"name"`
+			Config *json.RawMessage `json:"config"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		if req.BaseID == "" {
+			writeOperationErr(w, errors.New("restore_base requires source baseId"))
+			return
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		req.ResourceClass = operations.ResourceIO
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+	}
 	if body.Type == "reindex_document" {
 		if req.DocumentID == "" {
 			writeOperationErr(w, operations.ErrNotFound)
 			return
 		}
-		req.Payload = json.RawMessage("{}")
+		encoded, err := json.Marshal(map[string]string{"documentId": req.DocumentID})
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
 		totalUnits := 1
 		req.TotalUnits = &totalUnits
 		req.ResourceClass = "io"
+		if req.IdempotencyKey == "" {
+			key, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), req.BaseID, []string{req.DocumentID})
+			if err != nil {
+				writeOperationErr(w, err)
+				return
+			}
+			req.IdempotencyKey = key
+		}
 	}
 	if body.Type == "delete_base" {
 		if req.BaseID == "" {
@@ -156,6 +289,9 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Payload = json.RawMessage("{}")
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceIO
 	}
 	if body.Type == "reindex_base" {
 		if req.BaseID == "" {
@@ -164,6 +300,14 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Payload = json.RawMessage("{}")
 		req.ResourceClass = "io"
+		if req.IdempotencyKey == "" {
+			key, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), req.BaseID, nil)
+			if err != nil {
+				writeOperationErr(w, err)
+				return
+			}
+			req.IdempotencyKey = key
+		}
 	}
 	if body.Type == "download_ocr_model" {
 		req.Payload = json.RawMessage("{}")
@@ -212,10 +356,71 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 		req.Payload = encoded
 		totalUnits := 100
 		req.TotalUnits = &totalUnits
-		req.ResourceClass = "network"
+		req.ResourceClass = operations.ResourceNetwork
 		if body.Type == "self_test_reranker" {
-			req.ResourceClass = "model"
+			req.ResourceClass = operations.ResourceModel
+		} else if body.Type == "download_model" && s.app.ManagedRuntime {
+			req.ResourceClass = operations.ResourceModel
 		}
+	}
+	if body.Type == "remove_ocr_model" {
+		req.Payload = json.RawMessage("{}")
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceDisk
+	}
+	if body.Type == "remove_model" {
+		var input struct {
+			ID             string `json:"id"`
+			Kind           string `json:"kind"`
+			Managed        bool   `json:"managed"`
+			Capability     string `json:"capability"`
+			CustomReranker bool   `json:"customReranker"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		input.ID = strings.TrimPrefix(strings.TrimSpace(input.ID), "local:")
+		if input.ID == "" || (input.Managed && input.Capability != "embedding" && input.Capability != "rerank") {
+			writeOperationErr(w, errors.New("remove_model requires id and a valid managed capability"))
+			return
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceDisk
+		if input.Managed {
+			req.ResourceClass = operations.ResourceModel
+		}
+	}
+	if body.Type == "ollama_delete" {
+		var input struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		input.Model = strings.TrimSpace(input.Model)
+		if input.Model == "" {
+			writeOperationErr(w, errors.New("ollama model is required"))
+			return
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceModel
 	}
 	if body.Type == "migrate_model_cache" {
 		var input struct {
@@ -239,20 +444,39 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Payload = encoded
-		if existing, found, err := s.app.Operations.FindIdempotencyOperation(req); found {
+		if existing, found, err := s.app.Operations.FindIdempotencyOperationContext(r.Context(), req); found {
 			writeOperationAccepted(w, existing)
 			return
 		} else if err != nil {
 			writeOperationErr(w, err)
 			return
 		}
-		if _, err := s.app.PlanModelCacheMigration(resolved); err != nil {
-			writeOperationErr(w, err)
-			return
-		}
 		totalUnits := 1
 		req.TotalUnits = &totalUnits
 		req.ResourceClass = "disk"
+	}
+	if body.Type == "plan_model_cache_migration" {
+		var input struct {
+			TargetDir string `json:"targetDir"`
+		}
+		if err := json.Unmarshal(body.Input, &input); err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		if strings.TrimSpace(input.TargetDir) == "" {
+			writeOperationErr(w, errors.New("targetDir is required"))
+			return
+		}
+		resolved := s.app.ResolveModelCacheDir(input.TargetDir)
+		encoded, err := json.Marshal(map[string]any{"targetDir": resolved})
+		if err != nil {
+			writeOperationErr(w, err)
+			return
+		}
+		req.Payload = encoded
+		totalUnits := 1
+		req.TotalUnits = &totalUnits
+		req.ResourceClass = operations.ResourceDisk
 	}
 	if body.Type == "reindex_documents" {
 		var input struct {
@@ -270,6 +494,7 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 			writeOperationErr(w, operations.ErrNotFound)
 			return
 		}
+		sort.Strings(input.DocumentIDs)
 		encoded, err := json.Marshal(input)
 		if err != nil {
 			writeOperationErr(w, err)
@@ -279,6 +504,14 @@ func (s *Server) submitOperation(w http.ResponseWriter, r *http.Request) {
 		totalUnits := len(input.DocumentIDs)
 		req.TotalUnits = &totalUnits
 		req.ResourceClass = "io"
+		if req.IdempotencyKey == "" {
+			key, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), req.BaseID, input.DocumentIDs)
+			if err != nil {
+				writeOperationErr(w, err)
+				return
+			}
+			req.IdempotencyKey = key
+		}
 	}
 	if body.Type == "maintenance_storage" {
 		var input struct {
@@ -411,7 +644,7 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.app.Operations.Get(r.PathValue("id"))
+	op, err := s.app.Operations.GetContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeOperationErr(w, err)
 		return
@@ -447,7 +680,7 @@ func (s *Server) listOperations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.app.Operations.Cancel(r.PathValue("id"))
+	op, err := s.app.Operations.CancelContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeOperationErr(w, err)
 		return
@@ -456,7 +689,7 @@ func (s *Server) cancelOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) retryOperation(w http.ResponseWriter, r *http.Request) {
-	op, err := s.app.Operations.Retry(r.PathValue("id"))
+	op, err := s.app.Operations.RetryContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeOperationErr(w, err)
 		return
@@ -536,6 +769,11 @@ func writeOperationErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusUnauthorized, envelopeError("invalid_credential", err.Error()))
 	case errors.Is(err, operations.ErrQueueFull):
 		writeJSON(w, http.StatusTooManyRequests, envelopeError("queue_full", err.Error()))
+	case errors.Is(err, operations.ErrResourceBudgetExceeded):
+		writeJSON(w, http.StatusTooManyRequests, envelopeError("quota_exceeded", err.Error()))
+	case errors.Is(err, operations.ErrDiskLowWater):
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusTooManyRequests, envelopeError("disk_low_water", err.Error()))
 	case errors.Is(err, operations.ErrPayloadTooLarge):
 		writeJSON(w, http.StatusRequestEntityTooLarge, envelopeError("payload_too_large", err.Error()))
 	case errors.Is(err, operations.ErrUnsupportedCommand):
@@ -550,6 +788,10 @@ func writeOperationErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, envelopeError("upload-invalid", err.Error()))
 	case errors.Is(err, operations.ErrUploadTooLarge):
 		writeJSON(w, http.StatusRequestEntityTooLarge, envelopeError("upload-too-large", err.Error()))
+	case errors.Is(err, operations.ErrUploadQuotaExceeded):
+		writeJSON(w, http.StatusTooManyRequests, envelopeError("quota_exceeded", err.Error()))
+	case errors.Is(err, operations.ErrTempQuotaExceeded):
+		writeJSON(w, http.StatusTooManyRequests, envelopeError("quota_exceeded", err.Error()))
 	case errors.Is(err, operations.ErrUploadStorageNotSet):
 		writeJSON(w, http.StatusServiceUnavailable, envelopeError("upload-storage-unavailable", err.Error()))
 	default:
@@ -558,5 +800,5 @@ func writeOperationErr(w http.ResponseWriter, err error) {
 }
 
 func envelopeError(code, message string) map[string]any {
-	return map[string]any{"ok": false, "error": map[string]string{"code": code, "message": message}}
+	return map[string]any{"ok": false, "error": map[string]string{"code": code, "message": operations.SafeErrorMessage(message)}}
 }

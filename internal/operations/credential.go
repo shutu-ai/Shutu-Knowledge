@@ -82,7 +82,7 @@ func (s *Service) ensureIdempotencySigningKey(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO operation_signing_keys
+	_, err = s.db.ExecPriority(ctx, storage.ControlWrite, `INSERT INTO operation_signing_keys
 		(id, secret, state, created_at) VALUES (?, ?, 'active', ?)`,
 		keyID, hex.EncodeToString(secret), now())
 	if err != nil {
@@ -255,23 +255,21 @@ func (s *Service) RotateIdempotencySigningKey(ctx context.Context, retention tim
 	if err != nil {
 		return "", err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = tx.Rollback() }()
 	retainUntil := now() + retention.Milliseconds()
-	if _, err := tx.ExecContext(ctx, `UPDATE operation_signing_keys
+	err = s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE operation_signing_keys
 		SET state = 'retired', rotated_at = ?, retained_until = ?
 		WHERE state = 'active'`, now(), retainUntil); err != nil {
-		return "", fmt.Errorf("retire operation signing key: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO operation_signing_keys
+			return fmt.Errorf("retire operation signing key: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_signing_keys
 		(id, secret, state, created_at) VALUES (?, ?, 'active', ?)`,
-		keyID, hex.EncodeToString(secret), now()); err != nil {
-		return "", fmt.Errorf("create operation signing key: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
+			keyID, hex.EncodeToString(secret), now()); err != nil {
+			return fmt.Errorf("create operation signing key: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 	return keyID, nil
@@ -280,7 +278,7 @@ func (s *Service) RotateIdempotencySigningKey(ctx context.Context, retention tim
 // RevokeIdempotencySigningKey immediately rejects every credential signed by
 // the key, including credentials whose signed expiry is still in the future.
 func (s *Service) RevokeIdempotencySigningKey(ctx context.Context, keyID string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE operation_signing_keys
+	result, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE operation_signing_keys
 		SET state = 'revoked', rotated_at = ?, retained_until = NULL
 		WHERE id = ? AND state IN ('active','retired')`, now(), keyID)
 	if err != nil {

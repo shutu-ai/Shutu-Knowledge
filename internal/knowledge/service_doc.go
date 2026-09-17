@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +19,6 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/caption"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
 	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
-	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
 
@@ -90,7 +90,7 @@ func (s *Service) ListDocumentsContext(ctx context.Context, baseID string) ([]Do
 		return nil, err
 	}
 	modelKey := ""
-	if providers, providerErr := s.providersForBase(baseID); providerErr != nil {
+	if providers, providerErr := s.providersForBaseContext(ctx, baseID); providerErr != nil {
 		return nil, providerErr
 	} else if providers.embeddingActive && providers.embedder != nil {
 		modelKey = providers.embedder.ModelKey()
@@ -102,6 +102,164 @@ func (s *Service) ListDocumentsContext(ctx context.Context, baseID string) ([]Do
 		out = append(out, summary)
 	}
 	return out, nil
+}
+
+// ListDocumentsPageContext provides a bounded flat-list compatibility view.
+func (s *Service) ListDocumentsPageContext(ctx context.Context, baseID string, limit, offset int) (DocumentListPage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	docs, total, err := s.store.listDocumentMetadataPageContext(ctx, baseID, limit, offset)
+	if err != nil {
+		return DocumentListPage{}, err
+	}
+	modelKey := ""
+	if providers, providerErr := s.providersForBaseContext(ctx, baseID); providerErr != nil {
+		return DocumentListPage{}, providerErr
+	} else if providers.embeddingActive && providers.embedder != nil {
+		modelKey = providers.embedder.ModelKey()
+	}
+	out := make([]DocumentSummary, 0, len(docs))
+	for _, doc := range docs {
+		summary := summarize(doc)
+		summary.EmbeddingReady = modelKey != "" && doc.EmbeddingReady && doc.EmbeddingModel == modelKey
+		out = append(out, summary)
+	}
+	return DocumentListPage{
+		Documents: out, Total: total, Limit: limit, Offset: offset,
+		HasMore: offset+len(out) < total,
+	}, nil
+}
+
+// CountActiveDocuments returns the scalar count used by operation receipts.
+// Callers that need the rows should use a bounded page API instead.
+func (s *Service) CountActiveDocuments(ctx context.Context, baseID string) (int, error) {
+	return s.store.countActiveDocumentsContext(ctx, baseID)
+}
+
+// CountDocumentTree returns a scalar subtree size for operation progress. It
+// uses a recursive SQL count instead of loading every sibling in the base.
+func (s *Service) CountDocumentTree(ctx context.Context, rootID string) (int, error) {
+	return s.store.countDocumentTreeContext(ctx, rootID)
+}
+
+// ReindexIdempotencyKey derives a stable equivalent-operation key from the
+// current target/source/config snapshot. An empty documentIDs slice means the
+// whole base; a non-empty slice is treated as an order-independent batch.
+// The key contains only a digest, so configuration credentials never leave
+// this process even though they participate in the snapshot.
+func (s *Service) ReindexIdempotencyKey(ctx context.Context, baseID string, documentIDs []string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return "", err
+	}
+	resolved := ResolveBaseConfig(s.global, base.Config)
+	configBytes, err := json.Marshal(resolved)
+	if err != nil {
+		return "", fmt.Errorf("marshal reindex config snapshot: %w", err)
+	}
+	hash := sha256.New()
+	writePart := func(value string) {
+		_, _ = fmt.Fprintf(hash, "%d:", len(value))
+		_, _ = hash.Write([]byte(value))
+	}
+	writePart("reindex-equivalent-v1")
+	writePart(baseID)
+	writePart(string(configBytes))
+	writePart(resolved.EmbeddingProvider)
+	writePart(resolved.EmbeddingModel)
+	if len(documentIDs) == 0 {
+		writePart("base")
+		// The base epoch is advanced atomically with source identity changes and
+		// subtree deletion. It is the bounded aggregate identity for a whole-base
+		// reindex; do not scan every document while an HTTP receipt is being built.
+		writePart(fmt.Sprintf("%d", base.MutationEpoch))
+	} else {
+		writePart("documents")
+		documents := make([]Document, 0, len(documentIDs))
+		for _, documentID := range documentIDs {
+			document, err := s.store.getDocumentContext(ctx, documentID)
+			if err != nil {
+				return "", err
+			}
+			if document.BaseID != baseID {
+				return "", ErrConflict
+			}
+			documents = append(documents, document)
+		}
+		sort.Slice(documents, func(i, j int) bool { return documents[i].ID < documents[j].ID })
+		for _, document := range documents {
+			writeReindexDocumentIdentity(writePart, summarize(document))
+		}
+	}
+	return "reindex.auto." + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func writeReindexDocumentIdentity(writePart func(string), document DocumentSummary) {
+	writePart(document.ID)
+	writePart(document.SourceType)
+	writePart(fmt.Sprintf("%d", document.SourceVersion))
+	writePart(fmt.Sprintf("%d", document.MutationEpoch))
+	writePart(fmt.Sprintf("%d", document.ActiveIndexGen))
+	writePart(document.ContentHash)
+	writePart(document.SourcePath)
+	writePart(document.RawFilePath)
+}
+
+// ForEachReindexDocumentBatch visits a fixed target window in bounded keyset
+// pages. The upper cursor is captured before the first page, so documents
+// created while the operation runs are left for a later explicit reindex.
+func (s *Service) ForEachReindexDocumentBatch(ctx context.Context, baseID string, batchSize int, visit func(start, total int, documents []DocumentSummary) error) error {
+	if batchSize <= 0 {
+		batchSize = 50
+	}
+	if batchSize > 200 {
+		batchSize = 200
+	}
+	if _, err := s.store.getBaseContext(ctx, baseID); err != nil {
+		return err
+	}
+	total, cutoffCreatedAt, cutoffID, err := s.store.reindexDocumentWindow(ctx, baseID)
+	if err != nil {
+		return err
+	}
+	if total == 0 {
+		return visit(0, 0, nil)
+	}
+	var afterCreatedAt int64
+	var afterID string
+	for start := 0; start < total; {
+		docs, err := s.store.listReindexDocumentBatchContext(ctx, baseID, cutoffCreatedAt, cutoffID, afterCreatedAt, afterID, batchSize)
+		if err != nil {
+			return err
+		}
+		if len(docs) == 0 {
+			break
+		}
+		page := make([]DocumentSummary, 0, len(docs))
+		for _, doc := range docs {
+			page = append(page, summarize(doc))
+		}
+		if err := visit(start, total, page); err != nil {
+			return err
+		}
+		last := docs[len(docs)-1]
+		afterCreatedAt, afterID = last.CreatedAt, last.ID
+		start += len(docs)
+	}
+	return nil
 }
 
 // ListDocumentChildrenContext returns one bounded directory page. Directory
@@ -131,7 +289,7 @@ func (s *Service) ListDocumentChildrenContext(ctx context.Context, baseID, paren
 		return DocumentChildrenPage{}, err
 	}
 	modelKey := ""
-	if providers, providerErr := s.providersForBase(baseID); providerErr != nil {
+	if providers, providerErr := s.providersForBaseContext(ctx, baseID); providerErr != nil {
 		return DocumentChildrenPage{}, providerErr
 	} else if providers.embeddingActive && providers.embedder != nil {
 		modelKey = providers.embedder.ModelKey()
@@ -164,10 +322,16 @@ func (s *Service) ListDocumentChildrenContext(ctx context.Context, baseID, paren
 
 // ListChunks returns a page of a document's chunks.
 func (s *Service) ListChunks(docID string, limit, offset int) ([]Chunk, error) {
-	if _, err := s.store.getDocument(docID); err != nil {
+	return s.ListChunksContext(context.Background(), docID, limit, offset)
+}
+
+// ListChunksContext keeps document validation and bounded chunk reads inside
+// the caller's cancellation boundary.
+func (s *Service) ListChunksContext(ctx context.Context, docID string, limit, offset int) ([]Chunk, error) {
+	if _, err := s.store.getDocumentContext(ctx, docID); err != nil {
 		return nil, err
 	}
-	return s.store.listChunksByDoc(docID, limit, offset)
+	return s.store.listChunksByDocContext(ctx, docID, limit, offset)
 }
 
 func summarize(d Document) DocumentSummary {
@@ -179,23 +343,49 @@ func summarize(d Document) DocumentSummary {
 		Status: d.Status, Phase: d.Phase, Progress: d.Progress,
 		ErrorCode: d.ErrorCode, ErrorMessage: d.ErrorMessage,
 		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		SourceVersion: d.SourceVersion, MutationEpoch: d.MutationEpoch,
+		ActiveIndexGen: d.ActiveIndexGen,
+		ContentHash:    d.ContentHash, RawFilePath: d.RawFilePath,
 	}
 }
 
 // GetDocument returns the full document; chunks included on request.
 func (s *Service) GetDocument(id string, includeChunks bool) (Document, []Chunk, error) {
-	doc, err := s.store.getDocument(id)
+	return s.GetDocumentWithContext(context.Background(), id, includeChunks)
+}
+
+// GetDocumentWithContext keeps operation-worker reads inside the caller's
+// cancellation boundary. The compatibility GetDocument wrapper remains for
+// non-operation callers.
+func (s *Service) GetDocumentWithContext(ctx context.Context, id string, includeChunks bool) (Document, []Chunk, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err != nil {
 		return Document{}, nil, err
 	}
 	var chunks []Chunk
 	if includeChunks {
-		chunks, err = s.store.listChunksByDoc(id, 0, 0)
+		chunks, err = s.store.listChunksByDocContext(ctx, id, 0, 0)
 		if err != nil {
 			return Document{}, nil, err
 		}
 	}
 	return doc, chunks, nil
+}
+
+// GetDocumentIncludingDeleting is restricted to operation recovery paths. A
+// tombstoned document is hidden from ordinary reads but must remain visible to
+// a retry that is finishing physical cleanup.
+func (s *Service) GetDocumentIncludingDeleting(id string) (Document, error) {
+	return s.GetDocumentIncludingDeletingWithContext(context.Background(), id)
+}
+
+// GetDocumentIncludingDeletingWithContext is used by delete recovery while
+// retaining the caller's cancellation boundary.
+func (s *Service) GetDocumentIncludingDeletingWithContext(ctx context.Context, id string) (Document, error) {
+	return s.store.getDocumentIncludingDeletingContext(ctx, id)
 }
 
 // RawFile is original source content prepared for HTTP download/preview.
@@ -224,6 +414,19 @@ func (s *Service) GetRawFile(id string) (*RawFile, error) {
 // be replaced by a later re-index, so a historical mapping is never enough:
 // returning current bytes under an old citation would mix evidence.
 func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*RawFile, error) {
+	return s.GetRawFileForCitationContext(context.Background(), id, opts)
+}
+
+// GetRawFileForCitationContext keeps generation validation and raw-byte reads
+// inside the caller's cancellation boundary. The compatibility wrapper above
+// remains for non-HTTP callers.
+func (s *Service) GetRawFileForCitationContext(ctx context.Context, id string, opts RawCitationOptions) (*RawFile, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if (opts.IndexGeneration == nil) != (opts.SourceVersion == nil) {
 		return nil, fmt.Errorf("indexGeneration and sourceVersion must be supplied together")
 	}
@@ -231,7 +434,7 @@ func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*Ra
 	var current Document
 	if opts.IndexGeneration != nil {
 		var err error
-		identity, err = s.store.generationByID(context.Background(), s.store.db.ReadDB(),
+		identity, err = s.store.generationByID(ctx, s.store.db.ReadDB(),
 			id, *opts.IndexGeneration)
 		if err != nil {
 			return nil, err
@@ -242,7 +445,7 @@ func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*Ra
 		// Historical bytes never bypass a committed tombstone. Once the
 		// current document is invisible, fail with the citation contract
 		// instead of exposing ordinary not-found semantics.
-		current, err = s.store.getDocument(id)
+		current, err = s.store.getDocumentContext(ctx, id)
 		if err != nil {
 			if errors.Is(err, ErrNotFound) {
 				return nil, ErrHistoricalEvidenceExpired
@@ -251,7 +454,7 @@ func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*Ra
 		}
 	} else {
 		var err error
-		current, err = s.store.getDocument(id)
+		current, err = s.store.getDocumentContext(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -263,7 +466,9 @@ func (s *Service) GetRawFileForCitation(id string, opts RawCitationOptions) (*Ra
 	if identity.RawFilePath == "" {
 		return nil, fmt.Errorf("%w: document has no raw source", ErrNotFound)
 	}
-	data, err := s.raw.Read(identity.RawFilePath)
+	diskReadStarted := Now()
+	data, err := s.raw.ReadContext(ctx, identity.RawFilePath)
+	s.recordMetric(func(m *MetricsSnapshot) { m.DiskReadMS += durationMS(diskReadStarted) })
 	if err != nil {
 		return nil, err
 	}
@@ -299,14 +504,20 @@ func rawPathIsVersioned(rawPath string) bool {
 // preserveLegacyRawGeneration copies an old shared raw file into the immutable
 // layout before a rebuild can replace it. The content hash must already match
 // the published document; otherwise the historical citation is already unsafe.
-func (s *Service) preserveLegacyRawGeneration(doc *Document, data []byte) error {
+func (s *Service) preserveLegacyRawGeneration(ctx context.Context, doc *Document, data []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if doc.SourceType != "file" || doc.RawFilePath == "" || rawPathIsVersioned(doc.RawFilePath) ||
 		doc.SourceVersion <= 0 || doc.ContentHash == "" {
 		return nil
 	}
 	if len(data) == 0 {
 		var err error
-		data, err = s.raw.Read(doc.RawFilePath)
+		data, err = s.raw.ReadContext(ctx, doc.RawFilePath)
 		if err != nil {
 			return err
 		}
@@ -323,7 +534,7 @@ func (s *Service) preserveLegacyRawGeneration(doc *Document, data []byte) error 
 	if err != nil {
 		return err
 	}
-	if err := s.store.setGenerationRawPath(doc.ID, doc.ActiveIndexGen, rel); err != nil {
+	if err := s.store.setGenerationRawPathContext(ctx, doc.ID, doc.ActiveIndexGen, rel); err != nil {
 		return err
 	}
 	doc.RawFilePath = rel
@@ -339,17 +550,23 @@ type IndexingStatus struct {
 	Progress int    `json:"progress"`
 }
 
-// IndexingStatus reports active imports across every base.
+const maxIndexingStatusItems = 200
+
+// IndexingStatus reports a bounded snapshot of active imports across every
+// base. The compatibility wrapper retains the original non-context API.
 func (s *Service) IndexingStatus() ([]IndexingStatus, error) {
-	docs, err := s.store.listAllDocumentMetadata()
+	return s.IndexingStatusContext(context.Background())
+}
+
+// IndexingStatusContext is the cancellable, bounded status path used by Web
+// requests. The limit is enforced by the SQL query before rows are materialized.
+func (s *Service) IndexingStatusContext(ctx context.Context) ([]IndexingStatus, error) {
+	docs, err := s.store.listActiveDocumentMetadataContext(ctx, maxIndexingStatusItems)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]IndexingStatus, 0)
 	for _, doc := range docs {
-		if doc.Status != StatusPending && doc.Status != StatusProcessing {
-			continue
-		}
 		out = append(out, IndexingStatus{
 			DocID: doc.ID, BaseID: doc.BaseID, Title: doc.Title,
 			Phase: doc.Phase, Progress: doc.Progress,
@@ -360,7 +577,15 @@ func (s *Service) IndexingStatus() ([]IndexingStatus, error) {
 
 // RenameDocument updates the title.
 func (s *Service) RenameDocument(id, title string) (Document, error) {
-	doc, err := s.store.getDocument(id)
+	return s.RenameDocumentWithContext(context.Background(), id, title)
+}
+
+// RenameDocumentWithContext binds the document read and update to the caller.
+func (s *Service) RenameDocumentWithContext(ctx context.Context, id, title string) (Document, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err != nil {
 		return Document{}, err
 	}
@@ -371,7 +596,7 @@ func (s *Service) RenameDocument(id, title string) (Document, error) {
 	doc.Title = title
 	doc.TitleLocked = true
 	doc.UpdatedAt = now()
-	if err := s.store.putDocument(doc); err != nil {
+	if err := s.store.putDocumentContext(ctx, doc); err != nil {
 		return Document{}, err
 	}
 	return doc, nil
@@ -380,20 +605,24 @@ func (s *Service) RenameDocument(id, title string) (Document, error) {
 // deleteDocumentTree first commits the logical delete fence for the target and
 // every descendant, then performs bounded physical cleanup. A cleanup failure
 // leaves lifecycle_state=deleting rather than exposing or resurrecting rows.
-// Once that fence commits, cancellation can no longer restore the tree, so
-// cleanup continues to its bounded terminal state instead of pausing midway.
+// Once that fence commits, cancellation cannot restore the tree; an
+// interrupted cleanup remains deleting and the next durable attempt resumes
+// from its bounded page/chunk cursor.
 func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDeleted func()) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	root, err := s.store.getDocument(rootID)
+	root, err := s.store.getDocumentContext(ctx, rootID)
 	switch {
 	case err == nil:
-		if _, err := s.store.markDocumentTreeDeleting(rootID); err != nil {
+		if _, err := s.store.markDocumentTreeDeletingWithContext(ctx, rootID); err != nil {
 			return 0, err
 		}
 	case errors.Is(err, ErrNotFound):
-		root, err = s.store.getDocumentIncludingDeleting(rootID)
+		root, err = s.store.getDocumentIncludingDeletingContext(ctx, rootID)
 		if err != nil {
 			return 0, err
 		}
@@ -403,40 +632,53 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 	default:
 		return 0, err
 	}
-	refs, err := s.store.listDocumentTreeCleanupRefs(root.ID)
-	if err != nil {
-		return 0, err
-	}
 	removed := 0
-	for _, ref := range refs {
-		rawPaths, err := s.store.deleteDocumentGenerations(ref.ID)
+	afterID := ""
+	for {
+		refs, err := s.store.listDocumentTreeCleanupRefsContext(ctx, root.ID, afterID, cleanupDocumentPageSize)
 		if err != nil {
 			return removed, err
 		}
-		activeIsGenerationRaw := false
-		for _, rawPath := range rawPaths {
-			if rawPath == ref.RawFilePath {
-				activeIsGenerationRaw = true
-			}
-			if err := s.raw.Delete(rawPath); err != nil {
+		if len(refs) == 0 {
+			break
+		}
+		for _, ref := range refs {
+			if err := ctx.Err(); err != nil {
 				return removed, err
 			}
-		}
-		if ref.RawFilePath != "" {
-			if activeIsGenerationRaw {
-				removed++
-				if onDeleted != nil {
-					onDeleted()
+			rawPaths, err := s.store.deleteDocumentGenerationsWithContext(ctx, ref.ID)
+			if err != nil {
+				return removed, err
+			}
+			activeIsGenerationRaw := false
+			for _, rawPath := range rawPaths {
+				if rawPath == ref.RawFilePath {
+					activeIsGenerationRaw = true
 				}
-				continue
+				if err := s.raw.Delete(rawPath); err != nil {
+					return removed, err
+				}
 			}
-			if err := s.raw.Delete(ref.RawFilePath); err != nil {
-				return removed, err
+			if ref.RawFilePath != "" {
+				if activeIsGenerationRaw {
+					removed++
+					if onDeleted != nil {
+						onDeleted()
+					}
+					continue
+				}
+				if err := s.raw.Delete(ref.RawFilePath); err != nil {
+					return removed, err
+				}
+			}
+			removed++
+			if onDeleted != nil {
+				onDeleted()
 			}
 		}
-		removed++
-		if onDeleted != nil {
-			onDeleted()
+		afterID = refs[len(refs)-1].ID
+		if len(refs) < cleanupDocumentPageSize {
+			break
 		}
 	}
 	return removed, nil
@@ -485,7 +727,10 @@ func (s *Service) AddTextDocument(ctx context.Context, baseID, title, content st
 // If its business effect already committed before the terminal state was
 // written, a restart returns the same document instead of importing again.
 func (s *Service) AddTextDocumentWithID(ctx context.Context, baseID, id, title, content string) (Document, error) {
-	base, err := s.store.getBase(baseID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
 	if err != nil {
 		return Document{}, err
 	}
@@ -502,7 +747,7 @@ func (s *Service) AddTextDocumentWithID(ctx context.Context, baseID, id, title, 
 			return Document{}, err
 		}
 	}
-	doc, err := s.store.getDocument(id)
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err == nil {
 		if doc.Status == StatusReady {
 			return doc, nil
@@ -517,7 +762,6 @@ func (s *Service) AddTextDocumentWithID(ctx context.Context, baseID, id, title, 
 	doc.Title = title
 	doc.SourceType = "text"
 	doc.Status = StatusPending
-	doc.CreatedAt = doc.CreatedAt
 	doc.RawText = content
 	if doc.CreatedAt == 0 {
 		doc.CreatedAt = now()
@@ -541,7 +785,10 @@ func (s *Service) AddFileDocument(ctx context.Context, baseID, fileName string, 
 // before execution. After a publish/crash race, a ready document is returned
 // rather than imported a second time.
 func (s *Service) AddFileDocumentWithID(ctx context.Context, baseID, id, fileName string, data []byte, parentDirID string) (Document, error) {
-	base, err := s.store.getBase(baseID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
 	if err != nil {
 		return Document{}, err
 	}
@@ -557,7 +804,7 @@ func (s *Service) AddFileDocumentWithID(ctx context.Context, baseID, id, fileNam
 			return Document{}, err
 		}
 	}
-	doc, err := s.store.getDocument(id)
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err == nil {
 		if doc.Status == StatusReady {
 			return doc, nil
@@ -590,8 +837,16 @@ func hashText(text string) string {
 
 // AddFilesItem is one file of a batch import.
 type AddFilesItem struct {
-	FileName      string
-	ContentBase64 string
+	DocumentID    string `json:"documentId,omitempty"`
+	FileName      string `json:"fileName"`
+	ContentBase64 string `json:"contentBase64"`
+	// Resolved fields are populated only by the durable operation adapter.
+	// They are intentionally excluded from the HTTP command payload; the
+	// Knowledge service uses them to preserve an already committed batch item
+	// without replaying its business effect.
+	Resolved        bool   `json:"-"`
+	ResolvedSkipped bool   `json:"-"`
+	ResolvedTitle   string `json:"-"`
 }
 
 // AcceptedFile reports one successfully imported (or skipped) file.
@@ -615,11 +870,14 @@ const MaxBatchFiles = 20
 // start. Fixing titles and duplicate decisions up front prevents concurrent
 // imports from racing for the same name.
 type plannedFile struct {
-	title     string
-	fileName  string
-	data      []byte
-	hash      string
-	duplicate bool
+	documentID string
+	title      string
+	fileName   string
+	data       []byte
+	hash       string
+	duplicate  bool
+	resolved   bool
+	resSkipped bool
 }
 
 // AddFiles imports a batch of base64 files with server-side conflict
@@ -628,7 +886,10 @@ type plannedFile struct {
 // skipped. The request workers are bounded at five, while storage-heavy
 // ingest pipelines are capped separately at two by NewService.
 func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesItem, conflict, parentDirID string) (AddFilesResult, error) {
-	base, err := s.store.getBase(baseID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
 	if err != nil {
 		return AddFilesResult{}, err
 	}
@@ -670,24 +931,48 @@ func (s *Service) AddFiles(ctx context.Context, baseID string, items []AddFilesI
 	jobs := make(chan int)
 	workerErr := make(chan error, workerCount)
 	var workers sync.WaitGroup
+	var resultMu sync.Mutex
 	for worker := 0; worker < workerCount; worker++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
 				plan := plans[index]
-				if plan.duplicate {
-					result.Accepted[index] = AcceptedFile{Title: plan.title, Skipped: true}
+				if plan.resolved {
+					resultMu.Lock()
+					result.Accepted[index] = AcceptedFile{
+						ID: plan.documentID, Title: plan.title, Skipped: plan.resSkipped,
+					}
 					completed[index] = true
+					resultMu.Unlock()
 					continue
 				}
-				doc, err := s.AddFileDocument(ctx, baseID, plan.title, plan.data, parentDirID)
+				if plan.duplicate {
+					resultMu.Lock()
+					result.Accepted[index] = AcceptedFile{Title: plan.title, Skipped: true}
+					completed[index] = true
+					resultMu.Unlock()
+					continue
+				}
+				itemCtx := ctx
+				if factory := itemCommitHookFactoryFromContext(ctx); factory != nil {
+					itemCtx = WithCommitHook(ctx, factory(fmt.Sprintf("%d:%s", index, plan.fileName)))
+				}
+				var doc Document
+				var err error
+				if plan.documentID != "" {
+					doc, err = s.AddFileDocumentWithID(itemCtx, baseID, plan.documentID, plan.title, plan.data, parentDirID)
+				} else {
+					doc, err = s.AddFileDocument(itemCtx, baseID, plan.title, plan.data, parentDirID)
+				}
 				if err != nil {
 					workerErr <- err
 					return
 				}
+				resultMu.Lock()
 				result.Accepted[index] = AcceptedFile{ID: doc.ID, Title: doc.Title}
 				completed[index] = true
+				resultMu.Unlock()
 			}
 		}()
 	}
@@ -722,9 +1007,13 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 		return nil, err
 	}
 	type decodedFile struct {
-		name string
-		data []byte
-		hash string
+		name          string
+		data          []byte
+		hash          string
+		documentID    string
+		resolved      bool
+		resSkipped    bool
+		resolvedTitle string
 	}
 	files := make([]decodedFile, 0, len(items))
 	seenNames := map[string]bool{}
@@ -742,7 +1031,11 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 		}
 		seenNames[name] = true
 		sum := sha256.Sum256(data)
-		files = append(files, decodedFile{name: name, data: data, hash: hex.EncodeToString(sum[:])})
+		files = append(files, decodedFile{
+			name: name, data: data, hash: hex.EncodeToString(sum[:]),
+			documentID: item.DocumentID, resolved: item.Resolved,
+			resSkipped: item.ResolvedSkipped, resolvedTitle: item.ResolvedTitle,
+		})
 	}
 
 	if conflict == "detect" {
@@ -750,7 +1043,9 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 		for _, f := range files {
 			names = append(names, f.name)
 		}
-		if conflicts := s.DetectConflicts(baseID, names); len(conflicts) > 0 {
+		if conflicts, err := s.DetectConflictsContext(ctx, baseID, names); err != nil {
+			return nil, err
+		} else if len(conflicts) > 0 {
 			return nil, &ConflictError{Conflicts: conflicts}
 		}
 	}
@@ -758,69 +1053,137 @@ func (s *Service) planFileBatch(ctx context.Context, baseID string, items []AddF
 	// Existing hashes must remain visible to planning. Hashes created by the
 	// workers are serialized by SQLite; a race with another import can create
 	// a legitimate duplicate and will be reconciled by later operations.
-	existingHashes := map[string]bool{}
-	docs, err := s.store.listDocumentMetadata(baseID)
+	hashes := make([]string, 0, len(files))
+	for _, file := range files {
+		hashes = append(hashes, file.hash)
+	}
+	existingHashes, err := s.store.contentHashesPresentContext(ctx, baseID, hashes)
 	if err != nil {
 		return nil, err
-	}
-	for _, doc := range docs {
-		existingHashes[doc.ContentHash] = true
 	}
 	plans := make([]plannedFile, 0, len(files))
 	usedTitles := map[string]bool{}
 	for _, f := range files {
 		title := f.name
+		if f.resolvedTitle != "" {
+			title = f.resolvedTitle
+		}
+		if f.resolved {
+			// A resolved durable item must not participate in conflict
+			// resolution: doing so could delete its already-published document
+			// before the worker reaches the resolved fast path. Keep its hash and
+			// title in the planning index so later items still deduplicate
+			// against the committed result.
+			existingHashes[f.hash] = true
+			usedTitles[title] = true
+			plans = append(plans, plannedFile{
+				documentID: f.documentID,
+				title:      title,
+				fileName:   f.name,
+				data:       f.data,
+				hash:       f.hash,
+				resolved:   true,
+				resSkipped: f.resSkipped,
+			})
+			continue
+		}
+		titleCollision := false
 		if conflict == "replace" {
-			if existing, err := s.store.findDocumentByTitle(baseID, title); err == nil {
-				if err := s.DeleteDocument(existing.ID); err != nil {
+			if existing, err := s.store.findDocumentByTitleContext(ctx, baseID, title); err == nil {
+				titleCollision = true
+				deleteCtx := ctx
+				if factory := itemCommitHookFactoryFromContext(ctx); factory != nil {
+					// Replacing an existing title is a second durable business
+					// effect. Give it its own marker so a crash between the old
+					// delete and the new document publish can be replayed without
+					// mistaking the replacement for a committed import.
+					deleteCtx = WithCommitHook(ctx, factory("replace:"+existing.ID))
+				}
+				if _, err := s.DeleteDocumentWithProgress(deleteCtx, existing.ID, nil); err != nil && !errors.Is(err, ErrNotFound) {
 					return nil, err
 				}
 			}
 		} else if conflict == "rename" {
-			if _, err := s.store.findDocumentByTitle(baseID, title); err == nil {
-				title = s.RenameAvailable(baseID, title)
+			if _, err := s.store.findDocumentByTitleContext(ctx, baseID, title); err == nil {
+				var renameErr error
+				title, renameErr = s.RenameAvailableContext(ctx, baseID, title)
+				if renameErr != nil {
+					return nil, renameErr
+				}
 			}
 		}
 		duplicate := existingHashes[f.hash]
+		// A replace collision deliberately removes the old title before the
+		// worker runs. The old content hash is therefore not a reason to skip
+		// this item: doing so would leave the replacement title absent when the
+		// replacement bytes are identical to the old bytes.
+		if titleCollision {
+			duplicate = false
+		}
 		existingHashes[f.hash] = true
 		if usedTitles[title] {
-			title = s.RenameAvailable(baseID, title)
+			var renameErr error
+			title, renameErr = s.RenameAvailableContext(ctx, baseID, title)
+			if renameErr != nil {
+				return nil, renameErr
+			}
 		}
 		usedTitles[title] = true
 		plans = append(plans, plannedFile{
-			title: title, fileName: f.name, data: f.data, hash: f.hash, duplicate: duplicate,
+			documentID: f.documentID,
+			title:      title, fileName: f.name, data: f.data, hash: f.hash,
+			duplicate: duplicate, resolved: f.resolved,
+			resSkipped: f.resSkipped,
 		})
 	}
 	return plans, nil
 }
 
 func (s *Service) hasContentHash(baseID, hash string) bool {
-	docs, err := s.store.listDocumentMetadata(baseID)
-	if err != nil {
-		return false
+	present, err := s.hasContentHashContext(context.Background(), baseID, hash)
+	return err == nil && present
+}
+
+func (s *Service) hasContentHashContext(ctx context.Context, baseID, hash string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	for _, doc := range docs {
-		if doc.ContentHash == hash {
-			return true
-		}
-	}
-	return false
+	var present int
+	err := s.store.db.QueryRowContext(ctx, `SELECT 1 FROM documents
+		WHERE base_id = ? AND lifecycle_state = ? AND content_hash = ? LIMIT 1`,
+		baseID, LifecycleActive, hash).Scan(&present)
+	return present == 1, err
 }
 
 // DetectConflicts returns base file names that already exist.
 func (s *Service) DetectConflicts(baseID string, fileNames []string) []string {
+	conflicts, _ := s.DetectConflictsContext(context.Background(), baseID, fileNames)
+	return conflicts
+}
+
+// DetectConflictsContext is the cancellable conflict lookup used by import
+// workers. Unlike the legacy helper it returns unexpected database errors.
+func (s *Service) DetectConflictsContext(ctx context.Context, baseID string, fileNames []string) ([]string, error) {
 	var conflicts []string
 	for _, name := range fileNames {
-		if _, err := s.store.findDocumentByTitle(baseID, name); err == nil {
+		if _, err := s.store.findDocumentByTitleContext(ctx, baseID, name); err == nil {
 			conflicts = append(conflicts, name)
+		} else if err != ErrNotFound {
+			return conflicts, err
 		}
 	}
-	return conflicts
+	return conflicts, nil
 }
 
 // FindDocumentByTitle exposes title conflict lookup to operation adapters.
 func (s *Service) FindDocumentByTitle(baseID, title string) (Document, error) {
 	return s.store.findDocumentByTitle(baseID, title)
+}
+
+// FindDocumentByTitleContext is the cancellable title conflict lookup used by
+// operation workers.
+func (s *Service) FindDocumentByTitleContext(ctx context.Context, baseID, title string) (Document, error) {
+	return s.store.findDocumentByTitleContext(ctx, baseID, title)
 }
 
 // RenameAvailable suggests the first free "name_1" style title.
@@ -835,20 +1198,38 @@ func (s *Service) RenameAvailable(baseID, fileName string) string {
 	}
 }
 
+// RenameAvailableContext returns the first free title without allowing an
+// operation worker to wait on an uncancellable database lookup.
+func (s *Service) RenameAvailableContext(ctx context.Context, baseID, fileName string) (string, error) {
+	ext := filepath.Ext(fileName)
+	stem := strings.TrimSuffix(fileName, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s_%d%s", stem, i, ext)
+		if _, err := s.store.findDocumentByTitleContext(ctx, baseID, candidate); err == ErrNotFound {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
 // ReindexDocument re-reads the raw source, re-parses, and re-chunks.
 func (s *Service) ReindexDocument(ctx context.Context, id string) (Document, error) {
-	doc, err := s.store.getDocument(id)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	doc, err := s.store.getDocumentContext(ctx, id)
 	if err != nil {
 		return Document{}, err
 	}
-	base, err := s.store.getBase(doc.BaseID)
+	base, err := s.store.getBaseContext(ctx, doc.BaseID)
 	if err != nil {
 		return Document{}, err
 	}
 	var data []byte
 	if doc.SourceType == "file" {
 		if doc.RawFilePath != "" {
-			if data, err = s.raw.Read(doc.RawFilePath); err != nil {
+			if data, err = s.raw.ReadContext(ctx, doc.RawFilePath); err != nil {
 				return Document{}, err
 			}
 		}
@@ -889,45 +1270,6 @@ func readBoundedSourceFile(path string) ([]byte, error) {
 	return data, nil
 }
 
-// ReindexBase reindexes every document of a base as one background job.
-func (s *Service) ReindexBase(ctx context.Context, baseID string) (string, error) {
-	if s.jobMgr == nil {
-		return "", fmt.Errorf("job manager is not running")
-	}
-	if _, err := s.store.getBase(baseID); err != nil {
-		return "", err
-	}
-	docs, err := s.store.listDocumentMetadata(baseID)
-	if err != nil {
-		return "", err
-	}
-	total := len(docs)
-	return s.jobMgr.SubmitIOWithProgress("reindex_base", baseID, total, func(jobCtx context.Context, report func(jobs.ProgressUpdate)) error {
-		for i, doc := range docs {
-			select {
-			case <-jobCtx.Done():
-				return jobCtx.Err()
-			default:
-			}
-			if doc.SourceType == "directory" {
-				report(jobs.ProgressUpdate{Phase: "reindexing", Completed: i + 1, Total: total, File: doc.Title})
-				continue
-			}
-			if _, err := s.ReindexDocument(jobCtx, doc.ID); err != nil {
-				// A single failure must not hide the rest (per-file errors
-				// stay on the document row).
-				doc.Status = StatusFailed
-				doc.ErrorCode = ErrParseFailed
-				doc.ErrorMessage = err.Error()
-				doc.UpdatedAt = now()
-				_ = s.store.putDocument(doc)
-			}
-			report(jobs.ProgressUpdate{Phase: "reindexing", Completed: i + 1, Total: total, File: doc.Title})
-		}
-		return nil
-	})
-}
-
 // RecoverInterrupted finalizes documents left mid-import by a crash:
 // recoverable ones (raw source present) are marked for reindex, hopeless
 // placeholders become failed.
@@ -935,7 +1277,7 @@ func (s *Service) RecoverInterrupted(ctx context.Context) (resumed int, failed i
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	return s.store.recoverInterrupted(now(), StatusPending, StatusProcessing, StatusFailed,
+	return s.store.recoverInterruptedWithContext(ctx, now(), StatusPending, StatusProcessing, StatusFailed,
 		ErrInterrupted, "import was interrupted before the source was stored")
 }
 
@@ -952,20 +1294,25 @@ func (s *Service) newDocument(baseID, title, sourceType string) Document {
 // later steps leaves the raw copy for recovery.
 func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fileBytes []byte) error {
 	cfg = ResolveBaseConfig(s.global, cfg)
-	providers, err := s.providersForBase(doc.BaseID)
+	providers, err := s.providersForBaseContext(ctx, doc.BaseID)
 	if err != nil {
 		return err
 	}
 	if doc.SourceType == "file" && len(fileBytes) > 0 {
-		if err := s.preserveLegacyRawGeneration(doc, fileBytes); err != nil {
+		if err := s.preserveLegacyRawGeneration(ctx, doc, fileBytes); err != nil {
 			return err
 		}
 	}
 	previous := *doc
 	publishedVectors := 0
 	if previous.ID != "" {
-		publishedVectors, _ = s.store.countEmbeddedChunksByDocGeneration(previous.ID, previous.ActiveIndexGen)
+		var err error
+		publishedVectors, err = s.store.countEmbeddedChunksByDocGenerationContext(ctx, previous.ID, previous.ActiveIndexGen)
+		if err != nil {
+			return err
+		}
 	}
+	queueWaitStarted := Now()
 	if s.ingestSlots != nil {
 		select {
 		case s.ingestSlots <- struct{}{}:
@@ -974,11 +1321,14 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			return ctx.Err()
 		}
 	}
+	s.recordMetric(func(m *MetricsSnapshot) { m.QueueWaitMS += durationMS(queueWaitStarted) })
 	importStarted := Now()
 	defer func() {
 		s.recordMetric(func(m *MetricsSnapshot) {
 			m.Imports++
-			m.ImportDurationMS += durationMS(importStarted)
+			elapsed := durationMS(importStarted)
+			m.ImportDurationMS += elapsed
+			m.RunTimeMS += elapsed
 		})
 	}()
 	doc.Status = StatusProcessing
@@ -990,7 +1340,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.EmbeddingReady = false
 	doc.EmbeddingModel = ""
 	doc.UpdatedAt = now()
-	if err := s.store.startDocumentIngest(*doc); err != nil {
+	if err := s.store.startDocumentIngestContext(ctx, *doc); err != nil {
 		return err
 	}
 
@@ -998,7 +1348,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		rel, err := s.raw.WriteVersion(doc.BaseID, doc.ID, doc.SourceVersion+1,
 			"."+parser.ExtensionOf(doc.FileName), fileBytes)
 		if err != nil {
-			return s.failDocument(doc, ErrParseFailed, err)
+			return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 		}
 		doc.RawFilePath = rel
 		sum := sha256.Sum256(fileBytes)
@@ -1011,7 +1361,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		parsedText, parsedTitle, err := s.parseFileContent(ctx, doc, cfg, fileBytes)
 		s.recordMetric(func(m *MetricsSnapshot) { m.ParseDurationMS += durationMS(parseStarted) })
 		if err != nil {
-			return s.failDocument(doc, ErrParseFailed, err)
+			return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 		}
 		if parsedTitle != "" && !doc.TitleLocked {
 			doc.Title = parsedTitle
@@ -1021,7 +1371,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 
 	text = chunk.Normalize(text)
 	if text == "" {
-		return s.failDocument(doc, ErrParseFailed, fmt.Errorf("contains no extractable text"))
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, fmt.Errorf("contains no extractable text"))
 	}
 	doc.RawText = text
 	doc.CharCount = len([]rune(text))
@@ -1061,19 +1411,23 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		rows = append(rows, c)
 	}
 	if len(rows) == 0 {
-		return s.failDocument(doc, ErrParseFailed, fmt.Errorf("chunker produced no chunks"))
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, fmt.Errorf("chunker produced no chunks"))
 	}
 	targetModelKey := ""
 	if providers.embeddingActive && providers.embedder != nil && providers.embedder.ModelKey() != "none" {
 		targetModelKey = providers.embedder.ModelKey()
 	}
+	dbTransactionStarted := Now()
 	generation, err := s.store.putChunksReplace(ctx, rows, targetModelKey)
+	s.recordMetric(func(m *MetricsSnapshot) {
+		m.DBTransactionMS += durationMS(dbTransactionStarted)
+	})
 	if err != nil {
-		return s.failDocument(doc, ErrParseFailed, err)
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
-	staged, err := s.store.getDocument(doc.ID)
+	staged, err := s.store.getDocumentContext(ctx, doc.ID)
 	if err != nil {
-		return s.failDocument(doc, ErrParseFailed, err)
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
 	expectedEpoch := staged.MutationEpoch
 	doc.DesiredIndexGen = generation
@@ -1091,7 +1445,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		doc.Phase = PhaseEmbedding
 		doc.Progress = 0
 		doc.UpdatedAt = now()
-		if err := s.store.putDocument(*doc); err != nil {
+		if err := s.store.putDocumentContext(ctx, *doc); err != nil {
 			return err
 		}
 		embeddingStarted = Now()
@@ -1113,7 +1467,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 				doc.Incomplete = false
 			}
 			doc.UpdatedAt = now()
-			if err := s.store.putDocument(*doc); err != nil {
+			if err := s.store.putDocumentContext(ctx, *doc); err != nil {
 				return err
 			}
 			if publishedVectors > 0 {
@@ -1125,16 +1479,16 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 				doc.ErrorCode = code
 				doc.ErrorMessage = cause.Error()
 				doc.UpdatedAt = now()
-				return s.store.putDocument(*doc)
+				return s.store.putDocumentContext(ctx, *doc)
 			}
 			if code == ErrInterrupted {
 				return nil
 			}
 			doc.SourceVersion++
 			if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
-				return s.failDocument(doc, code, err)
+				return s.failDocumentContext(ctx, doc, code, err)
 			}
-			rawPaths, pruneErr := s.store.pruneRetiredGenerations(doc.ID, generation)
+			rawPaths, pruneErr := s.store.pruneRetiredGenerationsWithContext(ctx, doc.ID, generation)
 			if pruneErr != nil {
 				return pruneErr
 			}
@@ -1162,9 +1516,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.UpdatedAt = now()
 	doc.SourceVersion++
 	if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
-		return s.failDocument(doc, ErrParseFailed, err)
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
-	rawPaths, err := s.store.pruneRetiredGenerations(doc.ID, generation)
+	rawPaths, err := s.store.pruneRetiredGenerationsWithContext(ctx, doc.ID, generation)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1554,10 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 		}
 	}
 
-	parsed, parseErr := s.parsers.Parse(doc.FileName, data)
+	parsed, parseErr := s.parsers.ParseContext(ctx, doc.FileName, data)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", "", ctxErr
+	}
 	nativeAvailable := parseErr == nil && strings.TrimSpace(parsed.Text) != ""
 	// The parser may still provide fragmented native text while requesting a
 	// healthier OCR pass (upstream's text-layer health behavior).
@@ -1496,7 +1853,10 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		hashes = append(hashes, row.EmbeddingHash)
 		textByHash[row.EmbeddingHash] = row.EmbeddingText
 	}
-	reuse := s.store.ListEmbeddingVectorsByHashes(hashes, modelKey)
+	reuse, err := s.store.ListEmbeddingVectorsByHashesContext(ctx, hashes, modelKey)
+	if err != nil {
+		return ErrEmbeddingProvider, err
+	}
 	var pendingHashes []string
 	reusedForDocument := map[string][]float64{}
 	for _, hash := range hashes {
@@ -1509,7 +1869,7 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		}
 	}
 	if len(reusedForDocument) > 0 {
-		if err := s.store.PutChunkVectors(doc.ID, rows[0].IndexGeneration, modelKey, reusedForDocument); err != nil {
+		if err := s.store.PutChunkVectorsContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, reusedForDocument); err != nil {
 			return ErrEmbeddingProvider, err
 		}
 	}
@@ -1518,10 +1878,13 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 	progressStep := 100 / (len(rows) + 1)
 	landed := 0
 	report := func() {
+		if ctx.Err() != nil {
+			return
+		}
 		landed++
 		doc.Progress = minInt(99, landed*progressStep)
 		doc.UpdatedAt = now()
-		_ = s.store.putDocument(*doc)
+		_ = s.store.putDocumentContext(ctx, *doc)
 	}
 	for start := 0; start < len(pendingHashes); start += batchSize {
 		end := minInt(start+batchSize, len(pendingHashes))
@@ -1550,7 +1913,7 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 			}
 			byHash[batch[i]] = vector
 		}
-		if err := s.store.PutChunkVectors(doc.ID, rows[0].IndexGeneration, modelKey, byHash); err != nil {
+		if err := s.store.PutChunkVectorsContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, byHash); err != nil {
 			return ErrEmbeddingProvider, err
 		}
 		report()
@@ -1560,13 +1923,20 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 }
 
 func (s *Service) failDocument(doc *Document, code string, cause error) error {
+	return s.failDocumentContext(context.Background(), doc, code, cause)
+}
+
+func (s *Service) failDocumentContext(ctx context.Context, doc *Document, code string, cause error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	doc.Status = StatusFailed
 	doc.Phase = ""
 	doc.ErrorCode = code
 	doc.ErrorMessage = cause.Error()
 	doc.Incomplete = false
 	doc.UpdatedAt = now()
-	if err := s.store.putDocument(*doc); err != nil {
+	if err := s.store.putDocumentContext(ctx, *doc); err != nil {
 		return err
 	}
 	return fmt.Errorf("%s: %w", code, cause)

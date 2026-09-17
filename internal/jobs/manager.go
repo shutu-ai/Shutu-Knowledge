@@ -79,6 +79,8 @@ type Manager struct {
 	ioQueue   chan *task
 	workers   int
 	wg        sync.WaitGroup
+	stopOnce  sync.Once
+	stopDone  chan struct{}
 	onFailure func(kind string)
 }
 
@@ -88,11 +90,12 @@ func New(db *storage.DB, workers int) *Manager {
 		workers = 1
 	}
 	return &Manager{
-		db:      db,
-		tasks:   map[string]*task{},
-		queue:   make(chan *task, 256),
-		ioQueue: make(chan *task, 256),
-		workers: workers,
+		db:       db,
+		tasks:    map[string]*task{},
+		queue:    make(chan *task, 256),
+		ioQueue:  make(chan *task, 256),
+		workers:  workers,
+		stopDone: make(chan struct{}),
 	}
 }
 
@@ -120,8 +123,21 @@ func (m *Manager) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop waits for in-flight tasks (best effort) and drains workers.
+// Stop waits for in-flight tasks for a bounded compatibility budget.
 func (m *Manager) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	m.StopWithContext(ctx)
+}
+
+// StopWithContext cancels accepted tasks, closes the queues once, and waits
+// for workers without allowing a non-cooperative legacy task to block process
+// shutdown forever. A caller that needs the workers fully drained can retry
+// with a later context; the manager retains the same cancellation state.
+func (m *Manager) StopWithContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// A task context is independent from the process context so that a request
 	// cancellation cannot accidentally cancel accepted work. Shutdown must
 	// therefore cancel all accepted tasks before waiting for workers; otherwise
@@ -131,9 +147,18 @@ func (m *Manager) Stop() {
 		t.cancel()
 	}
 	m.mu.Unlock()
-	close(m.queue)
-	close(m.ioQueue)
-	m.wg.Wait()
+	m.stopOnce.Do(func() {
+		close(m.queue)
+		close(m.ioQueue)
+		go func() {
+			m.wg.Wait()
+			close(m.stopDone)
+		}()
+	})
+	select {
+	case <-m.stopDone:
+	case <-ctx.Done():
+	}
 }
 
 // Submit enqueues one task and persists its job row.

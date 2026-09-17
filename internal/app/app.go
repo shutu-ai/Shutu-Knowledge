@@ -17,7 +17,6 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/health"
-	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/logging"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
@@ -39,7 +38,6 @@ type App struct {
 	DB             *storage.DB
 	RawStore       *storage.RawFileStore
 	Health         *health.Registry
-	Jobs           *jobs.Manager
 	Operations     *operations.Service
 	Knowledge      *knowledge.Service
 	Models         *models.Manager
@@ -49,11 +47,15 @@ type App struct {
 	modelAdmission scheduler.Admission
 	// ManagedRuntime reports whether Knowledge prepared its own pinned runtime
 	// rather than using an explicitly configured deployment helper.
-	ManagedRuntime  bool
-	startupOnce     sync.Once
-	startupDone     chan struct{}
-	maintenanceOnce sync.Once
-	maintenanceDone chan struct{}
+	ManagedRuntime    bool
+	startupOnce       sync.Once
+	startupDone       chan struct{}
+	startupCancel     context.CancelFunc
+	lifecycleMu       sync.RWMutex
+	startupErr        error
+	maintenanceOnce   sync.Once
+	maintenanceDone   chan struct{}
+	maintenanceCancel context.CancelFunc
 	// deleteDocumentBoundary is a test-only synchronization point at the
 	// durable fence/cleanup boundary. Production leaves it nil.
 	deleteDocumentBoundary func()
@@ -106,23 +108,11 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 
 	application := &App{Home: home, Config: cfg, Logger: logger, DB: db, RawStore: raw, Health: health.NewRegistry(), instanceLock: instanceLock}
 	application.registerHealth()
-	application.Jobs = jobs.New(db, cfg.Jobs.ImportWorkers)
-	application.Knowledge = knowledge.NewService(db, raw, cfg, application.Jobs)
+	application.Knowledge = knowledge.NewService(db, raw, cfg)
 	application.modelAdmission = scheduler.NewSemaphore(cfg.Scheduler.Model)
 	application.Knowledge.SetSharedModelAdmission(application.modelAdmission)
-	application.Jobs.SetFailureObserver(application.Knowledge.ObserveJobFailure)
 	application.Operations, err = application.newOperationService()
 	if err != nil {
-		_ = db.Close()
-		_ = instanceLock.Release()
-		return nil, err
-	}
-	if err := application.Jobs.Start(ctx); err != nil {
-		_ = db.Close()
-		_ = instanceLock.Release()
-		return nil, err
-	}
-	if err := application.Operations.Start(ctx); err != nil {
 		_ = db.Close()
 		_ = instanceLock.Release()
 		return nil, err
@@ -142,6 +132,20 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 		application.Knowledge.SetOCRArtifactProvider(application.ocrArtifactPath)
 	}
 	application.registerOptionalHealth()
+	// Start durable workers only after every dependency they may call has been
+	// fully wired. Starting recovery dispatch before SetRuntime finishes lets a
+	// recovered operation race provider configuration during a second-process
+	// startup.
+	if err := application.Operations.Start(ctx); err != nil {
+		if application.Runtime != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			_ = closeRuntimeWithContext(cleanupCtx, application.Runtime)
+			cleanupCancel()
+		}
+		_ = db.Close()
+		_ = instanceLock.Release()
+		return nil, err
+	}
 	if options.DeferStartupRecovery {
 		return application, nil
 	}
@@ -158,27 +162,43 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 // operation for maintenance workflows.
 func (a *App) StartBackgroundRecovery() {
 	a.startupOnce.Do(func() {
-		a.startupDone = make(chan struct{})
+		done := make(chan struct{})
+		startupCtx, cancel := context.WithCancel(context.Background())
+		a.lifecycleMu.Lock()
+		a.startupDone = done
+		a.startupCancel = cancel
+		a.lifecycleMu.Unlock()
 		go func() {
-			defer close(a.startupDone)
-			a.runStartupRecovery(context.Background())
+			defer close(done)
+			a.runStartupRecovery(startupCtx)
 		}()
 	})
 }
 
 func (a *App) runStartupRecovery(ctx context.Context) {
 	if resumed, failed, err := a.Knowledge.RecoverInterrupted(ctx); err != nil {
+		a.lifecycleMu.Lock()
+		a.startupErr = fmt.Errorf("storage recovery incomplete: %w", err)
+		a.lifecycleMu.Unlock()
 		a.Logger.Warn("startup recovery incomplete", "error", err)
 	} else if resumed > 0 || failed > 0 {
 		a.Logger.Info("startup recovery", "resumed", resumed, "failed", failed)
 	}
 }
 
+func (a *App) startupError() error {
+	a.lifecycleMu.RLock()
+	defer a.lifecycleMu.RUnlock()
+	return a.startupErr
+}
+
 // StartupInProgress reports whether deferred startup recovery is still
 // running. It is deliberately a non-blocking check for HTTP and Agent health
 // handlers.
 func (a *App) StartupInProgress() bool {
+	a.lifecycleMu.RLock()
 	done := a.startupDone
+	a.lifecycleMu.RUnlock()
 	if done == nil {
 		return false
 	}
@@ -190,17 +210,28 @@ func (a *App) StartupInProgress() bool {
 	}
 }
 
-// HealthSnapshot keeps readiness probes independent from deferred startup
-// work. The database-backed checks run once recovery has completed.
+// HealthSnapshot keeps readiness probes non-blocking while deferred startup
+// work runs. The database-backed checks run once recovery has completed.
 func (a *App) HealthSnapshot(ctx context.Context) health.Report {
 	if a.StartupInProgress() {
 		return health.Report{
-			Ready:  true,
+			Ready:  false,
 			Status: "starting",
 			Components: []health.Component{{
 				Name:   "startup-recovery",
 				Status: "ok",
 				Detail: "storage recovery is running in the background",
+			}},
+		}
+	}
+	if err := a.startupError(); err != nil {
+		return health.Report{
+			Ready:  false,
+			Status: "unhealthy: startup-recovery",
+			Components: []health.Component{{
+				Name:   "startup-recovery",
+				Status: "failed",
+				Detail: err.Error(),
 			}},
 		}
 	}
@@ -212,19 +243,60 @@ func (a *App) HealthSnapshot(ctx context.Context) health.Report {
 // not wait for maintenance of a large database.
 func (a *App) StartBackgroundMaintenance() {
 	a.maintenanceOnce.Do(func() {
-		a.maintenanceDone = make(chan struct{})
+		done := make(chan struct{})
+		maintenanceCtx, cancel := context.WithCancel(context.Background())
+		a.lifecycleMu.Lock()
+		a.maintenanceDone = done
+		a.maintenanceCancel = cancel
+		a.lifecycleMu.Unlock()
 		go func() {
-			defer close(a.maintenanceDone)
-			maintenance, err := a.DB.MaintainSQLite(
-				a.Config.Maintenance.FTSAutoOptimize,
-				a.Config.Maintenance.Vacuum,
-				int64(a.Config.Maintenance.VacuumThresholdMB)*1024*1024,
-			)
+			defer close(done)
+			payload, err := json.Marshal(storageMaintenanceCommand{
+				SQLiteOnly:      true,
+				OptimizeFTS:     a.Config.Maintenance.FTSAutoOptimize,
+				Vacuum:          a.Config.Maintenance.Vacuum,
+				VacuumThreshold: int64(a.Config.Maintenance.VacuumThresholdMB) * 1024 * 1024,
+			})
 			if err != nil {
-				a.Logger.Warn("storage maintenance incomplete", "error", err)
-			} else if maintenance.FTSOptimized || maintenance.Vacuumed {
-				a.Logger.Info("storage maintenance", "ftsOptimized", maintenance.FTSOptimized,
-					"vacuumed", maintenance.Vacuumed, "databaseBytes", maintenance.DatabaseBytes)
+				a.Logger.Warn("storage maintenance admission failed", "error", err)
+				return
+			}
+			op, err := a.Operations.Submit(maintenanceCtx, operations.Request{
+				Type:                 "maintenance_storage",
+				CommandSchemaVersion: operations.CommandSchemaV1,
+				Payload:              payload,
+				IdempotencyKey: fmt.Sprintf("startup-storage-maintenance-v1-%t-%t-%d",
+					a.Config.Maintenance.FTSAutoOptimize, a.Config.Maintenance.Vacuum,
+					a.Config.Maintenance.VacuumThresholdMB),
+				ResourceClass: operations.ResourceMaintenance,
+				Priority:      -100,
+			})
+			if err != nil {
+				a.Logger.Warn("storage maintenance admission failed", "error", err)
+				return
+			}
+			for {
+				switch op.State {
+				case operations.StateSucceeded:
+					a.Logger.Info("storage maintenance operation completed", "operationId", op.ID)
+					return
+				case operations.StateFailed, operations.StateCancelled:
+					a.Logger.Warn("storage maintenance incomplete", "operationId", op.ID,
+						"state", op.State, "error", op.ErrorMessage)
+					return
+				}
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-maintenanceCtx.Done():
+					return
+				case <-timer.C:
+				}
+				next, getErr := a.Operations.GetContext(maintenanceCtx, op.ID)
+				if getErr != nil {
+					a.Logger.Warn("storage maintenance status unavailable", "operationId", op.ID, "error", getErr)
+					return
+				}
+				op = next
 			}
 		}()
 	})
@@ -403,8 +475,8 @@ func (a *App) registerOptionalHealth() {
 	a.Health.Register(health.CheckerFunc{
 		CheckName: "processor-mineru",
 		Level:     health.Optional,
-		Fn: func(context.Context) error {
-			bases, err := a.Knowledge.ListBases()
+		Fn: func(ctx context.Context) error {
+			bases, err := a.Knowledge.ListBasesContext(ctx)
 			if err != nil {
 				return err
 			}
@@ -505,8 +577,8 @@ func (a *App) registerHealth() {
 	a.Health.Register(health.CheckerFunc{
 		CheckName: "schema",
 		Level:     health.Critical,
-		Fn: func(context.Context) error {
-			v, err := storage.SchemaVersion(a.DB.ReadDB())
+		Fn: func(ctx context.Context) error {
+			v, err := storage.SchemaVersionContext(ctx, a.DB.ReadDB())
 			if err != nil {
 				return err
 			}
@@ -530,8 +602,8 @@ func (a *App) registerHealth() {
 	a.Health.Register(health.CheckerFunc{
 		CheckName: "storage-format",
 		Level:     health.Critical,
-		Fn: func(context.Context) error {
-			_, err := storage.StorageFormat(a.DB.DB)
+		Fn: func(ctx context.Context) error {
+			_, err := storage.StorageFormatContext(ctx, a.DB.ReadDB())
 			return err
 		},
 	})
@@ -542,9 +614,29 @@ func (a *App) registerHealth() {
 // UpdateConfig persists runtime settings in the Knowledge data domain and
 // applies them without requiring a process restart.
 func (a *App) UpdateConfig(cfg config.Config) error {
+	return a.UpdateConfigWithContext(context.Background(), cfg)
+}
+
+// UpdateConfigWithContext persists and applies runtime settings inside the
+// request or durable-operation cancellation boundary.
+func (a *App) UpdateConfigWithContext(ctx context.Context, cfg config.Config) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	cfg = cfg.Normalized()
-	if err := config.Save(filepath.Join(a.Home, "config.yaml"), cfg); err != nil {
+	if err := config.SaveContext(ctx, filepath.Join(a.Home, "config.yaml"), cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
+	}
+	if a.Runtime != nil {
+		closeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		if err := closeRuntimeWithContext(closeCtx, a.Runtime); err != nil {
+			cancel()
+			return fmt.Errorf("runtime shutdown incomplete: %w", err)
+		}
+		cancel()
 	}
 	a.Config = cfg
 	if a.Knowledge != nil {
@@ -554,7 +646,6 @@ func (a *App) UpdateConfig(cfg config.Config) error {
 		a.Models = models.NewManager(a.modelCacheDir(), cfg.Models.HFEndpoint, nil)
 	}
 	if a.Runtime != nil {
-		a.Runtime.Close()
 		a.Runtime = a.newRuntimeManager()
 	}
 	if a.Knowledge != nil {
@@ -588,25 +679,64 @@ func (a *App) PlanModelCacheMigration(target string) (models.MigrationPlan, erro
 }
 
 func (a *App) MigrateModelCache(target string, removeSource bool) (models.MigrationResult, error) {
+	return a.MigrateModelCacheContext(context.Background(), target, removeSource)
+}
+
+// MigrateModelCacheContext keeps the model-cache move inside the durable
+// operation context. The new config is persisted only after the target cache
+// has been copied and verified, but before an explicitly requested source
+// removal, so replay never has to infer ownership from a half-copied cache.
+func (a *App) MigrateModelCacheContext(ctx context.Context, target string, removeSource bool) (models.MigrationResult, error) {
 	resolved := a.resolveModelCacheDir(target)
-	result, err := a.Models.Migrate(resolved, removeSource)
+	nextConfig := a.Config
+	nextConfig.Models.CacheDir = resolved
+	if modelCachePathsEqual(a.Models.Root(), resolved) {
+		if err := config.SaveContext(ctx, filepath.Join(a.Home, "config.yaml"), nextConfig); err != nil {
+			return models.MigrationResult{}, fmt.Errorf("save migrated model cache: %w", err)
+		}
+		a.Config = nextConfig
+		modelCount, err := a.Models.CountContext(ctx)
+		if err != nil {
+			return models.MigrationResult{}, err
+		}
+		return models.MigrationResult{SourceDir: resolved, TargetDir: resolved, ModelCount: modelCount}, nil
+	}
+	result, err := a.Models.MigrateContext(ctx, resolved, removeSource, func() error {
+		if err := config.SaveContext(ctx, filepath.Join(a.Home, "config.yaml"), nextConfig); err != nil {
+			return fmt.Errorf("save migrated model cache: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
 		return result, err
 	}
-	previous := a.Config.Models.CacheDir
-	a.Config.Models.CacheDir = resolved
-	if err := config.Save(filepath.Join(a.Home, "config.yaml"), a.Config); err != nil {
-		a.Config.Models.CacheDir = previous
-		return result, fmt.Errorf("save migrated model cache: %w", err)
-	}
+	a.Config = nextConfig
 	a.Models = models.NewManager(resolved, a.Config.Models.HFEndpoint, nil)
 	return result, nil
+}
+
+func modelCachePathsEqual(left, right string) bool {
+	left, _ = filepath.Abs(filepath.Clean(left))
+	right, _ = filepath.Abs(filepath.Clean(right))
+	if filepath.Separator == '\\' {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 // LocalModelView is a cache model plus the latest persisted reranker test.
 type LocalModelView struct {
 	models.Model
 	SelfTest *knowledge.RerankSelfTest `json:"selfTest,omitempty"`
+}
+
+// LocalModelsPage is the bounded control-plane view returned by the model
+// picker. Runtime/configured entries may be appended to the first page, while
+// manifest-backed cache entries are paged by the model manager.
+type LocalModelsPage struct {
+	Models     []LocalModelView `json:"models"`
+	NextOffset int              `json:"nextOffset"`
+	HasMore    bool             `json:"hasMore"`
 }
 
 type managedRuntimeState struct {
@@ -668,6 +798,43 @@ func cachedManagedModels(home, cacheDir string) []LocalModelView {
 	return views
 }
 
+// ManagedModelCapability identifies a managed-runtime model without probing
+// the helper. Model removal is a control-plane operation; it must classify a
+// cached model from configuration or the persisted runtime catalog rather than
+// running a potentially expensive health/inference call in an HTTP handler.
+func (a *App) ManagedModelCapability(id string) string {
+	if !a.ManagedRuntime {
+		return ""
+	}
+	id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
+	if id == "" {
+		return ""
+	}
+	candidates := []struct {
+		id, capability string
+	}{
+		{id: a.Config.Embedding.Model, capability: runtime.CapabilityEmbedding},
+		{id: a.Config.Rerank.Model, capability: runtime.CapabilityRerank},
+	}
+	for _, candidate := range candidates {
+		if strings.TrimPrefix(strings.TrimSpace(candidate.id), "local:") == id {
+			return candidate.capability
+		}
+	}
+	for _, view := range cachedManagedModels(a.Home, a.modelCacheDir()) {
+		if view.ID != id {
+			continue
+		}
+		if view.Kind == models.KindEmbedding {
+			return runtime.CapabilityEmbedding
+		}
+		if view.Kind == models.KindRerank {
+			return runtime.CapabilityRerank
+		}
+	}
+	return ""
+}
+
 func safeModelCachePath(root, id string) bool {
 	root = filepath.Clean(root)
 	candidate := filepath.Join(root, filepath.FromSlash(id))
@@ -676,24 +843,44 @@ func safeModelCachePath(root, id string) bool {
 }
 
 func (a *App) ListLocalModels() ([]LocalModelView, error) {
-	return a.listLocalModels("")
+	page, err := a.ListLocalModelsPageContext(context.Background(), "", 0, 0)
+	return page.Models, err
 }
 
 // ListLocalModelsForBase includes the selected base's effective model
 // configuration. Base overrides must be visible to the model picker even when
 // the global model configuration points at a different model.
 func (a *App) ListLocalModelsForBase(baseID string) ([]LocalModelView, error) {
-	return a.listLocalModels(baseID)
+	page, err := a.ListLocalModelsPageContext(context.Background(), baseID, 0, 0)
+	return page.Models, err
 }
 
 func (a *App) listLocalModels(baseID string) ([]LocalModelView, error) {
-	items, err := a.Models.List()
-	if err != nil {
-		return nil, err
+	page, err := a.ListLocalModelsPageContext(context.Background(), baseID, 0, 0)
+	return page.Models, err
+}
+
+// ListLocalModelsPage returns a bounded local-model view. The legacy methods
+// above retain their response shape, while HTTP callers can advance through
+// manifest-backed cache entries using nextOffset/hasMore.
+func (a *App) ListLocalModelsPage(baseID string, limit, offset int) (LocalModelsPage, error) {
+	return a.ListLocalModelsPageContext(context.Background(), baseID, limit, offset)
+}
+
+// ListLocalModelsPageContext returns a bounded local-model view while keeping
+// filesystem, metadata, and runtime status reads inside the caller context.
+func (a *App) ListLocalModelsPageContext(ctx context.Context, baseID string, limit, offset int) (LocalModelsPage, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	custom, err := a.Knowledge.ListCustomRerankers()
+	modelPage, err := a.Models.ListPageContext(ctx, limit, offset)
 	if err != nil {
-		return nil, err
+		return LocalModelsPage{}, err
+	}
+	items := modelPage.Models
+	custom, err := a.Knowledge.ListCustomRerankersContext(ctx)
+	if err != nil {
+		return LocalModelsPage{}, err
 	}
 	views := make([]LocalModelView, 0, len(items)+len(custom))
 	seen := map[string]bool{}
@@ -701,33 +888,24 @@ func (a *App) listLocalModels(baseID string) ([]LocalModelView, error) {
 		seen[model.ID] = true
 		view := LocalModelView{Model: model}
 		if model.Kind == models.KindRerank {
-			test, err := a.Knowledge.GetRerankSelfTest(
+			test, err := a.Knowledge.GetRerankSelfTestContext(ctx,
 				model.ID, model.SizeBytes, model.Downloaded, len(model.Artifacts),
 			)
 			if err != nil {
-				return nil, err
+				return LocalModelsPage{}, err
 			}
 			view.SelfTest = &test
 		}
 		views = append(views, view)
-	}
-	for _, item := range custom {
-		if !seen[item.ID] {
-			views = append(views, LocalModelView{Model: models.Model{
-				ID: item.ID, Kind: models.KindRerank, Status: "registered",
-				Lifecycle: models.LifecycleNotInstalled, Runtime: models.LifecycleRuntimeMiss,
-				Artifacts: []string{}, Downloaded: 0,
-			}})
-		}
 	}
 	configuredEmbeddingModel := a.Config.Embedding.Model
 	configuredRerankModel := a.Config.Rerank.Model
 	embeddingLocal := a.Config.Embedding.Provider == "local"
 	rerankEnabled := a.Config.Rerank.Enabled
 	if baseID != "" {
-		base, baseErr := a.Knowledge.GetBase(baseID)
+		base, baseErr := a.Knowledge.GetBaseWithContext(ctx, baseID)
 		if baseErr != nil {
-			return nil, baseErr
+			return LocalModelsPage{}, baseErr
 		}
 		effective := knowledge.ResolveBaseConfig(a.Config, base.Config)
 		configuredEmbeddingModel = effective.EmbeddingModel
@@ -735,104 +913,129 @@ func (a *App) listLocalModels(baseID string) ([]LocalModelView, error) {
 		embeddingLocal = effective.EmbeddingProvider == "local"
 		rerankEnabled = effective.RerankEnabled != nil && *effective.RerankEnabled
 	}
-	if a.Runtime != nil {
-		runtimeStatus := a.Runtime.Status(context.Background())
-		addManaged := func(id, kind, capability string) {
-			id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
-			if id == "" || !a.ManagedRuntime || seen[id] {
-				return
+	// Non-manifest entries are a small compatibility catalog. Keep them on the
+	// first page only so advancing manifest pages never duplicates them.
+	if offset == 0 {
+		for _, item := range custom {
+			if !seen[item.ID] {
+				views = append(views, LocalModelView{Model: models.Model{
+					ID: item.ID, Kind: models.KindRerank, Status: "registered",
+					Lifecycle: models.LifecycleNotInstalled, Runtime: models.LifecycleRuntimeMiss,
+					Artifacts: []string{}, Downloaded: 0,
+				}})
 			}
-			health := runtimeStatus[capability]
-			lifecycle := models.LifecycleNotInstalled
-			if health.Lifecycle != "" {
-				lifecycle = health.Lifecycle
-			} else if health.Details != nil && health.Details["lifecycle"] != "" {
-				lifecycle = health.Details["lifecycle"]
+		}
+		if a.Runtime != nil {
+			runtimeStatus := map[string]runtime.Health{}
+			if snapshotter, ok := a.Runtime.(runtime.StatusSnapshotter); ok {
+				runtimeStatus = snapshotter.CachedStatus()
+			} else {
+				// Compatibility controllers predating StatusSnapshotter may only
+				// expose a live status call; production Manager uses the bounded
+				// cached path above.
+				runtimeStatus = a.Runtime.Status(ctx)
 			}
-			lastError := ""
-			runtimePath := health.Path
-			remediation := health.Remediation
-			lastError = health.LastError
-			if health.Details != nil {
-				if lastError == "" {
-					lastError = health.Details["error"]
+			addManaged := func(id, kind, capability string) {
+				id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
+				if id == "" || !a.ManagedRuntime || seen[id] {
+					return
 				}
-			}
-			status := "not-downloaded"
-			switch {
-			case health.Lifecycle == models.LifecycleFailed:
-				status = "incomplete"
-			case health.Ready || (health.Model != "" && health.Lifecycle != models.LifecycleNotInstalled) || health.Lifecycle == models.LifecycleInstalled || health.Lifecycle == models.LifecycleLoading || health.Lifecycle == models.LifecycleReady:
-				status = "installed"
-				if health.Ready {
-					lifecycle = models.LifecycleReady
+				health := runtimeStatus[capability]
+				lifecycle := models.LifecycleNotInstalled
+				if health.Lifecycle != "" {
+					lifecycle = health.Lifecycle
+				} else if health.Details != nil && health.Details["lifecycle"] != "" {
+					lifecycle = health.Details["lifecycle"]
 				}
-			}
-			var selfTest *knowledge.RerankSelfTest
-			if kind == models.KindRerank {
-				test, err := a.Knowledge.GetRerankSelfTest(id, 0, 0, 0)
-				if err == nil && test.CheckedAt > 0 {
-					selfTest = &test
+				lastError := ""
+				runtimePath := health.Path
+				remediation := health.Remediation
+				lastError = health.LastError
+				if health.Details != nil {
+					if lastError == "" {
+						lastError = health.Details["error"]
+					}
 				}
+				status := "not-downloaded"
+				switch {
+				case health.Lifecycle == models.LifecycleFailed:
+					status = "incomplete"
+				case health.Ready || (health.Model != "" && health.Lifecycle != models.LifecycleNotInstalled) || health.Lifecycle == models.LifecycleInstalled || health.Lifecycle == models.LifecycleLoading || health.Lifecycle == models.LifecycleReady:
+					status = "installed"
+					if health.Ready {
+						lifecycle = models.LifecycleReady
+					}
+				}
+				var selfTest *knowledge.RerankSelfTest
+				if kind == models.KindRerank {
+					test, err := a.Knowledge.GetRerankSelfTestContext(ctx, id, 0, 0, 0)
+					if err == nil && test.CheckedAt > 0 {
+						selfTest = &test
+					}
+				}
+				views = append(views, LocalModelView{Model: models.Model{
+					ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
+					Ready: health.Ready, Runtime: health.Version, RuntimePath: runtimePath,
+					LastError: lastError, Remediation: remediation,
+				}, SelfTest: selfTest})
+				seen[id] = true
 			}
-			views = append(views, LocalModelView{Model: models.Model{
-				ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
-				Ready: health.Ready, Runtime: health.Version, RuntimePath: runtimePath,
-				LastError: lastError, Remediation: remediation,
-			}, SelfTest: selfTest})
-			seen[id] = true
-		}
-		addConfiguredManaged := func(configuredID, kind, capability string, useConfigured bool) {
-			if !useConfigured {
-				return
+			addConfiguredManaged := func(configuredID, kind, capability string, useConfigured bool) {
+				if !useConfigured {
+					return
+				}
+				id := strings.TrimPrefix(strings.TrimSpace(configuredID), "local:")
+				if id == "" || !a.ManagedRuntime || seen[id] {
+					return
+				}
+				health := runtimeStatus[capability]
+				healthModel := strings.TrimPrefix(strings.TrimSpace(health.Model), "local:")
+				if healthModel == id && health.Lifecycle != models.LifecycleNotInstalled {
+					addManaged(id, kind, capability)
+					return
+				}
+				status := "not-downloaded"
+				lifecycle := models.LifecycleNotInstalled
+				runtimeStatusValue := models.LifecycleRuntimeMiss
+				if _, statErr := os.Stat(filepath.Join(a.modelCacheDir(), filepath.FromSlash(id))); statErr == nil {
+					status = "installed"
+					lifecycle = models.LifecycleInstalled
+					runtimeStatusValue = "RUNTIME_CACHED"
+				}
+				views = append(views, LocalModelView{Model: models.Model{
+					ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
+					Runtime: runtimeStatusValue,
+				}})
+				seen[id] = true
 			}
-			id := strings.TrimPrefix(strings.TrimSpace(configuredID), "local:")
-			if id == "" || !a.ManagedRuntime || seen[id] {
-				return
+			// The currently loaded runtime model is useful even when the selected
+			// base points at another cached model. Add both entries so the picker can
+			// distinguish a loaded model from an installed-but-not-loaded one.
+			health := runtimeStatus[runtime.CapabilityEmbedding]
+			if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
+				addManaged(health.Model, models.KindEmbedding, runtime.CapabilityEmbedding)
 			}
-			health := runtimeStatus[capability]
-			healthModel := strings.TrimPrefix(strings.TrimSpace(health.Model), "local:")
-			if healthModel == id && health.Lifecycle != models.LifecycleNotInstalled {
-				addManaged(id, kind, capability)
-				return
+			health = runtimeStatus[runtime.CapabilityRerank]
+			if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
+				addManaged(health.Model, models.KindRerank, runtime.CapabilityRerank)
 			}
-			status := "not-downloaded"
-			lifecycle := models.LifecycleNotInstalled
-			runtimeStatusValue := models.LifecycleRuntimeMiss
-			if _, statErr := os.Stat(filepath.Join(a.modelCacheDir(), filepath.FromSlash(id))); statErr == nil {
-				status = "installed"
-				lifecycle = models.LifecycleInstalled
-				runtimeStatusValue = "RUNTIME_CACHED"
-			}
-			views = append(views, LocalModelView{Model: models.Model{
-				ID: id, Kind: kind, Status: status, Lifecycle: lifecycle,
-				Runtime: runtimeStatusValue,
-			}})
-			seen[id] = true
-		}
-		// The currently loaded runtime model is useful even when the selected
-		// base points at another cached model. Add both entries so the picker can
-		// distinguish a loaded model from an installed-but-not-loaded one.
-		health := runtimeStatus[runtime.CapabilityEmbedding]
-		if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
-			addManaged(health.Model, models.KindEmbedding, runtime.CapabilityEmbedding)
-		}
-		health = runtimeStatus[runtime.CapabilityRerank]
-		if strings.TrimSpace(health.Model) != "" && health.Lifecycle != models.LifecycleNotInstalled {
-			addManaged(health.Model, models.KindRerank, runtime.CapabilityRerank)
-		}
-		addConfiguredManaged(configuredEmbeddingModel, models.KindEmbedding, runtime.CapabilityEmbedding, embeddingLocal)
-		addConfiguredManaged(configuredRerankModel, models.KindRerank, runtime.CapabilityRerank, rerankEnabled)
-		if a.ManagedRuntime {
-			for _, cached := range cachedManagedModels(a.Home, a.modelCacheDir()) {
-				if !seen[cached.ID] {
-					views = append(views, cached)
-					seen[cached.ID] = true
+			addConfiguredManaged(configuredEmbeddingModel, models.KindEmbedding, runtime.CapabilityEmbedding, embeddingLocal)
+			addConfiguredManaged(configuredRerankModel, models.KindRerank, runtime.CapabilityRerank, rerankEnabled)
+			if a.ManagedRuntime {
+				for _, cached := range cachedManagedModels(a.Home, a.modelCacheDir()) {
+					if !seen[cached.ID] {
+						views = append(views, cached)
+						seen[cached.ID] = true
+					}
 				}
 			}
 		}
 	}
-	return views, nil
+	page := LocalModelsPage{Models: views, HasMore: modelPage.HasMore}
+	if modelPage.HasMore {
+		page.NextOffset = modelPage.NextOffset
+	}
+	return page, nil
 }
 
 // SelfTestReranker asks the isolated helper to score relevant and irrelevant
@@ -844,9 +1047,18 @@ func (a *App) SelfTestReranker(ctx context.Context, id string) (knowledge.Rerank
 // SelfTestRerankerWithProgress performs the same readiness check while
 // exposing managed-runtime loading phases to the Web job layer.
 func (a *App) SelfTestRerankerWithProgress(ctx context.Context, id string, report func(runtime.ModelProgress)) (knowledge.RerankSelfTest, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return knowledge.RerankSelfTest{}, err
+	}
 	id = strings.TrimPrefix(strings.TrimSpace(id), "local:")
-	model, err := a.Models.Get(id)
+	model, err := a.Models.GetContext(ctx, id)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return knowledge.RerankSelfTest{}, ctxErr
+		}
 		// The managed runtime owns its Transformers.js cache and does not
 		// publish the manifest used by the generic artifact manager. Its live
 		// health state is therefore the source of truth for managed models.
@@ -922,7 +1134,7 @@ func (a *App) SelfTestRerankerWithProgress(ctx context.Context, id string, repor
 	}
 	if !healthy {
 		result.Error = "rerank self-test did not return two distinct valid scores in relevant-to-irrelevant order"
-		if err := a.Knowledge.SaveRerankSelfTest(result); err != nil {
+		if err := a.Knowledge.SaveRerankSelfTestContext(ctx, result); err != nil {
 			return result, err
 		}
 		return result, fmt.Errorf("%s", result.Error)
@@ -930,7 +1142,7 @@ func (a *App) SelfTestRerankerWithProgress(ctx context.Context, id string, repor
 	result.Healthy = true
 	result.Scores = payload.Scores
 	result.Current = true
-	if err := a.Knowledge.SaveRerankSelfTest(result); err != nil {
+	if err := a.Knowledge.SaveRerankSelfTestContext(ctx, result); err != nil {
 		return result, err
 	}
 	if report != nil {
@@ -941,25 +1153,73 @@ func (a *App) SelfTestRerankerWithProgress(ctx context.Context, id string, repor
 
 // Close releases all resources.
 func (a *App) Close() {
-	if a.startupDone != nil {
-		<-a.startupDone
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	a.lifecycleMu.RLock()
+	startupCancel := a.startupCancel
+	maintenanceCancel := a.maintenanceCancel
+	startupDone := a.startupDone
+	maintenanceDone := a.maintenanceDone
+	a.lifecycleMu.RUnlock()
+	if startupCancel != nil {
+		startupCancel()
 	}
-	if a.maintenanceDone != nil {
-		<-a.maintenanceDone
+	if maintenanceCancel != nil {
+		maintenanceCancel()
+	}
+	waitDone := func(done chan struct{}) {
+		if done == nil {
+			return
+		}
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+			a.Logger.Warn("shutdown wait exceeded deadline")
+		}
+	}
+	waitDone(startupDone)
+	waitDone(maintenanceDone)
+	if a.Operations != nil {
+		a.Operations.StopWithContext(shutdownCtx)
 	}
 	if a.Runtime != nil {
-		a.Runtime.Close()
-	}
-	if a.Jobs != nil {
-		a.Jobs.Stop()
-	}
-	if a.Operations != nil {
-		a.Operations.Stop()
+		if err := closeRuntimeWithContext(shutdownCtx, a.Runtime); err != nil {
+			a.Logger.Warn("runtime shutdown incomplete", "error", err)
+		}
 	}
 	if a.DB != nil {
-		_ = a.DB.Close()
+		if err := a.DB.CloseWithContext(shutdownCtx); err != nil {
+			a.Logger.Warn("database shutdown incomplete", "error", err)
+		}
 	}
 	if a.instanceLock != nil {
-		_ = a.instanceLock.Release()
+		if err := a.instanceLock.ReleaseWithContext(shutdownCtx); err != nil {
+			a.Logger.Warn("instance lock release incomplete", "error", err)
+		}
+	}
+}
+
+// closeRuntimeWithContext keeps shutdown bounded even for compatibility
+// controllers that only expose the historical Close method. The goroutine is
+// intentionally isolated from application teardown: once the deadline is
+// reached, DB and instance-lock cleanup must not wait for an uncooperative
+// helper process.
+func closeRuntimeWithContext(ctx context.Context, controller runtime.Controller) error {
+	if controller == nil {
+		return nil
+	}
+	if closer, ok := controller.(interface{ CloseWithContext(context.Context) error }); ok {
+		return closer.CloseWithContext(ctx)
+	}
+	done := make(chan struct{})
+	go func() {
+		controller.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

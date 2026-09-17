@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"errors"
@@ -18,10 +19,10 @@ var migrationFS embed.FS
 // These are compatibility contract versions, not migration counts.
 const (
 	CurrentStorageFormatVersion = 2
-	CurrentStorageReaderVersion = 6
-	CurrentStorageWriterVersion = 6
-	MinStorageReaderVersion     = 6
-	MinStorageWriterVersion     = 6
+	CurrentStorageReaderVersion = 8
+	CurrentStorageWriterVersion = 8
+	MinStorageReaderVersion     = 8
+	MinStorageWriterVersion     = 8
 )
 
 var (
@@ -129,23 +130,44 @@ func Migrate(db *sql.DB) error {
 
 // SchemaVersion reports the highest applied migration version (0 when none).
 func SchemaVersion(db *sql.DB) (int, error) {
+	return SchemaVersionContext(context.Background(), db)
+}
+
+// SchemaVersionContext reports the highest applied migration version while
+// honoring the caller's cancellation.
+func SchemaVersionContext(ctx context.Context, db *sql.DB) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var v int
-	err := db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
+	err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
 	return v, err
 }
 
 // StorageFormat returns the persisted compatibility envelope and the highest
 // applied migration for startup, health, doctor, and rollback drills.
 func StorageFormat(db *sql.DB) (StorageFormatInfo, error) {
+	return StorageFormatContext(context.Background(), db)
+}
+
+// StorageFormatContext returns the persisted compatibility envelope while
+// honoring the caller's cancellation.
+func StorageFormatContext(ctx context.Context, db *sql.DB) (StorageFormatInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var info StorageFormatInfo
-	err := db.QueryRow(`SELECT format_version, min_reader_version, min_writer_version,
+	err := db.QueryRowContext(ctx, `SELECT format_version, min_reader_version, min_writer_version,
 		migration_status FROM storage_format WHERE id = 1`).Scan(
 		&info.FormatVersion, &info.MinReaderVersion, &info.MinWriterVersion,
 		&info.MigrationStatus)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return StorageFormatInfo{}, ctxErr
+		}
 		return StorageFormatInfo{}, fmt.Errorf("%w: %s", ErrStorageUnavailable, err)
 	}
-	info.SchemaVersion, err = SchemaVersion(db)
+	info.SchemaVersion, err = SchemaVersionContext(ctx, db)
 	if err != nil {
 		return StorageFormatInfo{}, err
 	}

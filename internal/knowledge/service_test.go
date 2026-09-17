@@ -3,7 +3,9 @@ package knowledge
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"image/png"
 	"os"
@@ -14,7 +16,6 @@ import (
 	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
-	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -107,7 +108,6 @@ func TestAddFilesUsesBoundedParallelIngestion(t *testing.T) {
 type fixture struct {
 	service  *Service
 	raw      *storage.RawFileStore
-	jobs     *jobs.Manager
 	shutdown func()
 }
 
@@ -123,14 +123,9 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("raw store: %v", err)
 	}
-	manager := jobs.New(db, 2)
-	if err := manager.Start(context.Background()); err != nil {
-		t.Fatalf("start jobs: %v", err)
-	}
-	service := NewService(db, raw, config.Defaults(), manager)
-	f := &fixture{service: service, raw: raw, jobs: manager}
+	service := NewService(db, raw, config.Defaults())
+	f := &fixture{service: service, raw: raw}
 	f.shutdown = func() {
-		manager.Stop()
 		_ = db.Close()
 	}
 	t.Cleanup(f.shutdown)
@@ -168,6 +163,57 @@ func TestBaseLifecycle(t *testing.T) {
 	}
 	if _, err := f.service.GetBase(base.ID); err != ErrNotFound {
 		t.Fatalf("expected not found after delete, got %v", err)
+	}
+}
+
+func TestCommitHookRollbackProtectsDocumentFence(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	doc, err := f.service.AddTextDocument(context.Background(), base.ID, "atomic", "atomic business effect")
+	if err != nil {
+		t.Fatalf("add text: %v", err)
+	}
+	before, _, err := f.service.GetDocument(doc.ID, false)
+	if err != nil {
+		t.Fatalf("get document before reindex: %v", err)
+	}
+	failure := errors.New("marker write failed")
+	commitHook := func(tx *sql.Tx) error {
+		_, _ = tx.Exec(`INSERT INTO operation_items(operation_id, item_key, attempt, state, commit_marker, updated_at)
+			VALUES ('hook-test', 'atomic', 1, 'committed', 1, 1)`)
+		return failure
+	}
+	if _, err := f.service.DeleteDocumentWithProgress(WithCommitHook(context.Background(), commitHook), doc.ID, nil); !errors.Is(err, failure) {
+		t.Fatalf("delete with failed marker: got %v, want %v", err, failure)
+	}
+	stillActive, _, err := f.service.GetDocument(doc.ID, false)
+	if err != nil || stillActive.LifecycleState != LifecycleActive {
+		t.Fatalf("delete fence escaped rollback: err=%v doc=%+v", err, stillActive)
+	}
+
+	if _, err := f.service.ReindexDocument(WithCommitHook(context.Background(), commitHook), doc.ID); !errors.Is(err, failure) {
+		t.Fatalf("reindex with failed marker: got %v, want %v", err, failure)
+	}
+	after, _, err := f.service.GetDocument(doc.ID, false)
+	if err != nil {
+		t.Fatalf("get document after reindex: %v", err)
+	}
+	if after.ActiveIndexGen != before.ActiveIndexGen {
+		t.Fatalf("reindex generation escaped rollback: before=%d after=%d", before.ActiveIndexGen, after.ActiveIndexGen)
+	}
+}
+
+func TestBaseDeleteCommitHookRollbackProtectsFence(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	failure := errors.New("base marker write failed")
+	hook := func(*sql.Tx) error { return failure }
+	if err := f.service.DeleteBaseWithContext(WithCommitHook(context.Background(), hook), base.ID); !errors.Is(err, failure) {
+		t.Fatalf("delete base with failed marker: got %v, want %v", err, failure)
+	}
+	stillActive, err := f.service.GetBase(base.ID)
+	if err != nil || stillActive.LifecycleState != LifecycleActive {
+		t.Fatalf("base delete fence escaped rollback: err=%v base=%+v", err, stillActive)
 	}
 }
 
@@ -305,11 +351,9 @@ func TestDirectoryParseFailureRetainsSourceForReindex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobID, err := f.service.ImportDirectoryTree(context.Background(), base.ID, root)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := f.service.RunDirectoryImport(context.Background(), base.ID, root, nil); err == nil {
+		t.Fatal("directory import should report the parse failure")
 	}
-	waitJobAllowFailed(t, f.service, jobID)
 	docs, err := f.service.ListDocuments(base.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -398,6 +442,45 @@ func TestAddFilesConflictStrategiesAndDedup(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("replace left %d a.md documents", count)
+	}
+}
+
+func TestAddFilesReplaceReimportsSameContentAfterTitleCollision(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	ctx := context.Background()
+	content := "# Same\n\nidentical replacement content"
+	if _, err := f.service.AddTextDocument(ctx, base.ID, "same.md", content); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := f.service.AddFiles(ctx, base.ID, []AddFilesItem{{
+		FileName:      "same.md",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte(content)),
+	}}, "replace", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "added" || len(result.Accepted) != 1 || result.Accepted[0].Skipped {
+		t.Fatalf("same-content replace was skipped: %+v", result)
+	}
+
+	docs, err := f.service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var same []DocumentSummary
+	for _, doc := range docs {
+		if doc.Title == "same.md" {
+			same = append(same, doc)
+		}
+	}
+	if len(same) != 1 || same[0].Status != StatusReady {
+		t.Fatalf("same-content replacement result: %+v", same)
+	}
+	full, _, err := f.service.GetDocument(same[0].ID, false)
+	if err != nil || full.RawText != content {
+		t.Fatalf("same-content replacement content: %+v %v", full, err)
 	}
 }
 
@@ -558,7 +641,75 @@ func TestRecoverInterrupted(t *testing.T) {
 	}
 }
 
-func TestReindexBaseJob(t *testing.T) {
+func TestRecoverInterruptedUsesBoundedCancellableBatches(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	const documentCount = 300
+	err := f.service.store.db.WriteTx(context.Background(), storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		for i := 0; i < documentCount; i++ {
+			doc := f.service.newDocument(base.ID, fmt.Sprintf("recovery-%03d", i), "text")
+			doc.Status = StatusProcessing
+			doc.Incomplete = true
+			if err := upsertDocument(context.Background(), tx, doc); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, failed, err := f.service.RecoverInterrupted(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed != documentCount {
+		t.Fatalf("recovered failed documents = %d, want %d", failed, documentCount)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := f.service.RecoverInterrupted(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled recovery error = %v", err)
+	}
+}
+
+func TestDirectoryDeleteCleanupUsesBoundedPages(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	root := f.service.newDocument(base.ID, "paged-directory", "directory")
+	root.Status = StatusReady
+	if err := f.service.store.putDocument(root); err != nil {
+		t.Fatal(err)
+	}
+	const childCount = cleanupDocumentPageSize + 2
+	err := f.service.store.db.WriteTx(context.Background(), storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		for i := 0; i < childCount; i++ {
+			child := f.service.newDocument(base.ID, fmt.Sprintf("paged-child-%03d", i), "text")
+			child.ParentDirectoryID = root.ID
+			child.Status = StatusReady
+			if err := upsertDocument(context.Background(), tx, child); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := f.service.DeleteDirectoryRecursiveWithProgress(context.Background(), root.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != childCount+1 {
+		t.Fatalf("paged directory cleanup removed %d documents, want %d", removed, childCount+1)
+	}
+	if docs, err := f.service.ListDocuments(base.ID); err != nil || len(docs) != 0 {
+		t.Fatalf("paged directory cleanup left visible documents: %v %v", docs, err)
+	}
+}
+
+func TestReindexBaseBatches(t *testing.T) {
 	f := newFixture(t)
 	base := f.createBase(t)
 	if _, err := f.service.AddTextDocument(context.Background(), base.ID, "one", "first document body"); err != nil {
@@ -567,30 +718,404 @@ func TestReindexBaseJob(t *testing.T) {
 	if _, err := f.service.AddTextDocument(context.Background(), base.ID, "two", "second document body"); err != nil {
 		t.Fatal(err)
 	}
-	jobID, err := f.service.ReindexBase(context.Background(), base.ID)
+	err := f.service.ForEachReindexDocumentBatch(context.Background(), base.ID, 2, func(_ int, _ int, documents []DocumentSummary) error {
+		for _, document := range documents {
+			if document.SourceType == "directory" {
+				continue
+			}
+			if _, err := f.service.ReindexDocument(context.Background(), document.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("submit reindex: %v", err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		job, ok := f.jobs.Status(jobID)
-		if !ok {
-			t.Fatal("job missing")
-		}
-		if job.Status == jobs.StatusDone {
-			break
-		}
-		if job.Status == jobs.StatusFailed {
-			t.Fatalf("job failed: %s", job.Error)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("job did not finish: %+v", job)
-		}
-		time.Sleep(20 * time.Millisecond)
+		t.Fatalf("reindex batches: %v", err)
 	}
 	stats, err := f.service.Stats(base.ID)
 	if err != nil || stats.ChunkCount < 2 {
 		t.Fatalf("stats after reindex: %+v %v", stats, err)
+	}
+}
+
+func TestForEachReindexDocumentBatchUsesStableBoundedWindow(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	for _, title := range []string{"one", "two", "three"} {
+		if _, err := f.service.AddTextDocument(context.Background(), base.ID, title, title+" body"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var seen []string
+	var batchSizes []int
+	err := f.service.ForEachReindexDocumentBatch(context.Background(), base.ID, 2, func(start, total int, documents []DocumentSummary) error {
+		if total != 3 {
+			t.Fatalf("planned total = %d, want 3", total)
+		}
+		batchSizes = append(batchSizes, len(documents))
+		for _, document := range documents {
+			seen = append(seen, document.ID)
+		}
+		if len(batchSizes) == 1 {
+			if _, err := f.service.AddTextDocument(context.Background(), base.ID, "late", "created after the reindex window"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 3 || len(batchSizes) != 2 || batchSizes[0] != 2 || batchSizes[1] != 1 {
+		t.Fatalf("bounded batches = %v, seen = %d", batchSizes, len(seen))
+	}
+	if late, err := f.service.FindDocumentByTitle(base.ID, "late"); err != nil || late.ID == "" {
+		t.Fatalf("late document was not created: %+v %v", late, err)
+	}
+}
+
+func TestReindexIdempotencyKeyTracksTargetAndConfigSnapshot(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	first, err := f.service.AddTextDocument(context.Background(), base.ID, "one", "one body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.service.AddTextDocument(context.Background(), base.ID, "two", "two body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, []string{first.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, []string{first.ID})
+	if err != nil || repeated != key {
+		t.Fatalf("repeat key = %q, %v; want %q", repeated, err, key)
+	}
+	ordered, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, []string{first.ID, second.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reversed, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, []string{second.ID, first.ID})
+	if err != nil || reversed != ordered {
+		t.Fatalf("order-sensitive batch keys = %q and %q (%v)", ordered, reversed, err)
+	}
+	baseKey, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, nil)
+	if err != nil || baseKey == ordered {
+		t.Fatalf("base key = %q, batch key = %q, err = %v", baseKey, ordered, err)
+	}
+	if _, err := f.service.AddTextDocument(context.Background(), base.ID, "three", "three body"); err != nil {
+		t.Fatal(err)
+	}
+	changedBaseKey, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, nil)
+	if err != nil || changedBaseKey == baseKey {
+		t.Fatalf("source mutation did not change base key: before=%q after=%q err=%v", baseKey, changedBaseKey, err)
+	}
+	cfg := f.service.GlobalConfig()
+	cfg.Embedding.Model = "changed-for-key-test"
+	f.service.SetGlobalConfig(cfg)
+	changed, err := f.service.ReindexIdempotencyKey(context.Background(), base.ID, []string{first.ID})
+	if err != nil || changed == key {
+		t.Fatalf("config change did not change key: before=%q after=%q err=%v", key, changed, err)
+	}
+	if len(key) != len("reindex.auto.")+64 || len(changed) != len("reindex.auto.")+64 {
+		t.Fatalf("unexpected key shape: %q", key)
+	}
+}
+
+func TestListDocumentsPageIsBounded(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	for _, title := range []string{"one", "two", "three"} {
+		if _, err := f.service.AddTextDocument(context.Background(), base.ID, title, title+" body"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := f.service.ListDocumentsPageContext(context.Background(), base.ID, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.service.ListDocumentsPageContext(context.Background(), base.ID, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Total != 3 || len(first.Documents) != 2 || !first.HasMore || second.Total != 3 || len(second.Documents) != 1 || second.HasMore {
+		t.Fatalf("pages = %+v / %+v", first, second)
+	}
+}
+
+func TestIndexingStatusIsBoundedAndCancellable(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	for index := 0; index < maxIndexingStatusItems+1; index++ {
+		doc := f.service.newDocument(base.ID, fmt.Sprintf("active-%03d", index), "text")
+		doc.Status = StatusPending
+		if index%2 == 0 {
+			doc.Status = StatusProcessing
+			doc.Phase = PhaseParsing
+		}
+		if err := f.service.store.putDocument(doc); err != nil {
+			t.Fatalf("seed indexing status %d: %v", index, err)
+		}
+	}
+
+	status, err := f.service.IndexingStatusContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status) != maxIndexingStatusItems {
+		t.Fatalf("indexing status length = %d, want %d", len(status), maxIndexingStatusItems)
+	}
+	for _, item := range status {
+		if item.DocID == "" || item.BaseID != base.ID || (item.Phase != "" && item.Phase != PhaseParsing) {
+			t.Fatalf("invalid indexing status item: %+v", item)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.service.IndexingStatusContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled indexing status error = %v, want context.Canceled", err)
+	}
+}
+
+func TestReindexAndRawCitationHonorCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	doc, err := f.service.AddFileDocument(context.Background(), base.ID, "cancel.md", []byte("cancel-aware source"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.service.ReindexDocument(ctx, doc.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reindex error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ReindexIdempotencyKey(ctx, base.ID, []string{doc.ID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reindex idempotency key error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.GetRawFileForCitationContext(ctx, doc.ID, RawCitationOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled raw citation error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPutChunkVectorsHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := f.service.store.PutChunkVectorsContext(ctx, "missing", 1, "fake:model", map[string][]float64{
+		"hash": {1, 0},
+	})
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, storage.ErrWriteUnknown) {
+		t.Fatalf("cancelled vector write error = %v, want context.Canceled or storage.ErrWriteUnknown", err)
+	}
+}
+
+func TestEmbeddedChunkCountHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := f.service.store.countEmbeddedChunksByDocGenerationContext(ctx, "missing", 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled embedded chunk count error = %v, want context.Canceled", err)
+	}
+}
+
+func TestContentHashLookupHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := f.service.hasContentHashContext(ctx, "missing", "hash"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled content hash lookup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunDirectoryImportHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cancel.md"), []byte("cancel-aware directory source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.service.RunDirectoryImport(ctx, base.ID, root, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled directory import error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.FindDirectoryByPath(base.ID, root); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cancelled directory import created a container: %v", err)
+	}
+	container, err := f.service.CreateDirectory(base.ID, "tracked", "", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rescanCtx, cancelRescan := context.WithCancel(context.Background())
+	cancelRescan()
+	if _, err := f.service.RunDirectoryRescan(rescanCtx, container.ID, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled directory rescan error = %v, want context.Canceled", err)
+	}
+}
+
+func TestDirectoryChildTitleLookupHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "existing.md")
+	if err := os.WriteFile(path, []byte("directory child"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := f.service.importChildFile(ctx, base.ID, "directory-id", directoryEntry{
+		absPath: path, relPath: "existing.md", fileName: "existing.md", size: int64(len("directory child")),
+	}, newDirectorySyncIndex(nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("directory child title lookup with canceled context = %v, want context.Canceled", err)
+	}
+}
+
+func TestImportConflictLookupsHonorCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	if _, err := f.service.AddTextDocument(context.Background(), base.ID, "existing.md", "existing"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.service.FindDocumentByTitleContext(ctx, base.ID, "existing.md"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled title lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.RenameAvailableContext(ctx, base.ID, "existing.md"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled rename lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.DetectConflictsContext(ctx, base.ID, []string{"existing.md"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled conflict lookup error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCustomRerankerDeleteHonorsCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.service.RegisterCustomReranker("owner/model"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.service.DeleteCustomRerankerContext(ctx, "owner/model"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled custom reranker delete error = %v, want context.Canceled", err)
+	}
+	if err := f.service.SaveRerankSelfTestContext(ctx, RerankSelfTest{ID: "owner/model"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reranker self-test save error = %v, want context.Canceled", err)
+	}
+}
+
+func TestBaseAndDocumentReadPathsHonorCanceledContext(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := f.service.GetBaseWithContext(ctx, base.ID); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled base lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListBasesContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled base list error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListGroupsContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled group list error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.EnabledScopeStateContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled scope state error = %v, want context.Canceled", err)
+	}
+	if err := f.service.SetEnabledScopeWithContext(ctx, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled scope update error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.StatsContext(ctx, base.ID); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled base stats error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListDocumentsContext(ctx, base.ID); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled document list error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListDocumentChildrenContext(ctx, base.ID, "", 50, 0); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled document children error = %v, want context.Canceled", err)
+	}
+	if _, _, err := f.service.GetDocumentWithContext(ctx, "missing", false); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled document lookup error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListChunksContext(ctx, "missing", 20, 0); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled chunk list error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.ListSearchHistoryContext(ctx, 20); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled search history list error = %v, want context.Canceled", err)
+	}
+	if err := f.service.DeleteSearchHistoryContext(ctx, ""); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled search history delete error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.SaveSearchHistoryContext(ctx, SearchRequest{Query: "cancelled"}, SearchResult{}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled search history save error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.Search(ctx, SearchRequest{Query: "cancelled", Filter: &SearchFilter{TitleIncludes: "cancelled"}}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled filtered search error = %v, want context.Canceled", err)
+	}
+	anchorIndex := 0
+	if _, err := f.service.GetDocumentContext(ctx, "missing", ContextOptions{AnchorIndex: &anchorIndex}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled document context error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.AddTextDocumentWithID(ctx, base.ID, "cancelled-text", "cancelled", "body"); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled text import error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.AddFileDocumentWithID(ctx, base.ID, "cancelled-file", "cancelled.md", []byte("body"), ""); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled file import error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.AddFiles(ctx, base.ID, []AddFilesItem{{FileName: "cancelled.md", ContentBase64: base64.StdEncoding.EncodeToString([]byte("body"))}}, "", ""); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled batch import error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.AddUrlDocumentWithID(ctx, base.ID, "cancelled-url", "https://example.invalid", "", nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled URL import error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.RestoreBaseWithID(ctx, base.ID, "cancelled-restore", "", nil, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled restore error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.CreateBaseWithContext(ctx, "cancelled-base", "", "", BaseConfig{}); !errors.Is(err, context.Canceled) && !errors.Is(err, storage.ErrWriteUnknown) {
+		t.Errorf("cancelled base create error = %v, want context.Canceled or storage.ErrWriteUnknown", err)
+	}
+	name := "renamed"
+	if _, err := f.service.RenameBaseWithContext(ctx, base.ID, &name, nil, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled base rename error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.CreateDirectoryWithContext(ctx, base.ID, "cancelled-directory", "", t.TempDir()); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled directory create error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.RepointSourceWithContext(ctx, "missing", t.TempDir()); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled source repoint error = %v, want context.Canceled", err)
+	}
+	if _, err := f.service.RenameDocumentWithContext(ctx, "missing", "renamed"); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled document rename error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRestoreSourcePagesUseMetadataOnly(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	doc := f.service.newDocument(base.ID, "large-source", "text")
+	doc.Status = StatusReady
+	doc.RawText = strings.Repeat("source payload ", 2000)
+	doc.CharCount = len(doc.RawText)
+	if err := f.service.store.putDocument(doc); err != nil {
+		t.Fatalf("seed large source: %v", err)
+	}
+	page, err := f.service.store.listDocumentsAfterContext(context.Background(), base.ID, 0, "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].RawText != "" {
+		t.Fatalf("restore source page materialized raw text: len=%d rawBytes=%d", len(page), len(page[0].RawText))
+	}
+	full, err := f.service.store.getDocumentContext(context.Background(), page[0].ID)
+	if err != nil || len(full.RawText) == 0 {
+		t.Fatalf("full source lookup: err=%v rawBytes=%d", err, len(full.RawText))
 	}
 }
 

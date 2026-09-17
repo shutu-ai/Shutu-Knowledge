@@ -122,7 +122,11 @@ $extensionTools = @(
     "knowledge_get_document",
     "knowledge_read_document",
     "knowledge_reindex_document",
-    "knowledge_reindex_base"
+    "knowledge_reindex_base",
+    "knowledge_operation_status",
+    "knowledge_operation_cancel",
+    "knowledge_operation_retry",
+    "knowledge_maintenance_storage"
 )
 $toolLines = @("    - get_time", "    - read") + ($extensionTools | ForEach-Object { "    - ext__shutu-knowledge__$_" })
 $toolBlock = $toolLines -join [Environment]::NewLine
@@ -143,7 +147,7 @@ web_server:
   dist_dir: "$agentDistYaml"
 extensions:
   enabled: true
-  startup_timeout_ms: 60000
+  startup_timeout_ms: 120000
   health_timeout_ms: 3000
   context_timeout_ms: 5000
   shutdown_timeout_ms: 3000

@@ -27,6 +27,11 @@ func TestMetricsObserveIngestSearchModelAndJobFailures(t *testing.T) {
 		metrics.Searches != 1 || metrics.CandidateCount == 0 || metrics.ContextCount != int64(result.Total) {
 		t.Fatalf("successful metrics: %+v", metrics)
 	}
+	if metrics.RunTimeMS < metrics.ImportDurationMS+metrics.SearchDurationMS ||
+		metrics.QueueWaitMS < 0 || metrics.DiskReadMS < 0 || metrics.DBWaitMS < 0 ||
+		metrics.DBTransactionMS < 0 || metrics.FTSTimeMS < 0 || metrics.VectorTimeMS < 0 {
+		t.Fatalf("stage metrics: %+v", metrics)
+	}
 
 	broken := &fakeEmbedder{model: "a", failNth: 1}
 	service.SetProviders(broken, nil)

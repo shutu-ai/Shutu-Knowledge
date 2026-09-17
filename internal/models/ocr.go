@@ -55,7 +55,13 @@ func ocrArtifactNames() []string {
 
 // OCRStatus reports the shared PaddleOCR bundle without creating cache state.
 func (m *Manager) OCRStatus() (Model, error) {
-	model, err := m.inspect(OCRModelID)
+	return m.OCRStatusContext(context.Background())
+}
+
+// OCRStatusContext inspects the shared OCR bundle within the caller's
+// cancellation boundary.
+func (m *Manager) OCRStatusContext(ctx context.Context) (Model, error) {
+	model, err := m.inspectContext(ctx, OCRModelID)
 	if err == nil {
 		return model, nil
 	}

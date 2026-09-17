@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +35,56 @@ func openTestDB(t *testing.T) *DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestDBDoesNotBypassWriterWhenWriterIsUnavailable(t *testing.T) {
+	raw, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	db := &DB{DB: raw}
+
+	if _, err := db.Exec("CREATE TABLE bypass_guard (value TEXT)"); !errors.Is(err, ErrWriterStopped) {
+		t.Fatalf("Exec error = %v, want %v", err, ErrWriterStopped)
+	}
+	if err := db.Write(context.Background(), NormalWrite, func(context.Context, *sql.DB) error {
+		t.Fatal("writer callback executed without a writer")
+		return nil
+	}); !errors.Is(err, ErrWriterStopped) {
+		t.Fatalf("Write error = %v, want %v", err, ErrWriterStopped)
+	}
+	if err := db.WriteTx(context.Background(), NormalWrite, nil, func(*sql.Tx) error {
+		t.Fatal("transaction callback executed without a writer")
+		return nil
+	}); !errors.Is(err, ErrWriterStopped) {
+		t.Fatalf("WriteTx error = %v, want %v", err, ErrWriterStopped)
+	}
+
+	var tables int
+	if err := raw.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bypass_guard'").Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatalf("bypass guard table count = %d, want 0", tables)
+	}
+}
+
+func TestDBCloseWithContextHonorsCanceledShutdown(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	err := db.CloseWithContext(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CloseWithContext error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled CloseWithContext took %s", elapsed)
+	}
+	// The explicit close above owns the handles; prevent the cleanup hook from
+	// treating a second close error as the assertion under test.
+	db = nil
 }
 
 func TestMigrateAppliesAndIsIdempotent(t *testing.T) {
@@ -81,11 +133,33 @@ func TestStorageFormatCompatibilityEnvelope(t *testing.T) {
 		info.MigrationStatus != "ready" {
 		t.Fatalf("format envelope: %+v", info)
 	}
-	if info.SchemaVersion < 11 || info.SupportedMigrations < info.SchemaVersion {
+	if info.SchemaVersion < 16 || info.SupportedMigrations < info.SchemaVersion {
 		t.Fatalf("migration bounds: %+v", info)
 	}
 	if err := Migrate(db.DB); err != nil {
 		t.Fatal(err)
+	}
+	var operationColumns, itemTables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name IN ('input_ref', 'expected_target_epoch', 'retained_until')`).Scan(&operationColumns); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'operation_items'`).Scan(&itemTables); err != nil {
+		t.Fatal(err)
+	}
+	if operationColumns != 3 || itemTables != 1 {
+		t.Fatalf("operation envelope schema columns=%d itemTables=%d", operationColumns, itemTables)
+	}
+}
+
+func TestStorageMetadataContextHonorsCancellation(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := SchemaVersionContext(ctx, db.DB); !errors.Is(err, context.Canceled) {
+		t.Fatalf("schema version error = %v, want context.Canceled", err)
+	}
+	if _, err := StorageFormatContext(ctx, db.DB); !errors.Is(err, context.Canceled) {
+		t.Fatalf("storage format error = %v, want context.Canceled", err)
 	}
 }
 
@@ -107,7 +181,7 @@ func TestStorageFormatRejectsIncompatibleDatabase(t *testing.T) {
 	t.Run("future writer", func(t *testing.T) {
 		db := openTestDB(t)
 		path := db.Path()
-		if _, err := db.Exec(`UPDATE storage_format SET min_writer_version = 7 WHERE id = 1`); err != nil {
+		if _, err := db.Exec(`UPDATE storage_format SET min_writer_version = 9 WHERE id = 1`); err != nil {
 			t.Fatal(err)
 		}
 		if err := db.Close(); err != nil {
@@ -746,5 +820,10 @@ func TestMaintainSQLOptimizesFTSAndThresholdVacuum(t *testing.T) {
 	}
 	if forced.FTSOptimized || !forced.Vacuumed || forced.DatabaseBytesEnd == 0 {
 		t.Fatalf("forced vacuum: %+v", forced)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := db.MaintainSQLiteContext(ctx, true, true, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled maintenance error = %v", err)
 	}
 }

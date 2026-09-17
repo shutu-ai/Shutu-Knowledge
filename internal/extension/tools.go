@@ -39,6 +39,24 @@ type documentSummary struct {
 	DirectoryID string `json:"parentDirectoryId,omitempty"`
 }
 
+func documentListPage(ctx context.Context, service *knowledge.Service, baseID string, limit, offset int) (map[string]any, error) {
+	page, err := service.ListDocumentsPageContext(ctx, baseID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]documentSummary, 0, len(page.Documents))
+	for _, doc := range page.Documents {
+		out = append(out, documentSummary{ID: doc.ID, Title: doc.Title, SourceType: doc.SourceType, Status: doc.Status, CharCount: doc.CharCount, ChunkCount: doc.ChunkCount, DirectoryID: doc.ParentDirID})
+	}
+	return map[string]any{
+		"documents": out,
+		"total":     page.Total,
+		"limit":     page.Limit,
+		"offset":    page.Offset,
+		"hasMore":   page.HasMore,
+	}, nil
+}
+
 type documentPage struct {
 	ReadMode        string            `json:"readMode"`
 	ID              string            `json:"id"`
@@ -65,7 +83,7 @@ func CallTool(ctx context.Context, application *app.App, request extension.ToolC
 
 func callTool(ctx context.Context, application *app.App, request extension.ToolCallRequest) (any, error) {
 	service := application.Knowledge
-	if enabled, _, err := service.EnabledScope(); err != nil {
+	if enabled, _, err := service.EnabledScopeContext(ctx); err != nil {
 		return nil, err
 	} else if !enabled {
 		return nil, fmt.Errorf("knowledge invocation is disabled; enable it before calling knowledge tools")
@@ -91,7 +109,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			return nil, fmt.Errorf("search query is required")
 		}
 		if args.BaseID != "" {
-			if err := requireEnabledBase(service, args.BaseID); err != nil {
+			if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 				return nil, err
 			}
 		}
@@ -114,11 +132,13 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 	case "knowledge_list_bases":
 		var args struct {
 			BaseID string `json:"baseId"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		bases, err := enabledBases(service)
+		bases, err := enabledBases(ctx, service)
 		if err != nil {
 			return nil, err
 		}
@@ -131,11 +151,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		}
 		for _, base := range bases {
 			if base.ID == args.BaseID {
-				docs, err := service.ListDocuments(base.ID)
-				if err != nil {
-					return nil, err
-				}
-				return map[string]any{"documents": docs}, nil
+				return documentListPage(ctx, service, base.ID, args.Limit, args.Offset)
 			}
 		}
 		return nil, fmt.Errorf("knowledge base %s is not enabled", args.BaseID)
@@ -161,7 +177,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		if err := requireEnabledBase(service, args.BaseID); err != nil {
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 			return nil, err
 		}
 		operation, err := application.Operations.Submit(ctx, operations.Request{
@@ -182,7 +198,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		if err := requireEnabledBase(service, args.BaseID); err != nil {
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 			return nil, err
 		}
 		if strings.TrimSpace(args.Content) == "" {
@@ -205,22 +221,16 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 	case "knowledge_list_documents":
 		var args struct {
 			BaseID string `json:"baseId"`
+			Limit  int    `json:"limit"`
+			Offset int    `json:"offset"`
 		}
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		if err := requireEnabledBase(service, args.BaseID); err != nil {
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 			return nil, err
 		}
-		docs, err := service.ListDocuments(args.BaseID)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]documentSummary, 0, len(docs))
-		for _, doc := range docs {
-			out = append(out, documentSummary{ID: doc.ID, Title: doc.Title, SourceType: doc.SourceType, Status: doc.Status, CharCount: doc.CharCount, ChunkCount: doc.ChunkCount, DirectoryID: doc.ParentDirID})
-		}
-		return map[string]any{"documents": out}, nil
+		return documentListPage(ctx, service, args.BaseID, args.Limit, args.Offset)
 
 	case "knowledge_delete_document":
 		var args struct {
@@ -230,7 +240,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		doc, err := requireEnabledDocument(service, args.DocumentID)
+		doc, err := requireEnabledDocument(ctx, service, args.DocumentID)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +270,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		if err := requireEnabledBase(service, args.BaseID); err != nil {
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 			return nil, err
 		}
 		payload, err := json.Marshal(map[string]any{"url": args.URL, "title": args.Title})
@@ -284,7 +294,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		doc, err := requireEnabledDocument(service, args.DocumentID)
+		doc, err := requireEnabledDocument(ctx, service, args.DocumentID)
 		if err != nil {
 			return nil, err
 		}
@@ -310,7 +320,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			return nil, err
 		}
 		if args.BaseID != "" {
-			if err := requireEnabledBase(service, args.BaseID); err != nil {
+			if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 				return nil, err
 			}
 			stats, err := service.Stats(args.BaseID)
@@ -319,7 +329,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			}
 			return stats, nil
 		}
-		bases, err := enabledBases(service)
+		bases, err := enabledBases(ctx, service)
 		if err != nil {
 			return nil, err
 		}
@@ -353,7 +363,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		doc, err := requireEnabledDocument(service, args.DocumentID)
+		doc, err := requireEnabledDocument(ctx, service, args.DocumentID)
 		if err != nil {
 			return nil, err
 		}
@@ -410,7 +420,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		doc, err := requireEnabledDocument(service, args.DocumentID)
+		doc, err := requireEnabledDocument(ctx, service, args.DocumentID)
 		if err != nil {
 			return nil, err
 		}
@@ -473,7 +483,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		doc, err := requireEnabledDocument(service, args.DocumentID)
+		doc, err := requireEnabledDocument(ctx, service, args.DocumentID)
 		if err != nil {
 			return nil, err
 		}
@@ -484,10 +494,15 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err != nil {
 			return nil, err
 		}
+		key, err := service.ReindexIdempotencyKey(ctx, doc.BaseID, []string{doc.ID})
+		if err != nil {
+			return nil, err
+		}
 		operation, err := application.Operations.Submit(ctx, operations.Request{
 			Type: "reindex_document", CommandSchemaVersion: operations.CommandSchemaV1,
 			BaseID: doc.BaseID, DocumentID: doc.ID, Payload: payload,
 			TotalUnits: intPtr(1), ResourceClass: "io",
+			IdempotencyKey: key,
 		})
 		if err != nil {
 			return nil, err
@@ -501,12 +516,16 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		if err := requireEnabledBase(service, args.BaseID); err != nil {
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
+			return nil, err
+		}
+		key, err := service.ReindexIdempotencyKey(ctx, args.BaseID, nil)
+		if err != nil {
 			return nil, err
 		}
 		operation, err := application.Operations.Submit(ctx, operations.Request{
 			Type: "reindex_base", CommandSchemaVersion: operations.CommandSchemaV1,
-			BaseID: args.BaseID, Payload: json.RawMessage("{}"), ResourceClass: "io",
+			BaseID: args.BaseID, Payload: json.RawMessage("{}"), ResourceClass: "io", IdempotencyKey: key,
 		})
 		if err != nil {
 			return nil, err
@@ -546,12 +565,12 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		op, err := application.Operations.Get(args.OperationID)
+		op, err := application.Operations.GetContext(ctx, args.OperationID)
 		if err != nil {
 			return nil, err
 		}
 		if op.BaseID != "" {
-			if err := requireEnabledBase(service, op.BaseID); err != nil {
+			if err := requireEnabledBase(ctx, service, op.BaseID); err != nil {
 				return nil, err
 			}
 		}
@@ -564,16 +583,16 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		op, err := application.Operations.Get(args.OperationID)
+		op, err := application.Operations.GetContext(ctx, args.OperationID)
 		if err != nil {
 			return nil, err
 		}
 		if op.BaseID != "" {
-			if err := requireEnabledBase(service, op.BaseID); err != nil {
+			if err := requireEnabledBase(ctx, service, op.BaseID); err != nil {
 				return nil, err
 			}
 		}
-		cancelled, err := application.Operations.Cancel(args.OperationID)
+		cancelled, err := application.Operations.CancelContext(ctx, args.OperationID)
 		if err != nil {
 			return nil, err
 		}
@@ -586,16 +605,16 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := decodeArguments(request.Arguments, &args); err != nil {
 			return nil, err
 		}
-		op, err := application.Operations.Get(args.OperationID)
+		op, err := application.Operations.GetContext(ctx, args.OperationID)
 		if err != nil {
 			return nil, err
 		}
 		if op.BaseID != "" {
-			if err := requireEnabledBase(service, op.BaseID); err != nil {
+			if err := requireEnabledBase(ctx, service, op.BaseID); err != nil {
 				return nil, err
 			}
 		}
-		retried, err := application.Operations.Retry(args.OperationID)
+		retried, err := application.Operations.RetryContext(ctx, args.OperationID)
 		if err != nil {
 			return nil, err
 		}
@@ -619,15 +638,15 @@ func decodeArguments(arguments map[string]any, target any) error {
 	return decoder.Decode(target)
 }
 
-func enabledBases(service *knowledge.Service) ([]knowledge.BaseSummary, error) {
-	state, err := service.EnabledScopeState()
+func enabledBases(ctx context.Context, service *knowledge.Service) ([]knowledge.BaseSummary, error) {
+	state, err := service.EnabledScopeStateContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if !state.Enabled {
 		return nil, fmt.Errorf("knowledge invocation is disabled")
 	}
-	bases, err := service.ListBases()
+	bases, err := service.ListBasesContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -647,11 +666,11 @@ func enabledBases(service *knowledge.Service) ([]knowledge.BaseSummary, error) {
 	return out, nil
 }
 
-func requireEnabledBase(service *knowledge.Service, baseID string) error {
-	if _, err := service.GetBase(baseID); err != nil {
+func requireEnabledBase(ctx context.Context, service *knowledge.Service, baseID string) error {
+	if _, err := service.GetBaseWithContext(ctx, baseID); err != nil {
 		return err
 	}
-	state, err := service.EnabledScopeState()
+	state, err := service.EnabledScopeStateContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -672,12 +691,12 @@ func requireEnabledBase(service *knowledge.Service, baseID string) error {
 	return fmt.Errorf("knowledge base %s is not enabled", baseID)
 }
 
-func requireEnabledDocument(service *knowledge.Service, documentID string) (knowledge.Document, error) {
-	doc, _, err := service.GetDocument(documentID, false)
+func requireEnabledDocument(ctx context.Context, service *knowledge.Service, documentID string) (knowledge.Document, error) {
+	doc, _, err := service.GetDocumentWithContext(ctx, documentID, false)
 	if err != nil {
 		return knowledge.Document{}, err
 	}
-	if err := requireEnabledBase(service, doc.BaseID); err != nil {
+	if err := requireEnabledBase(ctx, service, doc.BaseID); err != nil {
 		return knowledge.Document{}, err
 	}
 	return doc, nil

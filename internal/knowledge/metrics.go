@@ -9,7 +9,14 @@ type MetricsSnapshot struct {
 	StartedAt           int64 `json:"startedAt"`
 	Imports             int64 `json:"imports"`
 	ImportDurationMS    int64 `json:"importDurationMs"`
+	QueueWaitMS         int64 `json:"queueWaitMs"`
+	RunTimeMS           int64 `json:"runTimeMs"`
 	ParseDurationMS     int64 `json:"parseDurationMs"`
+	DiskReadMS          int64 `json:"diskReadMs"`
+	DBWaitMS            int64 `json:"dbWaitMs"`
+	DBTransactionMS     int64 `json:"dbTransactionMs"`
+	FTSTimeMS           int64 `json:"ftsTimeMs"`
+	VectorTimeMS        int64 `json:"vectorTimeMs"`
 	ChunkCount          int64 `json:"chunkCount"`
 	EmbeddingDurationMS int64 `json:"embeddingDurationMs"`
 	Searches            int64 `json:"searches"`

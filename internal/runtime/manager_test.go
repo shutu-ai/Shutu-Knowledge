@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -128,7 +129,7 @@ func TestManagerCloseTerminatesAndReapsBusyHelper(t *testing.T) {
 		done <- manager.Call(context.Background(), CapabilityEmbedding, map[string]any{"sleepMs": 1000}, &vectors)
 	}()
 	deadline := time.Now().Add(2 * time.Second)
-	for !manager.HasProcess() {
+	for manager.Status(context.Background())[CapabilityEmbedding].Lifecycle != "LOADING" {
 		if time.Now().After(deadline) {
 			t.Fatal("busy helper did not start")
 		}
@@ -144,6 +145,43 @@ func TestManagerCloseTerminatesAndReapsBusyHelper(t *testing.T) {
 	}
 	if err := <-done; err == nil {
 		t.Fatal("expected terminated busy helper call to fail")
+	}
+}
+
+func TestManagerCloseWithContextBoundsBusyHelper(t *testing.T) {
+	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
+	manager := NewManager(Options{
+		Command: helperCommand(t), StartupTimeout: 2 * time.Second,
+		RequestTimeout: 10 * time.Second,
+	})
+	done := make(chan error, 1)
+	go func() {
+		var vectors [][]float64
+		done <- manager.Call(context.Background(), CapabilityEmbedding, map[string]any{"sleepMs": 10000}, &vectors)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for manager.Status(context.Background())[CapabilityEmbedding].Lifecycle != "LOADING" {
+		if time.Now().After(deadline) {
+			t.Fatal("busy helper did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := manager.CloseWithContext(ctx); err != nil {
+		t.Fatalf("bounded close failed: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("bounded close waited for request timeout: %s", elapsed)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("terminated helper call unexpectedly succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("busy helper call did not observe process termination")
 	}
 }
 
@@ -331,6 +369,15 @@ func TestCommandRequiresCapability(t *testing.T) {
 func TestWireErrorFormatting(t *testing.T) {
 	if got := (&Error{Code: "boom", Message: "bad"}).Error(); got != "boom: bad" {
 		t.Fatalf("error: %q", got)
+	}
+	got := (&Error{Code: "failed", Message: `apiKey=top-secret open C:\private\input.pdf`}).Error()
+	if strings.Contains(got, "top-secret") || strings.Contains(got, `C:\private`) {
+		t.Fatalf("wire error leaked sensitive data: %q", got)
+	}
+	cause := errors.New(`open C:\private\input.pdf`)
+	wrapped := (&helperProcess{lastError: `apiKey=stderr-secret`}).withStderr(cause)
+	if !errors.Is(wrapped, cause) || strings.Contains(wrapped.Error(), "stderr-secret") || strings.Contains(wrapped.Error(), `C:\private`) {
+		t.Fatalf("stderr wrapper lost safety or cause: %v", wrapped)
 	}
 	if got := strconv.Itoa(ProtocolVersion); got != "1" {
 		t.Fatalf("protocol: %s", got)

@@ -32,18 +32,43 @@ $escapedBinary = ($knowledgeBinary -replace "\\", "/")
 $dataDir = ($OutputRoot -replace "\\", "/") + "/agent-data"
 $withConfig = Join-Path $OutputRoot "agent-with.yaml"
 $withoutConfig = Join-Path $OutputRoot "agent-without.yaml"
+$expectedKnowledgeTools = @(
+    "ext__shutu-knowledge__knowledge_add_document",
+    "ext__shutu-knowledge__knowledge_create_base",
+    "ext__shutu-knowledge__knowledge_delete_base",
+    "ext__shutu-knowledge__knowledge_delete_document",
+    "ext__shutu-knowledge__knowledge_get_document",
+    "ext__shutu-knowledge__knowledge_import_url",
+    "ext__shutu-knowledge__knowledge_list_bases",
+    "ext__shutu-knowledge__knowledge_list_documents",
+    "ext__shutu-knowledge__knowledge_maintenance_storage",
+    "ext__shutu-knowledge__knowledge_operation_cancel",
+    "ext__shutu-knowledge__knowledge_operation_retry",
+    "ext__shutu-knowledge__knowledge_operation_status",
+    "ext__shutu-knowledge__knowledge_read_document",
+    "ext__shutu-knowledge__knowledge_refresh_url",
+    "ext__shutu-knowledge__knowledge_reindex_base",
+    "ext__shutu-knowledge__knowledge_reindex_document",
+    "ext__shutu-knowledge__knowledge_search",
+    "ext__shutu-knowledge__knowledge_stats"
+)
+$toolLines = @("    - get_time", "    - read") + ($expectedKnowledgeTools | ForEach-Object { "    - $_" })
+$toolBlock = $toolLines -join "`n"
 $reserveListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $reserveListener.Start()
 $Port = $reserveListener.LocalEndpoint.Port
 $reserveListener.Stop()
 @"
 data_dir: $dataDir
+tools:
+  enabled:
+$toolBlock
 extensions:
   enabled: true
   sources:
     - manifest: $(($manifestPath -replace "\\", "/"))
-  startup_timeout_ms: 10000
-  health_timeout_ms: 1000
+  startup_timeout_ms: 120000
+  health_timeout_ms: 3000
   context_timeout_ms: 4000
   shutdown_timeout_ms: 5000
 web_server:
@@ -133,6 +158,11 @@ $withoutCount = Invoke-CatalogGate $withoutConfig (Join-Path $OutputRoot "catalo
 $withWeb = Invoke-WebStateGate $withConfig "installed"
 $withoutWeb = Invoke-WebStateGate $withoutConfig "removed"
 
+$catalogWith = Get-Content -LiteralPath (Join-Path $OutputRoot "catalog-with.json") -Raw | ConvertFrom-Json
+$actualKnowledgeTools = @($catalogWith.tools | Where-Object { $_.name -like "ext__shutu-knowledge__*" } | ForEach-Object { $_.name })
+$missingKnowledgeTools = @($expectedKnowledgeTools | Where-Object { $_ -notin $actualKnowledgeTools })
+$unexpectedKnowledgeTools = @($actualKnowledgeTools | Where-Object { $_ -notin $expectedKnowledgeTools })
+
 [pscustomobject]@{
     InstalledTools = $withCount
     RemovedTools   = $withoutCount
@@ -140,9 +170,12 @@ $withoutWeb = Invoke-WebStateGate $withoutConfig "removed"
     RemovedRoutes   = $withoutWeb.Routes
     RemovedAgentHealthy = $withoutWeb.Health
     Catalog        = "PASS"
+    MissingTools   = $missingKnowledgeTools -join ","
+    UnexpectedTools = $unexpectedKnowledgeTools -join ","
 } | Format-List
 
-if ($withCount -ne 14 -or $withoutCount -ne 0) {
+if ($withCount -ne $expectedKnowledgeTools.Count -or $withoutCount -ne 0 -or
+    $missingKnowledgeTools.Count -gt 0 -or $unexpectedKnowledgeTools.Count -gt 0) {
     throw "removal gate failed: installed=$withCount removed=$withoutCount"
 }
 if ($withWeb.Routes -ne 1 -or -not $withWeb.Health) {

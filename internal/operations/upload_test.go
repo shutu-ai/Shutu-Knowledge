@@ -15,6 +15,28 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
+func TestUploadForOperationHonorsCanceledContext(t *testing.T) {
+	home := t.TempDir()
+	db, err := storage.Open(filepath.Join(home, "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := NewWithUploadRoot(db, 1, filepath.Join(home, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := service.CreateUpload(context.Background(), UploadCreate{BaseID: "base-a", FileName: "note.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := service.UploadForOperationContext(ctx, "operation-a", session.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled upload lookup error = %v, want context.Canceled", err)
+	}
+}
+
 func TestUploadBindsAtomicallyAndReleasesOnSuccess(t *testing.T) {
 	home := t.TempDir()
 	db, err := storage.Open(filepath.Join(home, "operations.db"))
@@ -76,6 +98,9 @@ func TestUploadBindsAtomicallyAndReleasesOnSuccess(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if op.TotalBytes == nil || *op.TotalBytes != int64(len("file body")) {
+		t.Fatalf("operation total bytes = %v, want %d", op.TotalBytes, len("file body"))
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -157,7 +182,170 @@ func TestUploadBindsAtomicallyAndReleasesOnSuccess(t *testing.T) {
 	}
 }
 
+func TestUploadReleasesAfterNonRetryableFailure(t *testing.T) {
+	home := t.TempDir()
+	db, err := storage.Open(filepath.Join(home, "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service, err := NewWithUploadRoot(db, 1, filepath.Join(home, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.maxPayload = 256
+	service.Register("import_file", func(_ context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		return strings.Repeat("x", service.maxPayload+1), nil
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(service.Stop)
+
+	session, err := service.CreateUpload(context.Background(), UploadCreate{
+		BaseID: "base-a", FileName: "too-large-result.md", ExpectedSize: int64Ptr(9),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PutUploadContent(context.Background(), session.ID, strings.NewReader("file body")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompleteUpload(context.Background(), session.ID); err != nil {
+		t.Fatal(err)
+	}
+	total := 1
+	op, err := service.Submit(context.Background(), Request{
+		Type: "import_file", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-a", DocumentID: "doc-a", Payload: json.RawMessage(`{"uploadId":"` + session.ID + `"}`),
+		UploadID: session.ID, TotalUnits: &total,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForState(t, service, op.ID, StateFailed)
+	if failed.Retryable {
+		t.Fatal("oversized result should make the operation non-retryable")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var released Upload
+	for {
+		released, err = service.GetUpload(session.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if released.State == UploadStateReleased {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("upload state after non-retryable failure = %s, want released", released.State)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(home, "uploads", session.ID+".staging")); !os.IsNotExist(err) {
+		t.Fatalf("staging file still exists after release: %v", err)
+	}
+}
+
+func TestStartupReleasesTerminalBoundUpload(t *testing.T) {
+	home := t.TempDir()
+	db, err := storage.Open(filepath.Join(home, "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first, err := NewWithUploadRoot(db, 1, filepath.Join(home, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Register("import_file", func(_ context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		return nil, nil
+	})
+	session, err := first.CreateUpload(context.Background(), UploadCreate{
+		BaseID: "base-a", FileName: "orphaned.md", ExpectedSize: int64Ptr(9),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.PutUploadContent(context.Background(), session.ID, strings.NewReader("file body")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.CompleteUpload(context.Background(), session.ID); err != nil {
+		t.Fatal(err)
+	}
+	op, err := first.Submit(context.Background(), Request{
+		Type: "import_file", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-a", DocumentID: "doc-a", Payload: json.RawMessage(`{"uploadId":"` + session.ID + `"}`),
+		UploadID: session.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecPriority(context.Background(), storage.ControlWrite, `UPDATE operations
+		SET state = ?, retryable = 0, attempt = ?, finished_at = ?, updated_at = ? WHERE id = ?`,
+		StateFailed, DefaultMaxAttempts, now(), now(), op.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := NewWithUploadRoot(db, 1, filepath.Join(home, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.Stop)
+	released, err := second.GetUpload(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.State != UploadStateReleased {
+		t.Fatalf("startup terminal upload state = %s, want released", released.State)
+	}
+	if _, err := os.Stat(filepath.Join(home, "uploads", session.ID+".staging")); !os.IsNotExist(err) {
+		t.Fatalf("startup recovery left staging file: %v", err)
+	}
+}
+
 func int64Ptr(value int64) *int64 { return &value }
+
+func TestUploadAggregateQuotaIsAtomic(t *testing.T) {
+	home := t.TempDir()
+	db, err := storage.Open(filepath.Join(home, "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	service, err := NewWithUploadRoot(db, 1, filepath.Join(home, "uploads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetResourceLimits(ResourceLimits{IO: 1, DBWrite: 1, Disk: 1, Network: 1, Model: 1, Maintenance: 1, MaxPerBase: 1, UploadBytes: 10})
+	first, err := service.CreateUpload(context.Background(), UploadCreate{BaseID: "base", FileName: "one.txt", ExpectedSize: int64Ptr(6)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PutUploadContent(context.Background(), first.ID, strings.NewReader("123456")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompleteUpload(context.Background(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.CreateUpload(context.Background(), UploadCreate{BaseID: "base", FileName: "two.txt", ExpectedSize: int64Ptr(5)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PutUploadContent(context.Background(), second.ID, strings.NewReader("abcde")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompleteUpload(context.Background(), second.ID); !errors.Is(err, ErrUploadQuotaExceeded) {
+		t.Fatalf("aggregate quota error = %v", err)
+	}
+	unchanged, err := service.GetUpload(second.ID)
+	if err != nil || unchanged.State != UploadStateUploading {
+		t.Fatalf("quota changed session: %+v %v", unchanged, err)
+	}
+}
 
 func TestUploadPublishProcessKillConverges(t *testing.T) {
 	uploadBody := "kill-safe upload body"

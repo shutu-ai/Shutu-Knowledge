@@ -146,20 +146,51 @@ type MigrationResult struct {
 	SourceRemove bool   `json:"sourceRemoved"`
 }
 
-// List returns every model directory. A directory without a complete
-// manifest is reported as incomplete rather than silently ignored.
+// ModelPage is a bounded view of manifest-backed models. NextOffset is zero
+// when HasMore is false; callers can request the next page without loading the
+// whole cache into memory.
+type ModelPage struct {
+	Models     []Model `json:"models"`
+	NextOffset int     `json:"nextOffset"`
+	HasMore    bool    `json:"hasMore"`
+}
+
+const (
+	defaultModelPageLimit = 100
+	maxModelPageLimit     = 100
+	maxModelPageOffset    = 1_000_000
+)
+
+var errModelPageComplete = errors.New("model page complete")
+
+// List returns every model directory for legacy callers. New control-plane
+// paths should use ListPage so a large cache cannot become an unbounded HTTP
+// response or allocation.
 func (m *Manager) List() ([]Model, error) {
+	return m.ListContext(context.Background())
+}
+
+// ListContext returns every manifest-backed model while allowing a maintenance
+// operation to stop a large cache walk before the next directory entry.
+func (m *Manager) ListContext(ctx context.Context) ([]Model, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	root := m.currentRoot()
 	var out []Model
-	err := filepath.WalkDir(m.root, func(path string, entry fs.DirEntry, walkErr error) error {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
 		if !entry.IsDir() && entry.Name() == "manifest.json" {
-			relative, relErr := filepath.Rel(m.root, filepath.Dir(path))
+			relative, relErr := filepath.Rel(root, filepath.Dir(path))
 			if relErr != nil {
 				return relErr
 			}
-			model, err := m.inspect(filepath.ToSlash(relative))
+			model, err := m.inspectAt(root, filepath.ToSlash(relative))
 			if err != nil {
 				return err
 			}
@@ -179,8 +210,59 @@ func (m *Manager) List() ([]Model, error) {
 	return out, nil
 }
 
+// CountContext counts manifest-backed models without decoding every manifest
+// or retaining the full catalog in memory. It is intended for maintenance
+// results that only need a cardinality, not the model picker view.
+func (m *Manager) CountContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	root := m.currentRoot()
+	count := 0
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() && entry.Name() == "manifest.json" {
+			count++
+		}
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (m *Manager) inspect(id string) (Model, error) {
-	dir, err := m.modelDir(id)
+	return m.inspectContext(context.Background(), id)
+}
+
+func (m *Manager) inspectContext(ctx context.Context, id string) (Model, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Model{}, err
+	}
+	model, err := m.inspectAt(m.currentRoot(), id)
+	if err != nil {
+		return Model{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Model{}, err
+	}
+	return model, nil
+}
+
+func (m *Manager) inspectAt(root, id string) (Model, error) {
+	dir, err := m.modelDirAt(root, id)
 	if err != nil {
 		return Model{}, err
 	}
@@ -214,9 +296,83 @@ func (m *Manager) inspect(id string) (Model, error) {
 	return model, nil
 }
 
+// ListPage returns a bounded, deterministic page of local models. WalkDir
+// visits directory entries in lexical order; the sentinel stops after the
+// first item beyond the requested page.
+func (m *Manager) ListPage(limit, offset int) (ModelPage, error) {
+	return m.ListPageContext(context.Background(), limit, offset)
+}
+
+// ListPageContext returns a bounded model page while honoring cancellation
+// during the cache walk and manifest inspection.
+func (m *Manager) ListPageContext(ctx context.Context, limit, offset int) (ModelPage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 {
+		limit = defaultModelPageLimit
+	}
+	if limit > maxModelPageLimit {
+		limit = maxModelPageLimit
+	}
+	if offset < 0 || offset > maxModelPageOffset {
+		return ModelPage{}, fmt.Errorf("model page offset is out of range")
+	}
+	root := m.currentRoot()
+	page := ModelPage{Models: make([]Model, 0, limit)}
+	skipped := 0
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() && entry.Name() == "manifest.json" {
+			if skipped < offset {
+				skipped++
+				return nil
+			}
+			if len(page.Models) >= limit {
+				page.HasMore = true
+				return errModelPageComplete
+			}
+			relative, err := filepath.Rel(root, filepath.Dir(path))
+			if err != nil {
+				return err
+			}
+			model, err := m.inspectAt(root, filepath.ToSlash(relative))
+			if err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			page.Models = append(page.Models, model)
+		}
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return page, nil
+	}
+	if err != nil && !errors.Is(err, errModelPageComplete) {
+		return ModelPage{}, err
+	}
+	if page.HasMore {
+		page.NextOffset = offset + len(page.Models)
+	}
+	return page, nil
+}
+
 // Get returns one manifest-backed model.
 func (m *Manager) Get(id string) (Model, error) {
-	return m.inspect(id)
+	return m.GetContext(context.Background(), id)
+}
+
+// GetContext reads one manifest-backed model while honoring a caller's
+// cancellation boundary around the filesystem inspection.
+func (m *Manager) GetContext(ctx context.Context, id string) (Model, error) {
+	return m.inspectContext(ctx, id)
 }
 
 // Download installs the requested Hugging Face repository into a temporary
@@ -343,8 +499,22 @@ func (m *Manager) downloadArtifact(ctx context.Context, modelID, artifact, dir s
 
 // Remove deletes an installed model. Active downloads are never removed.
 func (m *Manager) Remove(id string) error {
+	return m.RemoveContext(context.Background(), id)
+}
+
+// RemoveContext deletes a model tree while honoring cancellation between
+// filesystem operations. A canceled or failed delete may leave an incomplete
+// tree; a later retry safely removes the remaining entries and the operation
+// layer treats an already absent tree as success.
+func (m *Manager) RemoveContext(ctx context.Context, id string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dir, err := m.modelDir(id)
 	if err != nil {
 		return err
@@ -361,12 +531,60 @@ func (m *Manager) Remove(id string) error {
 		}
 		return err
 	}
-	return os.RemoveAll(dir)
+	return removeTreeContext(ctx, dir)
+}
+
+func removeTreeContext(ctx context.Context, root string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		path := filepath.Join(root, entry.Name())
+		if entry.IsDir() {
+			if err := removeTreeContext(ctx, path); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Remove(root); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // PlanMigration validates a complete move to an empty directory. It never
 // creates the target and never changes the active cache.
 func (m *Manager) PlanMigration(target string) (MigrationPlan, error) {
+	return m.PlanMigrationContext(context.Background(), target)
+}
+
+// PlanMigrationContext performs the potentially large validation scan under a
+// caller-owned context. The durable plan operation uses this boundary so a
+// cancelled request does not leave a worker walking an abandoned cache.
+func (m *Manager) PlanMigrationContext(ctx context.Context, target string) (MigrationPlan, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return MigrationPlan{}, err
+	}
 	source := m.currentRoot()
 	cleanTarget, err := migrationTarget(source, target)
 	if err != nil {
@@ -375,17 +593,20 @@ func (m *Manager) PlanMigration(target string) (MigrationPlan, error) {
 	if m.hasActive() {
 		return MigrationPlan{}, fmt.Errorf("model download is active")
 	}
-	models, err := m.List()
+	models, err := m.ListContext(ctx)
 	if err != nil {
 		return MigrationPlan{}, err
 	}
 	var total int64
 	for _, model := range models {
-		modelDir, err := m.modelDir(model.ID)
+		if err := ctx.Err(); err != nil {
+			return MigrationPlan{}, err
+		}
+		modelDir, err := m.modelDirAt(source, model.ID)
 		if err != nil {
 			return MigrationPlan{}, err
 		}
-		size, err := treeSize(modelDir)
+		size, err := treeSizeContext(ctx, modelDir)
 		if err != nil {
 			return MigrationPlan{}, err
 		}
@@ -395,8 +616,18 @@ func (m *Manager) PlanMigration(target string) (MigrationPlan, error) {
 }
 
 func treeSize(root string) (int64, error) {
+	return treeSizeContext(context.Background(), root)
+}
+
+func treeSizeContext(ctx context.Context, root string) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var total int64
 	err := filepath.WalkDir(root, func(_ string, entry fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return err
 		}
@@ -417,8 +648,24 @@ func treeSize(root string) (int64, error) {
 // copied file with SHA-256, optionally removes the source models, and only
 // then activates the target. Source removal is always explicit.
 func (m *Manager) Migrate(target string, removeSource bool) (MigrationResult, error) {
+	return m.MigrateContext(context.Background(), target, removeSource, nil)
+}
+
+// MigrateContext is the replayable migration boundary used by Durable
+// Operations. The target is fully copied and verified before beforeCommit is
+// called. Callers can persist the new authoritative configuration in that
+// callback; if it fails, the target is removed and the source remains active.
+// Once the callback succeeds, source removal (when requested) and activation
+// complete the migration without another externally observable decision.
+func (m *Manager) MigrateContext(ctx context.Context, target string, removeSource bool, beforeCommit func() error) (MigrationResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return MigrationResult{}, err
+	}
 	source := m.currentRoot()
 	cleanTarget, err := migrationTarget(source, target)
 	if err != nil {
@@ -427,7 +674,7 @@ func (m *Manager) Migrate(target string, removeSource bool) (MigrationResult, er
 	if m.hasActive() {
 		return MigrationResult{}, fmt.Errorf("model download is active")
 	}
-	plan, err := m.PlanMigration(cleanTarget)
+	plan, err := m.PlanMigrationContext(ctx, cleanTarget)
 	if err != nil {
 		return MigrationResult{}, err
 	}
@@ -443,20 +690,47 @@ func (m *Manager) Migrate(target string, removeSource bool) (MigrationResult, er
 	}
 	var copied int64
 	for _, model := range plan.Models {
-		sourceDir, err := m.modelDir(model.ID)
+		if err := ctx.Err(); err != nil {
+			_ = os.RemoveAll(cleanTarget)
+			return MigrationResult{}, err
+		}
+		sourceDir, err := m.modelDirAt(source, model.ID)
 		if err != nil {
+			_ = os.RemoveAll(cleanTarget)
 			return MigrationResult{}, err
 		}
 		targetDir := filepath.Join(cleanTarget, filepath.FromSlash(model.ID))
-		hashes, bytes, err := copyTree(sourceDir, targetDir)
+		hashes, bytes, err := copyTreeContext(ctx, sourceDir, targetDir)
 		if err != nil {
+			_ = os.RemoveAll(cleanTarget)
 			return MigrationResult{}, err
 		}
 		copied += bytes
-		if err := verifyTree(targetDir, hashes); err != nil {
+		if err := verifyTreeContext(ctx, targetDir, hashes); err != nil {
+			_ = os.RemoveAll(cleanTarget)
 			return MigrationResult{}, err
 		}
-		if removeSource {
+	}
+	if copied != plan.Bytes {
+		_ = os.RemoveAll(cleanTarget)
+		return MigrationResult{}, fmt.Errorf("copied %d bytes, expected %d", copied, plan.Bytes)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.RemoveAll(cleanTarget)
+		return MigrationResult{}, err
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			_ = os.RemoveAll(cleanTarget)
+			return MigrationResult{}, err
+		}
+	}
+	if removeSource {
+		for _, model := range plan.Models {
+			sourceDir, err := m.modelDirAt(source, model.ID)
+			if err != nil {
+				return MigrationResult{}, err
+			}
 			if err := os.RemoveAll(sourceDir); err != nil {
 				return MigrationResult{}, fmt.Errorf("remove source model %s: %w", model.ID, err)
 			}
@@ -464,9 +738,6 @@ func (m *Manager) Migrate(target string, removeSource bool) (MigrationResult, er
 				return MigrationResult{}, err
 			}
 		}
-	}
-	if copied != plan.Bytes {
-		return MigrationResult{}, fmt.Errorf("copied %d bytes, expected %d", copied, plan.Bytes)
 	}
 	if removeSource {
 		if entries, err := os.ReadDir(source); err == nil && len(entries) == 0 {
@@ -537,9 +808,16 @@ func containsPath(parent, child string) bool {
 }
 
 func copyTree(source, target string) (map[string][sha256.Size]byte, int64, error) {
+	return copyTreeContext(context.Background(), source, target)
+}
+
+func copyTreeContext(ctx context.Context, source, target string) (map[string][sha256.Size]byte, int64, error) {
 	hashes := map[string][sha256.Size]byte{}
 	var total int64
 	err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -565,19 +843,29 @@ func copyTree(source, target string) (map[string][sha256.Size]byte, int64, error
 		if err != nil {
 			return err
 		}
-		defer sourceFile.Close()
 		targetFile, err := os.Create(targetPath)
 		if err != nil {
+			_ = sourceFile.Close()
 			return err
 		}
-		defer targetFile.Close()
 		digest := sha256.New()
-		size, err := io.Copy(io.MultiWriter(targetFile, digest), sourceFile)
+		size, err := io.Copy(io.MultiWriter(targetFile, digest), contextReader{ctx: ctx, reader: sourceFile})
+		sourceCloseErr := sourceFile.Close()
+		targetCloseErr := error(nil)
 		if err != nil {
+			_ = targetFile.Close()
 			return fmt.Errorf("copy %s: %w", relative, err)
 		}
 		if err := targetFile.Sync(); err != nil {
+			_ = targetFile.Close()
 			return err
+		}
+		targetCloseErr = targetFile.Close()
+		if sourceCloseErr != nil {
+			return sourceCloseErr
+		}
+		if targetCloseErr != nil {
+			return targetCloseErr
 		}
 		if err := os.Chmod(targetPath, info.Mode().Perm()); err != nil {
 			return err
@@ -592,8 +880,15 @@ func copyTree(source, target string) (map[string][sha256.Size]byte, int64, error
 }
 
 func verifyTree(root string, hashes map[string][sha256.Size]byte) error {
+	return verifyTreeContext(context.Background(), root, hashes)
+}
+
+func verifyTreeContext(ctx context.Context, root string, hashes map[string][sha256.Size]byte) error {
 	seen := map[string]bool{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -614,7 +909,7 @@ func verifyTree(root string, hashes map[string][sha256.Size]byte) error {
 			return err
 		}
 		digest := sha256.New()
-		if _, err := io.Copy(digest, file); err != nil {
+		if _, err := io.Copy(digest, contextReader{ctx: ctx, reader: file}); err != nil {
 			_ = file.Close()
 			return err
 		}
@@ -638,6 +933,18 @@ func verifyTree(root string, hashes map[string][sha256.Size]byte) error {
 	return nil
 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 // Active reports whether a download is in progress.
 func (m *Manager) Active(id string) bool {
 	m.mu.Lock()
@@ -646,12 +953,16 @@ func (m *Manager) Active(id string) bool {
 }
 
 func (m *Manager) modelDir(id string) (string, error) {
+	return m.modelDirAt(m.currentRoot(), id)
+}
+
+func (m *Manager) modelDirAt(root, id string) (string, error) {
 	clean := pathClean(id)
 	if clean == "" || clean != strings.TrimSpace(id) {
 		return "", fmt.Errorf("invalid model id %q", id)
 	}
-	dir := filepath.Join(m.root, filepath.FromSlash(clean))
-	cleanRoot := filepath.Clean(m.root)
+	dir := filepath.Join(root, filepath.FromSlash(clean))
+	cleanRoot := filepath.Clean(root)
 	if dir == cleanRoot || !strings.HasPrefix(dir, cleanRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("model path escapes the cache")
 	}

@@ -124,7 +124,7 @@ func TestSustainedBusyWriterKeepsHTTPControlPathsBounded(t *testing.T) {
 	// A no-op write through the application pool takes SQLite's writer lock.
 	// Reads remain available in WAL; this proves HTTP durability writes cannot
 	// fake acceptance while the control path remains bounded.
-	lockTx, err := s.app.DB.BeginTx(context.Background(), nil)
+	lockTx, err := s.app.DB.DB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

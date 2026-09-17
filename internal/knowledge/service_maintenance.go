@@ -54,44 +54,52 @@ func (s *Service) ReconcileStorageSafe(ctx context.Context, options StorageRecon
 }
 
 func (s *Service) reconcileStorage(ctx context.Context, options StorageReconcileOptions, report reconcileProgress) (StorageReconcileResult, error) {
-	docs, err := s.store.listStorageRefs()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	docCount, err := s.store.countStorageRefs(ctx)
 	if err != nil {
 		return StorageReconcileResult{}, err
 	}
-	referenced := make(map[string]bool, len(docs))
-	for _, doc := range docs {
+	referenced := make(map[string]struct{}, docCount)
+	if err := s.store.visitStorageRefs(ctx, func(doc storageDocumentRef) error {
 		if doc.RawFilePath != "" {
-			referenced[doc.RawFilePath] = true
+			referenced[doc.RawFilePath] = struct{}{}
 		}
+		return nil
+	}); err != nil {
+		return StorageReconcileResult{}, err
 	}
-	generationPaths, err := s.store.listGenerationRawPaths()
+	if err := s.store.visitGenerationRawPaths(ctx, func(rel string) error {
+		referenced[rel] = struct{}{}
+		return nil
+	}); err != nil {
+		return StorageReconcileResult{}, err
+	}
+	rawCount, err := s.raw.CountAll(ctx)
 	if err != nil {
 		return StorageReconcileResult{}, err
 	}
-	for _, rel := range generationPaths {
-		referenced[rel] = true
-	}
-	raws, err := s.raw.ListAll()
-	if err != nil {
-		return StorageReconcileResult{}, err
-	}
+	total := rawCount + docCount
 	result := StorageReconcileResult{DryRun: options.DryRun}
 	if report != nil {
-		report("scanning", 0, len(raws)+len(docs))
+		report("scanning", 0, total)
 	}
-	for index, rel := range raws {
-		if referenced[rel] {
-			continue
-		}
+	rawIndex := 0
+	if err := s.raw.WalkAll(ctx, func(rel string) error {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return err
 		}
 		if report != nil {
-			report("scanning", index, len(raws)+len(docs))
+			report("scanning", rawIndex, total)
+		}
+		rawIndex++
+		if _, ok := referenced[rel]; ok {
+			return nil
 		}
 		size, err := s.raw.Size(rel)
 		if err != nil {
-			return result, err
+			return err
 		}
 		result.Orphans++
 		result.OrphanBytes += size
@@ -100,17 +108,20 @@ func (s *Service) reconcileStorage(ctx context.Context, options StorageReconcile
 		case options.Quarantine:
 			quarantinePath, quarantinedBytes, err := s.raw.Quarantine(rel)
 			if err != nil {
-				return result, err
+				return err
 			}
 			result.Quarantined++
 			result.QuarantineBytes += quarantinedBytes
 			_ = quarantinePath
 		default:
 			if err := s.raw.Delete(rel); err != nil {
-				return result, err
+				return err
 			}
 			result.DeletedRaw++
 		}
+		return nil
+	}); err != nil {
+		return result, err
 	}
 
 	if options.PurgeQuarantine && !options.DryRun {
@@ -134,27 +145,32 @@ func (s *Service) reconcileStorage(ctx context.Context, options StorageReconcile
 		result.ExpiredBytes = expiredBytes
 	}
 
-	for index, doc := range docs {
+	docIndex := 0
+	if err := s.store.visitStorageRefs(ctx, func(doc storageDocumentRef) error {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return err
 		}
 		if report != nil {
-			report("counting", len(raws)+index, len(raws)+len(docs))
+			report("counting", rawCount+docIndex, total)
 		}
-		chunkCount, err := s.store.countChunksByDoc(doc.ID)
+		docIndex++
+		chunkCount, err := s.store.countChunksByDocContext(ctx, doc.ID)
 		if err != nil {
-			return result, err
+			return err
 		}
 		if doc.ChunkCount == chunkCount {
-			continue
+			return nil
 		}
-		if err := s.store.updateChunkCount(doc.ID, chunkCount); err != nil {
-			return result, err
+		if err := s.store.updateChunkCountWithContext(ctx, doc.ID, chunkCount); err != nil {
+			return err
 		}
 		result.FixedCounts++
+		return nil
+	}); err != nil {
+		return result, err
 	}
 	if report != nil {
-		report("ready", len(raws)+len(docs), len(raws)+len(docs))
+		report("ready", total, total)
 	}
 	return result, nil
 }

@@ -78,6 +78,8 @@ func toolDefinitions() []extension.ToolDefinition {
 		}, "query"), extension.ToolRiskRead, false),
 		tool("knowledge_list_bases", "List enabled knowledge bases, or outline one base's document tree when baseId is supplied.", objectSchema(map[string]any{
 			"baseId": stringProperty("Optional base id to outline."),
+			"limit":  integerProperty("Maximum number of outline documents to return; defaults to 50 and is capped at 200.", 1, 200),
+			"offset": integerProperty("Zero-based outline document offset.", 0, 1000000000),
 		}), extension.ToolRiskRead, false),
 		tool("knowledge_create_base", "Create a new knowledge base.", objectSchema(map[string]any{
 			"name":        stringProperty("Short base name."),
@@ -91,8 +93,10 @@ func toolDefinitions() []extension.ToolDefinition {
 			"title":   stringProperty("Document title."),
 			"content": stringProperty("Full document text."),
 		}, "baseId", "title", "content"), extension.ToolRiskWrite, false),
-		tool("knowledge_list_documents", "List documents in one base, including document ids and counts.", objectSchema(map[string]any{
+		tool("knowledge_list_documents", "List a bounded page of documents in one base, including document ids and counts.", objectSchema(map[string]any{
 			"baseId": stringProperty("Base id."),
+			"limit":  integerProperty("Maximum number of documents to return; defaults to 50 and is capped at 200.", 1, 200),
+			"offset": integerProperty("Zero-based document offset.", 0, 1000000000),
 		}, "baseId"), extension.ToolRiskRead, false),
 		tool("knowledge_delete_document", "Submit a durable document deletion; cleanup continues after the logical delete is accepted.", objectSchema(map[string]any{
 			"baseId":     stringProperty("Owning base id, used to validate the request."),

@@ -30,7 +30,7 @@ func ProvideContext(ctx context.Context, application *app.App, request extension
 	if sessionID == "" {
 		sessionID = "global"
 	}
-	if state, err := application.Knowledge.EnabledScopeState(); err != nil {
+	if state, err := application.Knowledge.EnabledScopeStateContext(ctx); err != nil {
 		return extension.ContextResult{}, err
 	} else if !state.Enabled {
 		return extension.ContextResult{}, nil
@@ -74,7 +74,7 @@ func ProvideContext(ctx context.Context, application *app.App, request extension
 
 	baseNames := map[string]string{}
 	seats := map[string]int{}
-	if bases, listErr := application.Knowledge.ListBases(); listErr == nil {
+	if bases, listErr := application.Knowledge.ListBasesContext(ctx); listErr == nil {
 		for _, base := range bases {
 			baseConfig := knowledge.ResolveBaseConfig(application.Config, base.Config)
 			baseNames[base.ID] = base.Name

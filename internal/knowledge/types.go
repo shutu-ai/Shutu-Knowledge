@@ -195,6 +195,13 @@ type DocumentSummary struct {
 	ErrorMessage   string `json:"errorMessage,omitempty"`
 	CreatedAt      int64  `json:"createdAt"`
 	UpdatedAt      int64  `json:"updatedAt,omitempty"`
+	// These fields participate in equivalent-operation keys but are never
+	// serialized in list responses.
+	SourceVersion  int64  `json:"-"`
+	MutationEpoch  int64  `json:"-"`
+	ActiveIndexGen int64  `json:"-"`
+	ContentHash    string `json:"-"`
+	RawFilePath    string `json:"-"`
 }
 
 // DocumentChildrenPage is one bounded directory view. Breadcrumbs are ordered
@@ -207,6 +214,16 @@ type DocumentChildrenPage struct {
 	Offset      int               `json:"offset"`
 	HasMore     bool              `json:"hasMore"`
 	Breadcrumbs []DocumentSummary `json:"breadcrumbs"`
+}
+
+// DocumentListPage is the bounded compatibility form of the legacy flat
+// document list. It intentionally has no tree breadcrumbs.
+type DocumentListPage struct {
+	Documents []DocumentSummary `json:"documents"`
+	Total     int               `json:"total"`
+	Limit     int               `json:"limit"`
+	Offset    int               `json:"offset"`
+	HasMore   bool              `json:"hasMore"`
 }
 
 // BaseSummary is the list view of a base.

@@ -59,6 +59,9 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+
+      - name: Check storage writer guard
+        run: go test ./scripts -run '^TestWriterGuard$' -count=1
       - name: Test race
         run: go test -race ./...
       - name: Benchmark smoke
@@ -88,3 +91,63 @@ jobs:
         run: go run ./scripts/runtime_smoke.go -home "$RUNNER_TEMP/shutu-runtime-home" -model-cache "$RUNNER_TEMP/shutu-runtime-model-cache"
       - name: Offline managed runtime restart smoke
         run: go run ./scripts/runtime_smoke.go -home "$RUNNER_TEMP/shutu-runtime-home" -model-cache "$RUNNER_TEMP/shutu-runtime-model-cache" -offline-restart
+
+  # Native lifecycle evidence is intentionally separate from the ordinary
+  # Ubuntu build: instance ownership, signal handling, and process-tree
+  # cleanup must execute on each supported release host.
+  release-host:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    name: release-host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Download Go modules
+        run: go mod download
+      - name: Native host lifecycle acceptance
+        run: go run ./cmd/release-acceptance -profile host
+      - name: Upload release-host evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-host-${{ matrix.os }}
+          path: .tmp/release-acceptance
+          if-no-files-found: warn
+
+  # Formal packaging is a separate gate from native lifecycle acceptance. The
+  # package script requires the checkout to be clean, embeds the candidate
+  # identity and storage contract, verifies the archive, and runs the static
+  # secret/provenance audit before an artifact can be uploaded.
+  release-package:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - name: Download Go modules
+        run: go mod download
+      - name: Build, verify, and audit formal package
+        shell: pwsh
+        run: |
+          & .\scripts\package_release.ps1 `
+            -Platform windows-amd64 `
+            -OutputRoot .tmp\formal-release
+      - name: Upload formal package and audit inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-release-windows-amd64
+          path: .tmp/formal-release
+          if-no-files-found: warn

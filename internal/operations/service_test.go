@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +111,266 @@ func TestSubmitIsDurableAndIdempotent(t *testing.T) {
 		t.Fatalf("executor calls = %d, want 1", calls)
 	}
 	mu.Unlock()
+}
+
+func TestSubmitPersistsReplayEnvelope(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	targetEpoch := int64(17)
+	ancestorEpoch := int64(4)
+	allocatedGeneration := int64(9)
+	request := Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		BaseID: "base-a", DocumentID: "doc-a", ParentOperationID: "parent-a",
+		PrincipalRef: "principal-a", ScopeRef: "scope-a", InputRef: "upload-a",
+		InputSHA256: "input-hash-a", SourceVersion: "source-v3",
+		ConfigSnapshotRef: "config-v8", ModelSnapshotRef: "model-v2",
+		ExpectedTargetEpoch: &targetEpoch, ExpectedAncestorEpoch: &ancestorEpoch,
+		AllocatedGeneration: &allocatedGeneration,
+		Payload:             json.RawMessage(`{"value":"envelope"}`), IdempotencyKey: "envelope-key",
+	}
+	first, err := service.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PrincipalRef != request.PrincipalRef || first.ScopeRef != request.ScopeRef ||
+		first.InputRef != request.InputRef || first.InputSHA256 != request.InputSHA256 ||
+		first.SourceVersion != request.SourceVersion || first.ConfigSnapshotRef != request.ConfigSnapshotRef ||
+		first.ModelSnapshotRef != request.ModelSnapshotRef || first.DocumentID != request.DocumentID ||
+		first.AllocatedDocumentID != request.DocumentID || first.AllocatedGeneration == nil ||
+		*first.AllocatedGeneration != allocatedGeneration || first.ExpectedTargetEpoch == nil ||
+		*first.ExpectedTargetEpoch != targetEpoch || first.ExpectedAncestorEpoch == nil ||
+		*first.ExpectedAncestorEpoch != ancestorEpoch {
+		t.Fatalf("replay envelope = %+v", first)
+	}
+	second, err := service.Submit(context.Background(), request)
+	if err != nil || second.ID != first.ID {
+		t.Fatalf("same envelope replay = %+v, err=%v", second, err)
+	}
+	request.ConfigSnapshotRef = "config-v9"
+	if _, err := service.Submit(context.Background(), request); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("snapshot conflict = %v", err)
+	}
+}
+
+func TestOperationItemCommitMarkerIsMonotonic(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	op, err := service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":"item"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.MarkItem(context.Background(), op.ID, 1, "doc-a", ItemCommitted,
+		map[string]any{"documentId": "doc-a"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.MarkItem(context.Background(), op.ID, 1, "doc-a", ItemFailed,
+		nil, "late_failure", "must not overwrite"); !errors.Is(err, ErrOperationItemCommitted) {
+		t.Fatalf("committed marker overwrite = %v", err)
+	}
+	if err := service.MarkItem(context.Background(), op.ID, 0, "doc-a", ItemCommitted,
+		nil, "", ""); err != nil {
+		t.Fatalf("same committed marker replay = %v", err)
+	}
+	items, err := service.ListItems(context.Background(), op.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || !items[0].Committed || items[0].State != ItemCommitted ||
+		string(items[0].Result) != `{"documentId":"doc-a"}` {
+		t.Fatalf("operation items = %+v", items)
+	}
+}
+
+func TestOversizedResultIsBoundedAndNonRetryable(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	service.Register("oversized-result", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		return map[string]string{"payload": strings.Repeat("x", service.maxPayload+1)}, nil
+	})
+	op, err := service.Submit(context.Background(), Request{
+		Type: "oversized-result", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{}`), IdempotencyKey: "oversized-result-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := waitForState(t, service, op.ID, StateFailed)
+	if finished.ErrorCode != "result_too_large" || finished.Retryable {
+		t.Fatalf("oversized result state = %+v", finished)
+	}
+	var stored sql.NullString
+	if err := service.db.QueryRow(`SELECT result FROM operations WHERE id = ?`, op.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Valid {
+		t.Fatalf("oversized result was persisted: %d bytes", len(stored.String))
+	}
+	if _, err := service.Retry(op.ID); err == nil {
+		t.Fatal("oversized result unexpectedly accepted retry")
+	}
+}
+
+func TestOperationMetricsAggregatesOutcomesByType(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	service.Register("timeout", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		return nil, context.DeadlineExceeded
+	})
+	op, err := service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":"metrics"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, service, op.ID, StateSucceeded)
+	timeoutOp, err := service.Submit(context.Background(), Request{
+		Type: "timeout", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, service, timeoutOp.ID, StateFailed)
+	if _, err := service.Submit(context.Background(), Request{
+		Type: "missing", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{}`),
+	}); !errors.Is(err, ErrUnsupportedCommand) {
+		t.Fatalf("unsupported operation error = %v", err)
+	}
+
+	metrics, err := service.OperationMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo := metrics.ByType["echo"]
+	if metrics.Total != 2 || echo.Total != 1 || echo.Succeeded != 1 || echo.Failed != 0 {
+		t.Fatalf("operation metrics = %+v, echo = %+v", metrics, echo)
+	}
+	timeoutStats := metrics.ByType["timeout"]
+	if timeoutStats.Failed != 1 || timeoutStats.Timeouts != 1 {
+		t.Fatalf("timeout metrics = %+v", timeoutStats)
+	}
+	if metrics.Rejected != 1 || metrics.ByType["missing"].Rejected != 1 {
+		t.Fatalf("rejection metrics = %+v", metrics)
+	}
+}
+
+func TestOperationExposesDerivedQueueAndRunTiming(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	service.Register("slow-timing", func(ctx context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		select {
+		case <-time.After(20 * time.Millisecond):
+			return map[string]string{"ok": "true"}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	op, err := service.Submit(context.Background(), Request{
+		Type: "slow-timing", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{}`), IdempotencyKey: "slow-timing-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitForState(t, service, op.ID, StateSucceeded)
+	if done.RequestedAt == 0 || done.StartedAt == 0 || done.FinishedAt == 0 {
+		t.Fatalf("missing operation timestamps: %+v", done)
+	}
+	if done.QueueWaitMS != done.StartedAt-done.RequestedAt || done.RunTimeMS != done.FinishedAt-done.StartedAt {
+		t.Fatalf("derived timings do not match timestamps: %+v", done)
+	}
+	if done.RunTimeMS < 10 {
+		t.Fatalf("run time did not include executor: %dms", done.RunTimeMS)
+	}
+}
+
+func TestOperationPersistsAndChecksResourceBudget(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "resource-budget.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Register("echo", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		return nil, nil
+	})
+	service.SetResourceLimits(ResourceLimits{
+		IO: 1, DBWrite: 1, Disk: 1, Network: 1, Model: 1, Maintenance: 1,
+		MaxPerBase: 1, MemoryBytes: 256, DiskBytes: 512, TempBytes: 128,
+	})
+	op, err := service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"ok":true}`), ResourceClass: ResourceIO,
+		MemoryBytes: 64, DiskBytes: 128, TempBytes: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.MemoryBytes != 64 || op.DiskBytes != 128 || op.TempBytes != 32 {
+		t.Fatalf("persisted resource budget = %d/%d/%d, want 64/128/32", op.MemoryBytes, op.DiskBytes, op.TempBytes)
+	}
+	_, err = service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"ok":false}`), ResourceClass: ResourceIO,
+		MemoryBytes: 257,
+	})
+	if !errors.Is(err, ErrResourceBudgetExceeded) {
+		t.Fatalf("oversized resource budget error = %v, want ErrResourceBudgetExceeded", err)
+	}
+}
+
+func TestDiskLowWaterRejectsNewCommandsAndAllowsRetryAfterRecovery(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "disk-low-water.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Register("echo", func(context.Context, Operation, json.RawMessage, func(Progress)) (any, error) {
+		return nil, nil
+	})
+	service.SetResourceLimits(ResourceLimits{
+		IO: 1, DBWrite: 1, Disk: 1, Network: 1, Model: 1, Maintenance: 1,
+		MaxPerBase: 1, MemoryBytes: 256, DiskBytes: 512, DiskLowWaterBytes: 100, TempBytes: 128,
+	})
+	service.SetDiskFreeSampler(func() uint64 { return 50 })
+	_, err = service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":1}`), IdempotencyKey: "disk-low-water-key",
+		MemoryBytes: 64, DiskBytes: 128, TempBytes: 32,
+	})
+	if !errors.Is(err, ErrDiskLowWater) {
+		t.Fatalf("low-water error = %v, want ErrDiskLowWater", err)
+	}
+	service.SetDiskFreeSampler(func() uint64 { return 200 })
+	op, err := service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":1}`), IdempotencyKey: "disk-low-water-key",
+		MemoryBytes: 64, DiskBytes: 128, TempBytes: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.ID == "" {
+		t.Fatal("accepted operation has no id")
+	}
 }
 
 func TestQueueFullStillReturnsBoundIdempotentOperation(t *testing.T) {
@@ -329,6 +590,46 @@ func TestExpiredTerminalIdempotencyBindingReturnsExplicitError(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 1 {
 		t.Fatalf("expired retry executed executor %d additional time(s)", calls-1)
+	}
+}
+
+func TestExpiredTerminalOperationReleasesPayloadAndResult(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	request := Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload:        json.RawMessage(`{"value":"retained briefly"}`),
+		IdempotencyKey: "payload-retention-key",
+	}
+	accepted, err := service.Submit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := waitForState(t, service, accepted.ID, StateSucceeded)
+	if len(terminal.Result) == 0 {
+		t.Fatal("terminal result was not persisted before expiry")
+	}
+	if _, err := service.db.Exec(`UPDATE operations SET idempotency_expires_at = ? WHERE id = ?`,
+		time.Now().UnixMilli()-1, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.expireTerminalOperationPayloads(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	released, err := service.Get(accepted.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(released.Result) != 0 {
+		t.Fatalf("expired result retained: %s", released.Result)
+	}
+	var payload string
+	if err := service.db.QueryRow(`SELECT command_payload FROM operations WHERE id = ?`, accepted.ID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload != "" {
+		t.Fatalf("expired command payload retained: %q", payload)
 	}
 }
 
@@ -581,6 +882,38 @@ func TestRetryHonorsAttemptLimitAndRecordsEvents(t *testing.T) {
 	}
 }
 
+func TestFinishPersistsSanitizedExecutorError(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.Register("secret-error", func(_ context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		return nil, errors.New(`request failed: apiKey=top-secret open C:\private\input.pdf`)
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(service.Stop)
+	op, err := service.Submit(context.Background(), Request{
+		Type: "secret-error", CommandSchemaVersion: CommandSchemaV1, Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForState(t, service, op.ID, StateFailed)
+	if strings.Contains(failed.ErrorMessage, "top-secret") || strings.Contains(failed.ErrorMessage, `C:\private`) {
+		t.Fatalf("executor error leaked sensitive data: %q", failed.ErrorMessage)
+	}
+	if !strings.Contains(failed.ErrorMessage, "request failed") {
+		t.Fatalf("useful error cause lost: %q", failed.ErrorMessage)
+	}
+}
+
 func TestStaleAttemptProgressAndFinishAreIgnored(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "stale-attempt.db"))
 	if err != nil {
@@ -639,6 +972,29 @@ func TestStaleAttemptProgressAndFinishAreIgnored(t *testing.T) {
 	}
 	if progress.Phase != "working" || progress.CompletedUnits != 3 || progress.TotalUnits == nil || *progress.TotalUnits != 5 {
 		t.Fatalf("current attempt progress was not applied: %+v", progress)
+	}
+	if err := service.report(op.ID, 1, Progress{Phase: "working", Completed: 4, Total: 5}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := service.Events(context.Background(), op.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	phaseEvents := 0
+	for _, event := range events {
+		if event.Kind == "phase" {
+			phaseEvents++
+			var payload map[string]any
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["phase"] != "working" {
+				t.Fatalf("phase event payload = %v", payload)
+			}
+		}
+	}
+	if phaseEvents != 1 {
+		t.Fatalf("phase events = %d, want one deduplicated event", phaseEvents)
 	}
 	if err := service.finish(op.ID, 1, map[string]any{"current": true}, nil); err != nil {
 		t.Fatal(err)
@@ -710,6 +1066,102 @@ func TestCancelQueuedOperationWithoutRunningIt(t *testing.T) {
 	kinds := operationEventKinds(events)
 	if want := []string{"submitted", "cancel_requested", "finished"}; !slices.Equal(kinds, want) {
 		t.Fatalf("cancel events = %v, want %v", kinds, want)
+	}
+}
+
+func TestOperationControlReadsHonorCanceledContext(t *testing.T) {
+	var calls int
+	var mu sync.Mutex
+	service := newTestService(t, &calls, &mu)
+	op, err := service.Submit(context.Background(), Request{
+		Type: "echo", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":"cancelled-context"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for name, call := range map[string]func() error{
+		"get": func() error {
+			_, err := service.GetContext(ctx, op.ID)
+			return err
+		},
+		"cancel": func() error {
+			_, err := service.CancelContext(ctx, op.ID)
+			return err
+		},
+		"retry": func() error {
+			_, err := service.RetryContext(ctx, op.ID)
+			return err
+		},
+	} {
+		if err := call(); !errors.Is(err, context.Canceled) {
+			t.Errorf("%s with canceled context = %v, want context.Canceled", name, err)
+		}
+	}
+}
+
+func TestCancelRecordedBeforeWorkerRegistrationCancelsContext(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "cancel-before-registration.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	service, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelledInHook := make(chan struct{})
+	hookErr := make(chan error, 1)
+	SetTestPreDispatchHook(func(op Operation) {
+		cancelled, cancelErr := service.Cancel(op.ID)
+		if cancelErr != nil {
+			hookErr <- cancelErr
+			return
+		}
+		if cancelled.State != StateCancelling || !cancelled.CancelRequested {
+			hookErr <- fmt.Errorf("cancel state in pre-dispatch hook: %+v", cancelled)
+			return
+		}
+		close(cancelledInHook)
+	})
+	t.Cleanup(func() { SetTestPreDispatchHook(nil) })
+	executed := make(chan error, 1)
+	service.Register("cancel-before-registration", func(ctx context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		executed <- ctx.Err()
+		return nil, ctx.Err()
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(service.Stop)
+	op, err := service.Submit(context.Background(), Request{
+		Type: "cancel-before-registration", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-hookErr:
+		t.Fatal(err)
+	case <-cancelledInHook:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pre-dispatch cancellation hook did not run")
+	}
+	select {
+	case err := <-executed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("executor context error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled executor did not return")
+	}
+	final := waitForState(t, service, op.ID, StateCancelled)
+	if !final.CancelRequested || final.Attempt != 1 {
+		t.Fatalf("cancelled operation state: %+v", final)
 	}
 }
 

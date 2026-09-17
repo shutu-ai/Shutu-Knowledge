@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
-	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -80,14 +79,10 @@ func newBenchmarkFixture(b *testing.B) *benchmarkFixture {
 	if err != nil {
 		b.Fatal(err)
 	}
-	manager := jobs.New(db, 4)
-	if err := manager.Start(context.Background()); err != nil {
-		b.Fatal(err)
-	}
 	cfg := config.Defaults()
 	cfg.Embedding.Provider = "openai"
 	cfg.Embedding.Batch = 32
-	service := NewService(db, raw, cfg, manager)
+	service := NewService(db, raw, cfg)
 	service.SetProviders(benchmarkEmbedder{}, nil)
 	base, err := service.CreateBase("Benchmark", "", "", BaseConfig{})
 	if err != nil {
@@ -96,7 +91,6 @@ func newBenchmarkFixture(b *testing.B) *benchmarkFixture {
 	fixture := &benchmarkFixture{
 		service: service, base: base, docs: map[string]string{},
 		cleanup: func() {
-			manager.Stop()
 			_ = db.Close()
 		},
 	}
@@ -247,13 +241,9 @@ func newBenchmarkFixtureT(t *testing.T) *benchmarkFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager := jobs.New(db, 4)
-	if err := manager.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	cfg := config.Defaults()
 	cfg.Embedding.Provider = "openai"
-	service := NewService(db, raw, cfg, manager)
+	service := NewService(db, raw, cfg)
 	service.SetProviders(benchmarkEmbedder{}, nil)
 	base, err := service.CreateBase("Benchmark", "", "", BaseConfig{})
 	if err != nil {
@@ -262,7 +252,6 @@ func newBenchmarkFixtureT(t *testing.T) *benchmarkFixture {
 	fixture := &benchmarkFixture{
 		service: service, base: base, docs: map[string]string{},
 		cleanup: func() {
-			manager.Stop()
 			_ = db.Close()
 		},
 	}

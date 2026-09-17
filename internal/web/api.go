@@ -1,7 +1,7 @@
 package web
 
 import (
-	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -93,28 +94,34 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 }
 
 func writeErr(w http.ResponseWriter, err error) {
+	message := operations.SafeErrorMessage(err.Error())
 	var conflict *knowledge.ConflictError
 	switch {
 	case errors.As(err, &conflict):
 		writeJSON(w, http.StatusConflict, map[string]any{
-			"ok": false, "error": map[string]any{"code": "conflict", "conflicts": conflict.Conflicts, "message": err.Error()},
+			"ok": false, "error": map[string]any{"code": "conflict", "conflicts": conflict.Conflicts, "message": message},
 		})
 	case errors.Is(err, knowledge.ErrNotFound):
-		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": map[string]string{"code": "not-found", "message": err.Error()}})
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": map[string]string{"code": "not-found", "message": message}})
 	case errors.Is(err, knowledge.ErrModelSchedulerWait):
 		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": map[string]string{"code": "quota_exceeded", "message": err.Error()}})
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": map[string]string{"code": "quota_exceeded", "message": message}})
 	case errors.Is(err, knowledge.ErrSearchTimeout):
-		writeJSON(w, http.StatusRequestTimeout, map[string]any{"ok": false, "error": map[string]string{"code": "request_timeout", "message": err.Error()}})
+		writeJSON(w, http.StatusRequestTimeout, map[string]any{"ok": false, "error": map[string]string{"code": "request_timeout", "message": message}})
 	case errors.Is(err, knowledge.ErrHistoricalEvidenceExpired):
-		writeJSON(w, http.StatusGone, map[string]any{"ok": false, "error": map[string]string{"code": "historical_evidence_expired", "message": err.Error()}})
+		writeJSON(w, http.StatusGone, map[string]any{"ok": false, "error": map[string]string{"code": "historical_evidence_expired", "message": message}})
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": map[string]string{"code": "error", "message": err.Error()}})
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": map[string]string{"code": "error", "message": message}})
 	}
 }
 
 func writeOK(w http.ResponseWriter, value any) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "value": value})
+}
+
+func operationIdempotencyKey(prefix string, payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("%s-%x", prefix, digest[:])
 }
 
 func redactedBase(base knowledge.Base) knowledge.Base {
@@ -131,8 +138,8 @@ func decodeBody[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 	return body, true
 }
 
-func (s *Server) listBases(w http.ResponseWriter, _ *http.Request) {
-	bases, err := s.app.Knowledge.ListBases()
+func (s *Server) listBases(w http.ResponseWriter, r *http.Request) {
+	bases, err := s.app.Knowledge.ListBasesContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -155,7 +162,7 @@ func (s *Server) createBase(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	base, err := s.app.Knowledge.CreateBase(body.Name, body.Description, body.Group, body.Config)
+	base, err := s.app.Knowledge.CreateBaseWithContext(r.Context(), body.Name, body.Description, body.Group, body.Config)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -164,7 +171,7 @@ func (s *Server) createBase(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getBase(w http.ResponseWriter, r *http.Request) {
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -185,7 +192,7 @@ func (s *Server) patchBase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Config != nil {
-		current, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+		current, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -214,7 +221,7 @@ func (s *Server) patchBase(w http.ResponseWriter, r *http.Request) {
 		config.ClearMineruAPIKey = false
 		body.Config = &config
 	}
-	base, err := s.app.Knowledge.RenameBase(r.PathValue("id"), body.Name, body.Description, body.Group, body.Config)
+	base, err := s.app.Knowledge.RenameBaseWithContext(r.Context(), r.PathValue("id"), body.Name, body.Description, body.Group, body.Config)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -224,7 +231,7 @@ func (s *Server) patchBase(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteBase(w http.ResponseWriter, r *http.Request) {
 	baseID := r.PathValue("id")
-	if _, err := s.app.Knowledge.GetBase(baseID); err != nil {
+	if _, err := s.app.Knowledge.GetBaseWithContext(r.Context(), baseID); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -240,7 +247,7 @@ func (s *Server) deleteBase(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) baseStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.app.Knowledge.Stats(r.PathValue("id"))
+	stats, err := s.app.Knowledge.StatsContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -249,7 +256,7 @@ func (s *Server) baseStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) baseName(w http.ResponseWriter, r *http.Request) {
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -257,8 +264,8 @@ func (s *Server) baseName(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"id": base.ID, "name": base.Name, "group": base.Group})
 }
 
-func (s *Server) globalStats(w http.ResponseWriter, _ *http.Request) {
-	stats, err := s.app.Knowledge.Stats("")
+func (s *Server) globalStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.app.Knowledge.StatsContext(r.Context(), "")
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -280,16 +287,30 @@ func (s *Server) restoreBase(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	base, err := s.app.Knowledge.RestoreBase(r.Context(), r.PathValue("id"), body.Name, body.Config)
-	if err != nil {
+	if _, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id")); err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, redactedBase(base))
+	encoded, err := json.Marshal(map[string]any{"name": body.Name, "config": body.Config})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "restore_base", CommandSchemaVersion: operations.CommandSchemaV1,
+		BaseID: r.PathValue("id"), Payload: encoded,
+		IdempotencyKey: operationIdempotencyKey("restore-base-v1", append([]byte(r.PathValue("id")+"\x00"), encoded...)),
+		ResourceClass:  operations.ResourceIO,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeOperationAccepted(w, operation)
 }
 
-func (s *Server) indexingStatus(w http.ResponseWriter, _ *http.Request) {
-	status, err := s.app.Knowledge.IndexingStatus()
+func (s *Server) indexingStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := s.app.Knowledge.IndexingStatusContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -358,7 +379,7 @@ func (s *Server) rawDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	raw, err := s.app.Knowledge.GetRawFileForCitation(r.PathValue("id"), opts)
+	raw, err := s.app.Knowledge.GetRawFileForCitationContext(r.Context(), r.PathValue("id"), opts)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -414,7 +435,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	}
 	// Recall Test owns its replay history. Extension tool and automatic-RAG
 	// searches call Knowledge.Search directly and are intentionally excluded.
-	if _, err := s.app.Knowledge.SaveSearchHistory(body, result); err != nil {
+	if _, err := s.app.Knowledge.SaveSearchHistoryContext(r.Context(), body, result); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -426,7 +447,7 @@ func (s *Server) listSearchHistory(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 20
 	}
-	items, err := s.app.Knowledge.ListSearchHistory(limit)
+	items, err := s.app.Knowledge.ListSearchHistoryContext(r.Context(), limit)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -435,15 +456,15 @@ func (s *Server) listSearchHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteSearchHistory(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.Knowledge.DeleteSearchHistory(r.PathValue("id")); err != nil {
+	if err := s.app.Knowledge.DeleteSearchHistoryContext(r.Context(), r.PathValue("id")); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeOK(w, map[string]bool{"deleted": true})
 }
 
-func (s *Server) clearSearchHistory(w http.ResponseWriter, _ *http.Request) {
-	if err := s.app.Knowledge.DeleteSearchHistory(""); err != nil {
+func (s *Server) clearSearchHistory(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Knowledge.DeleteSearchHistoryContext(r.Context(), ""); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -495,12 +516,28 @@ func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {
-	docs, err := s.app.Knowledge.ListDocumentsContext(r.Context(), r.PathValue("id"))
+	if query := r.URL.Query(); query.Has("limit") || query.Has("offset") {
+		limit, _ := strconv.Atoi(query.Get("limit"))
+		offset, _ := strconv.Atoi(query.Get("offset"))
+		page, err := s.app.Knowledge.ListDocumentsPageContext(r.Context(), r.PathValue("id"), limit, offset)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeOK(w, page)
+		return
+	}
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Link", fmt.Sprintf("</api/bases/%s/documents?limit=50&offset=0>; rel=\"successor-version\"", url.PathEscape(r.PathValue("id"))))
+	// Preserve the legacy array response shape, but make the compatibility
+	// path bounded. Callers that need the remainder must use the successor
+	// page contract above.
+	page, err := s.app.Knowledge.ListDocumentsPageContext(r.Context(), r.PathValue("id"), 50, 0)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, docs)
+	writeOK(w, page.Documents)
 }
 
 func (s *Server) listDocumentChildren(w http.ResponseWriter, r *http.Request) {
@@ -537,7 +574,7 @@ func (s *Server) addDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -569,7 +606,7 @@ func (s *Server) addFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("at least one file is required"))
 		return
 	}
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -596,21 +633,26 @@ func (s *Server) addFiles(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) reindexBase(w http.ResponseWriter, r *http.Request) {
 	baseID := r.PathValue("id")
-	base, err := s.app.Knowledge.GetBase(baseID)
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), baseID)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	documents, err := s.app.Knowledge.ListDocuments(base.ID)
+	totalUnits, err := s.app.Knowledge.CountActiveDocuments(r.Context(), base.ID)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	totalUnits := len(documents)
+	idempotencyKey, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), base.ID, nil)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "reindex_base", CommandSchemaVersion: operations.CommandSchemaV1,
 		BaseID: base.ID, Payload: json.RawMessage("{}"), ResourceClass: "io",
-		TotalUnits: &totalUnits,
+		IdempotencyKey: idempotencyKey,
+		TotalUnits:     &totalUnits,
 	})
 	if err != nil {
 		writeOperationErr(w, err)
@@ -638,7 +680,7 @@ func (s *Server) addURLDocument(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -673,7 +715,7 @@ func (s *Server) importDirectory(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	base, err := s.app.Knowledge.GetBase(r.PathValue("id"))
+	base, err := s.app.Knowledge.GetBaseWithContext(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -700,7 +742,7 @@ func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	doc, err := s.app.Knowledge.CreateDirectory(r.PathValue("id"), body.Title, body.ParentDirectoryID, body.SourcePath)
+	doc, err := s.app.Knowledge.CreateDirectoryWithContext(r.Context(), r.PathValue("id"), body.Title, body.ParentDirectoryID, body.SourcePath)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -709,7 +751,7 @@ func (s *Server) createDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rescanDirectory(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -735,7 +777,7 @@ func (s *Server) repointSource(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	doc, err := s.app.Knowledge.RepointSource(r.PathValue("id"), body.Path)
+	doc, err := s.app.Knowledge.RepointSourceWithContext(r.Context(), r.PathValue("id"), body.Path)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -744,7 +786,7 @@ func (s *Server) repointSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) refreshDocument(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -763,7 +805,7 @@ func (s *Server) refreshDocument(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getDocument(w http.ResponseWriter, r *http.Request) {
 	includeChunks := r.URL.Query().Get("includeChunks") != "false"
-	doc, chunks, err := s.app.Knowledge.GetDocument(r.PathValue("id"), includeChunks)
+	doc, chunks, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), includeChunks)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -784,7 +826,7 @@ func (s *Server) patchDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	doc, err := s.app.Knowledge.RenameDocument(r.PathValue("id"), body.Title)
+	doc, err := s.app.Knowledge.RenameDocumentWithContext(r.Context(), r.PathValue("id"), body.Title)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -793,7 +835,7 @@ func (s *Server) patchDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -816,7 +858,7 @@ func (s *Server) deleteDocument(w http.ResponseWriter, r *http.Request) {
 // dispatcher serializes it with imports and reindexes.
 func (s *Server) deleteDocumentJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	doc, _, err := s.app.Knowledge.GetDocument(id, false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), id, false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -835,17 +877,16 @@ func (s *Server) deleteDocumentJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteDocumentTree(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	docs, err := s.app.Knowledge.ListDocuments(doc.BaseID)
+	total, err := s.app.Knowledge.CountDocumentTree(r.Context(), doc.ID)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	total := directoryTreeSize(docs, doc.ID)
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "delete_directory", CommandSchemaVersion: operations.CommandSchemaV1,
 		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
@@ -860,7 +901,7 @@ func (s *Server) deleteDocumentTree(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	doc, _, err := s.app.Knowledge.GetDocument(id, false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), id, false)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -869,12 +910,11 @@ func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("document is not a directory"))
 		return
 	}
-	docs, err := s.app.Knowledge.ListDocuments(doc.BaseID)
+	total, err := s.app.Knowledge.CountDocumentTree(r.Context(), id)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	total := directoryTreeSize(docs, id)
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "delete_directory", CommandSchemaVersion: operations.CommandSchemaV1,
 		BaseID: doc.BaseID, DocumentID: id, Payload: json.RawMessage("{}"),
@@ -885,26 +925,6 @@ func (s *Server) deleteDocumentTreeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeLegacyJobAccepted(w, operation, "determinate")
-}
-
-func directoryTreeSize(docs []knowledge.DocumentSummary, rootID string) int {
-	children := make(map[string][]string)
-	for _, doc := range docs {
-		children[doc.ParentDirID] = append(children[doc.ParentDirID], doc.ID)
-	}
-	var count func(string, map[string]bool) int
-	count = func(id string, seen map[string]bool) int {
-		if seen[id] {
-			return 0
-		}
-		seen[id] = true
-		total := 1
-		for _, childID := range children[id] {
-			total += count(childID, seen)
-		}
-		return total
-	}
-	return count(rootID, make(map[string]bool))
 }
 
 type deleteDocumentsRequest struct {
@@ -922,7 +942,7 @@ func (s *Server) deleteDocuments(w http.ResponseWriter, r *http.Request) {
 	}
 	baseID := ""
 	for _, id := range body.IDs {
-		doc, _, err := s.app.Knowledge.GetDocument(id, false)
+		doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), id, false)
 		if errors.Is(err, knowledge.ErrNotFound) {
 			continue
 		}
@@ -968,9 +988,10 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errors.New("at least one document is required"))
 		return
 	}
+	sort.Strings(body.IDs)
 	baseID := ""
 	for _, id := range body.IDs {
-		doc, _, err := s.app.Knowledge.GetDocument(id, false)
+		doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), id, false)
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -988,10 +1009,15 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	totalUnits := len(body.IDs)
+	idempotencyKey, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), baseID, body.IDs)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "reindex_documents", CommandSchemaVersion: operations.CommandSchemaV1,
 		BaseID: baseID, Payload: encoded, TotalUnits: &totalUnits,
-		ResourceClass: operations.ResourceIO,
+		ResourceClass: operations.ResourceIO, IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		writeOperationErr(w, err)
@@ -1001,16 +1027,22 @@ func (s *Server) reindexDocuments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
-	doc, _, err := s.app.Knowledge.GetDocument(r.PathValue("id"), false)
+	doc, _, err := s.app.Knowledge.GetDocumentWithContext(r.Context(), r.PathValue("id"), false)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	totalUnits := 1
+	idempotencyKey, err := s.app.Knowledge.ReindexIdempotencyKey(r.Context(), doc.BaseID, []string{doc.ID})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "reindex_document", CommandSchemaVersion: operations.CommandSchemaV1,
-		BaseID: doc.BaseID, DocumentID: doc.ID, Payload: json.RawMessage("{}"),
-		TotalUnits: &totalUnits, ResourceClass: operations.ResourceIO,
+		BaseID: doc.BaseID, DocumentID: doc.ID,
+		Payload:    json.RawMessage(fmt.Sprintf(`{"documentId":%q}`, doc.ID)),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceIO, IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		writeOperationErr(w, err)
@@ -1022,7 +1054,7 @@ func (s *Server) reindexOne(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-	chunks, err := s.app.Knowledge.ListChunks(r.PathValue("id"), limit, offset)
+	chunks, err := s.app.Knowledge.ListChunksContext(r.Context(), r.PathValue("id"), limit, offset)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1031,32 +1063,23 @@ func (s *Server) listChunks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) jobStatus(w http.ResponseWriter, r *http.Request) {
-	if operation, err := s.app.Operations.Get(r.PathValue("id")); err == nil {
+	if operation, err := s.app.Operations.GetContext(r.Context(), r.PathValue("id")); err == nil {
 		writeOK(w, operationJobSnapshot(operation))
 		return
 	}
-	job, ok := s.app.Jobs.Status(r.PathValue("id"))
-	if !ok {
-		writeErr(w, knowledge.ErrNotFound)
-		return
-	}
-	writeOK(w, job)
+	writeErr(w, knowledge.ErrNotFound)
 }
 
 func (s *Server) jobCancel(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.app.Operations.Get(r.PathValue("id")); err == nil {
-		if _, err := s.app.Operations.Cancel(r.PathValue("id")); err != nil {
+	if _, err := s.app.Operations.GetContext(r.Context(), r.PathValue("id")); err == nil {
+		if _, err := s.app.Operations.CancelContext(r.Context(), r.PathValue("id")); err != nil {
 			writeOperationErr(w, err)
 			return
 		}
 		writeOK(w, map[string]bool{"cancelled": true})
 		return
 	}
-	if !s.app.Jobs.Cancel(r.PathValue("id")) {
-		writeErr(w, knowledge.ErrNotFound)
-		return
-	}
-	writeOK(w, map[string]bool{"cancelled": true})
+	writeErr(w, knowledge.ErrNotFound)
 }
 
 func operationJobSnapshot(op operations.Operation) jobs.Job {
@@ -1091,8 +1114,8 @@ func derefOptionalInt64(value *int64) int64 {
 	return *value
 }
 
-func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request) {
-	groups, err := s.app.Knowledge.ListGroups()
+func (s *Server) listGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := s.app.Knowledge.ListGroupsContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1111,7 +1134,7 @@ func (s *Server) createGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	groups, err := s.app.Knowledge.CreateGroup(body.Name)
+	groups, err := s.app.Knowledge.CreateGroupWithContext(r.Context(), body.Name)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1124,7 +1147,7 @@ func (s *Server) renameGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	groups, err := s.app.Knowledge.RenameGroup(body.From, body.To)
+	groups, err := s.app.Knowledge.RenameGroupWithContext(r.Context(), body.From, body.To)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1137,15 +1160,15 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.app.Knowledge.DeleteGroup(body.Name); err != nil {
+	if err := s.app.Knowledge.DeleteGroupWithContext(r.Context(), body.Name); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeOK(w, map[string]bool{"deleted": true})
 }
 
-func (s *Server) getScope(w http.ResponseWriter, _ *http.Request) {
-	enabled, baseIDs, err := s.app.Knowledge.EnabledScope()
+func (s *Server) getScope(w http.ResponseWriter, r *http.Request) {
+	enabled, baseIDs, err := s.app.Knowledge.EnabledScopeContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1166,7 +1189,7 @@ func (s *Server) putScope(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.app.Knowledge.SetEnabledScope(body.Enabled, body.EnabledBaseIDs); err != nil {
+	if err := s.app.Knowledge.SetEnabledScopeWithContext(r.Context(), body.Enabled, body.EnabledBaseIDs); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -1227,7 +1250,7 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 	} else if body.CaptionAPIKey != nil && *body.CaptionAPIKey != "" {
 		next.Captioning.APIKey = *body.CaptionAPIKey
 	}
-	if err := s.app.UpdateConfig(next); err != nil {
+	if err := s.app.UpdateConfigWithContext(r.Context(), next); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -1248,20 +1271,39 @@ func (s *Server) modelSuggestions(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) listLocalModels(w http.ResponseWriter, r *http.Request) {
-	baseID := r.URL.Query().Get("baseId")
-	list, err := s.app.ListLocalModels()
-	if baseID != "" {
-		list, err = s.app.ListLocalModelsForBase(baseID)
+	query := r.URL.Query()
+	baseID := query.Get("baseId")
+	limit, offset := 0, 0
+	for name, target := range map[string]*int{"limit": &limit, "offset": &offset} {
+		raw, present := query[name]
+		if !present || len(raw) == 0 || strings.TrimSpace(raw[0]) == "" {
+			continue
+		}
+		value, err := strconv.Atoi(raw[0])
+		if err != nil {
+			writeErr(w, fmt.Errorf("invalid local model %s", name))
+			return
+		}
+		*target = value
 	}
+	page, err := s.app.ListLocalModelsPageContext(r.Context(), baseID, limit, offset)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	writeOK(w, map[string]any{"models": list, "cacheDir": s.app.Models.Root()})
+	if _, hasLimit := query["limit"]; !hasLimit {
+		if _, hasOffset := query["offset"]; !hasOffset {
+			w.Header().Set("Deprecation", "true")
+		}
+	}
+	writeOK(w, map[string]any{
+		"models": page.Models, "cacheDir": s.app.Models.Root(),
+		"nextOffset": page.NextOffset, "hasMore": page.HasMore,
+	})
 }
 
-func (s *Server) ocrModel(w http.ResponseWriter, _ *http.Request) {
-	model, err := s.app.Models.OCRStatus()
+func (s *Server) ocrModel(w http.ResponseWriter, r *http.Request) {
+	model, err := s.app.Models.OCRStatusContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1269,9 +1311,9 @@ func (s *Server) ocrModel(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, model)
 }
 
-func (s *Server) downloadOCRModel(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) downloadOCRModel(w http.ResponseWriter, r *http.Request) {
 	totalUnits := 100
-	operation, err := s.app.Operations.Submit(context.Background(), operations.Request{
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "download_ocr_model", CommandSchemaVersion: operations.CommandSchemaV1,
 		Payload: json.RawMessage("{}"), TotalUnits: &totalUnits, ResourceClass: "network",
 	})
@@ -1282,17 +1324,25 @@ func (s *Server) downloadOCRModel(w http.ResponseWriter, _ *http.Request) {
 	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
-func (s *Server) removeOCRModel(w http.ResponseWriter, _ *http.Request) {
-	status, err := s.app.Models.OCRStatus()
+func (s *Server) removeOCRModel(w http.ResponseWriter, r *http.Request) {
+	status, err := s.app.Models.OCRStatusContext(r.Context())
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	if status.Status != "not-downloaded" {
-		if err := s.app.Models.Remove(models.OCRModelID); err != nil {
-			writeErr(w, err)
+		totalUnits := 1
+		operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+			Type: "remove_ocr_model", CommandSchemaVersion: operations.CommandSchemaV1,
+			Payload: json.RawMessage("{}"), IdempotencyKey: "remove-ocr-model-v1",
+			TotalUnits: &totalUnits, ResourceClass: operations.ResourceDisk,
+		})
+		if err != nil {
+			writeOperationErr(w, err)
 			return
 		}
+		writeLegacyJobAccepted(w, operation, "determinate")
+		return
 	}
 	writeOK(w, map[string]bool{"removed": true})
 }
@@ -1394,7 +1444,12 @@ func (s *Server) downloadLocalModel(w http.ResponseWriter, r *http.Request) {
 	totalUnits := 100
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "download_model", CommandSchemaVersion: operations.CommandSchemaV1,
-		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "network",
+		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: func() string {
+			if managedModel {
+				return operations.ResourceModel
+			}
+			return operations.ResourceNetwork
+		}(),
 	})
 	if err != nil {
 		writeErr(w, err)
@@ -1412,64 +1467,69 @@ func (s *Server) removeLocalModel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	model, err := s.app.Models.Get(body.ID)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		writeErr(w, err)
+	normalizedID := strings.TrimPrefix(strings.TrimSpace(body.ID), "local:")
+	if normalizedID == "" {
+		writeErr(w, errors.New("model id is required"))
 		return
 	}
+	command := map[string]any{"id": normalizedID}
+	resourceClass := operations.ResourceDisk
+	model, err := s.app.Models.GetContext(r.Context(), normalizedID)
+	switch {
+	case err == nil:
+		command["kind"] = model.Kind
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		writeErr(w, err)
+		return
+	default:
+		if capability := s.app.ManagedModelCapability(normalizedID); capability != "" {
+			if _, ok := s.app.Runtime.(runtime.ManagedModelController); !ok {
+				writeErr(w, errors.New("managed runtime model control is unavailable"))
+				return
+			}
+			command["managed"] = true
+			command["capability"] = capability
+			resourceClass = operations.ResourceModel
+		} else {
+			command["customReranker"] = true
+		}
+	}
+	encoded, err := json.Marshal(command)
 	if err != nil {
-		normalizedID := strings.TrimPrefix(body.ID, "local:")
-		if s.app.ManagedRuntime {
-			candidates := []struct{ id, capability string }{
-				{id: s.app.Config.Embedding.Model, capability: runtime.CapabilityEmbedding},
-				{id: s.app.Config.Rerank.Model, capability: runtime.CapabilityRerank},
-			}
-			for capability, health := range s.app.Runtime.Status(r.Context()) {
-				if health.Model != "" && health.Lifecycle != models.LifecycleNotInstalled {
-					candidates = append(candidates, struct{ id, capability string }{id: health.Model, capability: capability})
-				}
-			}
-			for _, candidate := range candidates {
-				candidate.id = strings.TrimPrefix(strings.TrimSpace(candidate.id), "local:")
-				if candidate.id == normalizedID {
-					managed, managedOK := s.app.Runtime.(runtime.ManagedModelController)
-					if !managedOK {
-						writeErr(w, errors.New("managed runtime model control is unavailable"))
-						return
-					}
-					if removeErr := managed.RemoveModel(r.Context(), candidate.capability, normalizedID); removeErr != nil {
-						writeErr(w, removeErr)
-						return
-					}
-					writeOK(w, map[string]bool{"removed": true})
-					return
-				}
-			}
-		}
-		if customErr := s.app.Knowledge.DeleteCustomReranker(body.ID); customErr != nil {
-			writeErr(w, errors.Join(err, customErr))
-			return
-		}
-		writeOK(w, map[string]bool{"removed": true})
+		writeOperationErr(w, err)
 		return
 	}
-	if err := s.app.Models.Remove(body.ID); err != nil {
-		writeErr(w, err)
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "remove_model", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, IdempotencyKey: operationIdempotencyKey("remove-model-v1", encoded),
+		TotalUnits: &totalUnits, ResourceClass: resourceClass,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
 		return
 	}
-	if model.Kind == models.KindRerank {
-		_ = s.app.Knowledge.DeleteCustomReranker(body.ID)
-	}
-	writeOK(w, map[string]bool{"removed": true})
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) planModelCacheMigration(w http.ResponseWriter, r *http.Request) {
-	plan, err := s.app.PlanModelCacheMigration(r.URL.Query().Get("targetDir"))
+	target := s.app.ResolveModelCacheDir(r.URL.Query().Get("targetDir"))
+	encoded, err := json.Marshal(map[string]any{"targetDir": target})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
-	writeOK(w, plan)
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "plan_model_cache_migration", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, IdempotencyKey: operationIdempotencyKey("plan-model-cache-v1", encoded),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceDisk,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeOperationAccepted(w, operation)
 }
 
 type modelCacheMigrationRequest struct {
@@ -1483,25 +1543,22 @@ func (s *Server) migrateModelCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := s.app.ResolveModelCacheDir(body.TargetDir)
-	if _, err := s.app.PlanModelCacheMigration(target); err != nil {
-		writeErr(w, err)
-		return
-	}
 	encoded, err := json.Marshal(map[string]any{"targetDir": target, "removeSource": body.RemoveSource})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
 	totalUnits := 1
 	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
 		Type: "migrate_model_cache", CommandSchemaVersion: operations.CommandSchemaV1,
-		Payload: encoded, TotalUnits: &totalUnits, ResourceClass: "disk",
+		Payload: encoded, IdempotencyKey: operationIdempotencyKey("migrate-model-cache-v1", encoded),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceDisk,
 	})
 	if err != nil {
-		writeErr(w, err)
+		writeOperationErr(w, err)
 		return
 	}
-	writeLegacyJobAccepted(w, operation, "")
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 func (s *Server) listOllamaModels(w http.ResponseWriter, r *http.Request) {
@@ -1512,7 +1569,7 @@ func (s *Server) listOllamaModels(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOK(w, map[string]any{
 		"available": false, "models": []models.OllamaModel{},
-		"baseUrl": "http://127.0.0.1:11434", "error": err.Error(),
+		"baseUrl": "http://127.0.0.1:11434", "error": operations.SafeErrorMessage(err.Error()),
 	})
 }
 
@@ -1548,11 +1605,22 @@ func (s *Server) deleteOllamaModel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.app.Ollama.Delete(r.Context(), body.Model); err != nil {
-		writeErr(w, err)
+	encoded, err := json.Marshal(map[string]any{"model": strings.TrimSpace(body.Model)})
+	if err != nil {
+		writeOperationErr(w, err)
 		return
 	}
-	writeOK(w, map[string]bool{"deleted": true})
+	totalUnits := 1
+	operation, err := s.app.Operations.Submit(r.Context(), operations.Request{
+		Type: "ollama_delete", CommandSchemaVersion: operations.CommandSchemaV1,
+		Payload: encoded, IdempotencyKey: operationIdempotencyKey("ollama-delete-v1", encoded),
+		TotalUnits: &totalUnits, ResourceClass: operations.ResourceModel,
+	})
+	if err != nil {
+		writeOperationErr(w, err)
+		return
+	}
+	writeLegacyJobAccepted(w, operation, "determinate")
 }
 
 // Service exposes the knowledge service for tests and the extension adapter.

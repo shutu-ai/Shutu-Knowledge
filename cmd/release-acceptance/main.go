@@ -10,6 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,8 +42,8 @@ type stageResult struct {
 func main() {
 	var (
 		output      = flag.String("output", filepath.Join(".tmp", "release-acceptance"), "result directory")
-		profile     = flag.String("profile", "core", "identity, core, agent, web, or all")
-		allowDirty  = flag.Bool("allow-dirty", false, "permit acceptance on a dirty tracked work tree (local diagnostics only)")
+		profile     = flag.String("profile", "core", "identity, host, core, agent, web, or all")
+		allowDirty  = flag.Bool("allow-dirty", false, "permit acceptance on a dirty work tree (local diagnostics only)")
 		archiveRoot = flag.String("candidate-archive", "", "extracted formal package root for identity-only acceptance")
 	)
 	flag.Parse()
@@ -61,7 +63,7 @@ func run(started time.Time, output, profile string, allowDirty bool, archiveRoot
 		return err
 	}
 	switch profile {
-	case "identity", "core", "agent", "web", "all":
+	case "identity", "host", "core", "agent", "web", "all":
 	default:
 		return fmt.Errorf("unknown profile %q", profile)
 	}
@@ -77,7 +79,7 @@ func run(started time.Time, output, profile string, allowDirty bool, archiveRoot
 		return err
 	}
 	if dirty && !allowDirty {
-		return errors.New("tracked work tree is dirty; run acceptance from a clean candidate checkout or pass -allow-dirty for diagnostics")
+		return errors.New("work tree is dirty; run acceptance from a clean candidate checkout or pass -allow-dirty for diagnostics")
 	}
 
 	resultRoot := filepath.Join(output, started.Format("20060102-150405"))
@@ -120,6 +122,15 @@ func run(started time.Time, output, profile string, allowDirty bool, archiveRoot
 	writeResult(filepath.Join(resultRoot, "result.json"), result)
 
 	var testErr error
+	var nativeErr error
+	if profileIncludesNativeLifecycle(profile) {
+		nativeStage, err := runNativeLifecycle(binaryPath, resultRoot)
+		result.Stages = append(result.Stages, nativeStage)
+		if err != nil {
+			nativeErr = err
+		}
+		writeResult(filepath.Join(resultRoot, "result.json"), result)
+	}
 	if profile != "identity" {
 		testErr = runTests(resultRoot, profile, &result)
 	}
@@ -138,12 +149,16 @@ func run(started time.Time, output, profile string, allowDirty bool, archiveRoot
 	}
 	result.Duration = time.Since(started).String()
 	result.Status = "passed"
-	if testErr != nil || manifestErr != nil {
+	if nativeErr != nil || testErr != nil || manifestErr != nil {
 		result.Status = "failed"
 	}
 	writeResult(filepath.Join(resultRoot, "result.json"), result)
 	fmt.Printf("release acceptance: %s\nresult: %s\n", result.Status, resultRoot)
-	return errors.Join(testErr, manifestErr)
+	return errors.Join(nativeErr, testErr, manifestErr)
+}
+
+func profileIncludesNativeLifecycle(profile string) bool {
+	return profile == "host" || profile == "all"
 }
 
 func supportedHost() error {
@@ -175,7 +190,15 @@ func rejectCrossCompile() error {
 }
 
 func gitState() (string, bool, error) {
-	commitBytes, err := output("git", "rev-parse", "HEAD")
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		return "", false, err
+	}
+	return gitStateAt(repoRoot)
+}
+
+func gitStateAt(repoRoot string) (string, bool, error) {
+	commitBytes, err := output("git", "-C", repoRoot, "rev-parse", "HEAD")
 	if err != nil {
 		return "", false, err
 	}
@@ -183,7 +206,7 @@ func gitState() (string, bool, error) {
 	if matched, err := filepath.Match("????????????????????????????????????????", commit); err != nil || !matched {
 		return "", false, fmt.Errorf("invalid candidate commit %q", commit)
 	}
-	statusBytes, err := output("git", "status", "--porcelain", "--untracked-files=no")
+	statusBytes, err := output("git", "-C", repoRoot, "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return "", false, err
 	}
@@ -234,6 +257,171 @@ func identify(binaryPath string) (*version.Build, error) {
 		return nil, fmt.Errorf("candidate identity mismatch: got %+v want %+v", build, want)
 	}
 	return &build, nil
+}
+
+// runNativeLifecycle exercises the candidate binary as a real host process.
+// It intentionally disables the optional managed runtime so this stage tests
+// process ownership and storage recovery without downloading model assets.
+func runNativeLifecycle(binaryPath, resultRoot string) (stageResult, error) {
+	started := time.Now()
+	stage := stageResult{
+		Name:      "native-host-lifecycle",
+		Command:   []string{binaryPath, "serve"},
+		Status:    "running",
+		StartedAt: started,
+		Host: map[string]any{
+			"mode":                   "serve",
+			"managedRuntimeDisabled": true,
+			"checks":                 []string{"healthz", "duplicate-instance", "crash-restart"},
+		},
+	}
+	home := filepath.Join(resultRoot, "native-host")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return finishNativeStage(stage, home, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return finishNativeStage(stage, home, fmt.Errorf("reserve native host port: %w", err))
+	}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+	stage.Host["addr"] = addr
+	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte("server:\n  addr: "+addr+"\n"), 0o600); err != nil {
+		return finishNativeStage(stage, home, fmt.Errorf("write native host config: %w", err))
+	}
+
+	start := func(name string) (*exec.Cmd, *os.File, *os.File, error) {
+		stdout, err := os.OpenFile(filepath.Join(home, name+".out.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		stderr, err := os.OpenFile(filepath.Join(home, name+".err.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			_ = stdout.Close()
+			return nil, nil, nil, err
+		}
+		command := exec.Command(binaryPath, "serve")
+		if err := configureOwnedProcess(command); err != nil {
+			_ = stdout.Close()
+			_ = stderr.Close()
+			return nil, nil, nil, err
+		}
+		command.Env = append(os.Environ(),
+			"SHUTU_KNOWLEDGE_HOME="+home,
+			"SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME=1",
+		)
+		command.Stdout = stdout
+		command.Stderr = stderr
+		if err := command.Start(); err != nil {
+			_ = stdout.Close()
+			_ = stderr.Close()
+			return nil, nil, nil, err
+		}
+		return command, stdout, stderr, nil
+	}
+
+	first, firstOut, firstErr, err := start("first")
+	if err != nil {
+		return finishNativeStage(stage, home, fmt.Errorf("start native host: %w", err))
+	}
+	defer func() {
+		_ = firstOut.Close()
+		_ = firstErr.Close()
+	}()
+	if err := waitForNativeHealth(addr, first, 30*time.Second); err != nil {
+		_ = terminateOwnedProcessTree(first)
+		_, _ = first.Process.Wait()
+		return finishNativeStage(stage, home, fmt.Errorf("native host health: %w", err))
+	}
+
+	second, secondOut, secondErr, err := start("duplicate")
+	if err != nil {
+		_ = terminateOwnedProcessTree(first)
+		_, _ = first.Process.Wait()
+		return finishNativeStage(stage, home, fmt.Errorf("start duplicate native host: %w", err))
+	}
+	secondWait := make(chan error, 1)
+	go func() { secondWait <- second.Wait() }()
+	select {
+	case duplicateErr := <-secondWait:
+		if duplicateErr == nil {
+			_ = terminateOwnedProcessTree(second)
+			_ = terminateOwnedProcessTree(first)
+			_, _ = first.Process.Wait()
+			_ = secondOut.Close()
+			_ = secondErr.Close()
+			return finishNativeStage(stage, home, errors.New("duplicate native host unexpectedly started"))
+		}
+	case <-time.After(10 * time.Second):
+		_ = terminateOwnedProcessTree(second)
+		<-secondWait
+		_ = secondOut.Close()
+		_ = secondErr.Close()
+		_ = terminateOwnedProcessTree(first)
+		_, _ = first.Process.Wait()
+		return finishNativeStage(stage, home, errors.New("duplicate native host did not fail within 10s"))
+	}
+	_ = secondOut.Close()
+	_ = secondErr.Close()
+
+	if err := terminateOwnedProcessTree(first); err != nil {
+		return finishNativeStage(stage, home, fmt.Errorf("terminate native host: %w", err))
+	}
+	if _, err := first.Process.Wait(); err != nil {
+		// Process.Kill normally reports a non-nil wait error; the process is
+		// nevertheless reaped, which is the crash/restart boundary under test.
+		stage.Host["firstExit"] = err.Error()
+	}
+	restarted, restartOut, restartErr, err := start("restart")
+	if err != nil {
+		return finishNativeStage(stage, home, fmt.Errorf("restart native host after kill: %w", err))
+	}
+	if err := waitForNativeHealth(addr, restarted, 30*time.Second); err != nil {
+		_ = terminateOwnedProcessTree(restarted)
+		_, _ = restarted.Process.Wait()
+		_ = restartOut.Close()
+		_ = restartErr.Close()
+		return finishNativeStage(stage, home, fmt.Errorf("native host restart health: %w", err))
+	}
+	if err := terminateOwnedProcessTree(restarted); err != nil {
+		_ = restartOut.Close()
+		_ = restartErr.Close()
+		return finishNativeStage(stage, home, fmt.Errorf("terminate restarted native host: %w", err))
+	}
+	_, _ = restarted.Process.Wait()
+	_ = restartOut.Close()
+	_ = restartErr.Close()
+	stage.Status = "passed"
+	stage.Log = home
+	stage.Duration = time.Since(started).String()
+	return stage, nil
+}
+
+func waitForNativeHealth(addr string, command *exec.Cmd, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: time.Second}
+	for time.Now().Before(deadline) {
+		if command.ProcessState != nil {
+			return fmt.Errorf("process exited with %v", command.ProcessState)
+		}
+		response, err := client.Get("http://" + addr + "/healthz")
+		if err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("health endpoint did not become ready within %s", timeout)
+}
+
+func finishNativeStage(stage stageResult, logDir string, err error) (stageResult, error) {
+	stage.Status = "failed"
+	stage.Log = logDir
+	stage.Duration = time.Since(stage.StartedAt).String()
+	stage.Error = err.Error()
+	return stage, err
 }
 
 func runTests(resultRoot, profile string, result *stageResult) error {

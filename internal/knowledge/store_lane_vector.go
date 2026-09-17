@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 // VectorSearch brute-force scans scoped embeddings for one model space and
@@ -106,30 +108,51 @@ func decodeEmbedding(blob []byte) []float32 {
 // PutChunkVectors persists one embedded batch (crash-recovery write path:
 // every landed batch stays). modelKey tags the vector space.
 func (s *store) PutChunkVectors(docID string, generation int64, modelKey string, byHash map[string][]float64) error {
+	return s.PutChunkVectorsContext(context.Background(), docID, generation, modelKey, byHash)
+}
+
+// PutChunkVectorsContext persists one embedded batch under the caller's
+// cancellation boundary. Each batch is already bounded by the embedding
+// worker, and the unique Storage Writer remains the only write path.
+func (s *store) PutChunkVectorsContext(ctx context.Context, docID string, generation int64, modelKey string, byHash map[string][]float64) error {
 	if len(byHash) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	defer func() { _ = tx.Rollback() }()
-	for hash, vector := range byHash {
-		if _, err := tx.Exec(
-			`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND index_generation = ? AND embedding_text_hash = ?`,
-			encodeEmbedding(vector), modelKey, docID, generation, hash,
-		); err != nil {
-			return err
+	return s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+		for hash, vector := range byHash {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND index_generation = ? AND embedding_text_hash = ?`,
+				encodeEmbedding(vector), modelKey, docID, generation, hash,
+			); err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit()
+		return nil
+	})
 }
 
 // ListEmbeddingVectorsByHashes implements library-wide vector reuse: stored
 // vectors for the given embedding-text hashes under one model.
 func (s *store) ListEmbeddingVectorsByHashes(hashes []string, modelKey string) map[string][]float64 {
+	out, _ := s.ListEmbeddingVectorsByHashesContext(context.Background(), hashes, modelKey)
+	return out
+}
+
+// ListEmbeddingVectorsByHashesContext keeps each reuse query bounded and
+// returns cancellation/database errors instead of silently continuing with a
+// potentially expensive remote embedding pass.
+func (s *store) ListEmbeddingVectorsByHashesContext(ctx context.Context, hashes []string, modelKey string) (map[string][]float64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	out := map[string][]float64{}
 	for i := 0; i < len(hashes); i += 500 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		end := minInt(i+500, len(hashes))
 		batch := hashes[i:end]
 		query := `SELECT embedding_text_hash, embedding FROM chunks
@@ -139,9 +162,9 @@ func (s *store) ListEmbeddingVectorsByHashes(hashes []string, modelKey string) m
 		for _, hash := range batch {
 			args = append(args, hash)
 		}
-		rows, err := s.db.Query(query, args...)
+		rows, err := s.db.QueryContext(ctx, query, args...)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		for rows.Next() {
 			var hash string
@@ -155,20 +178,33 @@ func (s *store) ListEmbeddingVectorsByHashes(hashes []string, modelKey string) m
 				out[hash] = converted
 			}
 		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
 		rows.Close()
 	}
-	return out
+	return out, nil
 }
 
 // VectorModelCounts reports stored chunks per embedding-model tag (drift).
 func (s *store) VectorModelCounts(baseID string) (map[string]int, error) {
+	return s.VectorModelCountsContext(context.Background(), baseID)
+}
+
+// VectorModelCountsContext reports stored chunks per embedding-model tag while
+// honoring the caller's cancellation boundary.
+func (s *store) VectorModelCountsContext(ctx context.Context, baseID string) (map[string]int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	clause := ""
 	var args []any
 	if baseID != "" {
 		clause = " AND base_id = ?"
 		args = append(args, baseID)
 	}
-	rows, err := s.db.Query(`SELECT COALESCE(embedding_model, ''), COUNT(*) FROM chunks WHERE embedding IS NOT NULL`+clause+` GROUP BY embedding_model`, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(embedding_model, ''), COUNT(*) FROM chunks WHERE embedding IS NOT NULL`+clause+` GROUP BY embedding_model`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +223,14 @@ func (s *store) VectorModelCounts(baseID string) (map[string]int, error) {
 
 // VectorDimensions reports the widest stored vector in scope.
 func (s *store) VectorDimensions(baseID string) (int, error) {
+	return s.VectorDimensionsContext(context.Background(), baseID)
+}
+
+// VectorDimensionsContext reports the widest stored vector while honoring ctx.
+func (s *store) VectorDimensionsContext(ctx context.Context, baseID string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	clause := ""
 	var args []any
 	if baseID != "" {
@@ -194,7 +238,7 @@ func (s *store) VectorDimensions(baseID string) (int, error) {
 		args = append(args, baseID)
 	}
 	var dimensions sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(LENGTH(embedding) / 4) FROM chunks`+clause, args...).Scan(&dimensions); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(LENGTH(embedding) / 4) FROM chunks`+clause, args...).Scan(&dimensions); err != nil {
 		return 0, err
 	}
 	return int(dimensions.Int64), nil

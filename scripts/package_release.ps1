@@ -23,11 +23,22 @@ if (-not $versionMatch.Success) {
 }
 $version = $versionMatch.Groups[1].Value
 $extensionVersion = ($version -split '[-+]', 2)[0]
+$storageSource = Get-Content -LiteralPath (Join-Path $RepoRoot "internal\storage\migrate.go") -Raw
+function Get-StorageContractVersion([string] $Name) {
+    $match = [regex]::Match($storageSource, "(?m)^\s*" + [regex]::Escape($Name) + "\s*=\s*(\d+)")
+    if (-not $match.Success) {
+        throw "could not determine storage contract constant: $Name"
+    }
+    return [int]$match.Groups[1].Value
+}
+$storageFormatVersion = Get-StorageContractVersion "CurrentStorageFormatVersion"
+$storageReaderVersion = Get-StorageContractVersion "CurrentStorageReaderVersion"
+$storageWriterVersion = Get-StorageContractVersion "CurrentStorageWriterVersion"
 $commit = (& git -C $RepoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
     throw "could not determine candidate commit"
 }
-$dirtyFiles = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
+$dirtyFiles = @(& git -C $RepoRoot status --porcelain --untracked-files=all)
 if ($dirtyFiles.Count -gt 0) {
     throw "formal packaging requires a clean candidate checkout; uncommitted files: $($dirtyFiles -join '; ')"
 }
@@ -117,9 +128,9 @@ $binaryBuild = ConvertFrom-Json -InputObject ($binaryVersionLines -join "`n")
 $expectedBuild = @{
     version = $version
     gitCommit = $commit
-    storageFormatVersion = 2
-    storageReaderVersion = 6
-    storageWriterVersion = 6
+    storageFormatVersion = $storageFormatVersion
+    storageReaderVersion = $storageReaderVersion
+    storageWriterVersion = $storageWriterVersion
 }
 foreach ($property in $expectedBuild.Keys) {
     if ($binaryBuild.$property -ne $expectedBuild[$property]) {
@@ -134,9 +145,9 @@ $metadata = [ordered]@{
     version = $version
     platform = $Platform
     git_sha = $commit
-    storage_format_version = 2
-    storage_reader_version = 6
-    storage_writer_version = 6
+    storage_format_version = $storageFormatVersion
+    storage_reader_version = $storageReaderVersion
+    storage_writer_version = $storageWriterVersion
     packaging = "formal-release-zip"
     runtime = "embedded managed runtime assets; Node/model/OCR artifacts are auto-managed in the Knowledge data home"
     binary_sha256 = $binaryHash
@@ -174,6 +185,10 @@ foreach ($textFile in $textFiles) {
     if ($text -match 'C:\\Users\\|C:\\dev-projects\\|/home/[^/]+/|/Users/[^/]+/') {
         throw "formal package contains a developer-specific absolute path: $($textFile.FullName)"
     }
+}
+& (Join-Path $PSScriptRoot "audit_release_package.ps1") -PackageRoot $verifiedRoot
+if ($LASTEXITCODE -ne 0) {
+    throw "formal package static secret audit failed"
 }
 
 $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

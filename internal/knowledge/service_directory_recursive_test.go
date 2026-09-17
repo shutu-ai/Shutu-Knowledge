@@ -2,9 +2,12 @@ package knowledge
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 func TestDirectoryTreeImportsMultipleNestedLevels(t *testing.T) {
@@ -28,11 +31,9 @@ func TestDirectoryTreeImportsMultipleNestedLevels(t *testing.T) {
 	write("level-one/level-two/level-three/three.json", `{"value":"three"}`)
 	write("level-one/level-two/ignored.bin", "unsupported")
 
-	jobID, err := service.ImportDirectoryTree(context.Background(), base.ID, root)
-	if err != nil {
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil); err != nil {
 		t.Fatal(err)
 	}
-	waitJob(t, service, jobID)
 
 	docs, err := service.ListDocuments(base.ID)
 	if err != nil {
@@ -75,5 +76,56 @@ func TestDirectoryTreeImportsMultipleNestedLevels(t *testing.T) {
 	}
 	if _, ok := byPath[filepath.Join(root, "level-one", "level-two", "ignored.bin")]; ok {
 		t.Fatal("unsupported nested file should not be imported")
+	}
+}
+
+func TestDirectorySyncStateWritesPropagateCancellation(t *testing.T) {
+	f := newFixture(t)
+	base := f.createBase(t)
+	root := filepath.Join(t.TempDir(), "cancelled-directory")
+	container, err := f.service.CreateDirectory(base.ID, "cancelled-directory", "", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestedRoot := filepath.Join(root, "nested")
+	nested, err := f.service.CreateDirectory(base.ID, "nested", container.ID, nestedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := newDirectorySyncIndex(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := f.service.updateDirectorySyncProgressContext(ctx, container.ID, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("progress cancellation error = %v, want context.Canceled", err)
+	}
+	if err := f.service.markDirectorySyncFailedContext(ctx, container.ID, errors.New("scan failed")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("failure-state cancellation error = %v, want context.Canceled", err)
+	}
+	entry := directoryEntry{
+		absPath:  filepath.Join(root, "failed.md"),
+		relPath:  "failed.md",
+		fileName: "failed.md",
+	}
+	if _, err := f.service.recordChildFailureContext(ctx, base.ID, container.ID, entry, errors.New("parse failed"), index); err == nil ||
+		(!errors.Is(err, context.Canceled) && !errors.Is(err, storage.ErrWriteUnknown)) {
+		t.Fatalf("child-failure cancellation error = %v, want cancellation or storage.ErrWriteUnknown", err)
+	}
+	index = newDirectorySyncIndex([]Document{nested})
+	nestedEntry := directoryEntry{
+		absPath:  filepath.Join(nestedRoot, "nested-failed.md"),
+		relPath:  filepath.Join("nested", "nested-failed.md"),
+		fileName: "nested-failed.md",
+	}
+	failedID, err := f.service.recordChildFailureContext(context.Background(), base.ID, nested.ID, nestedEntry, errors.New("nested parse failed"), index)
+	if err != nil {
+		t.Fatalf("record nested child failure: %v", err)
+	}
+	failed, _, err := f.service.GetDocument(failedID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.ParentDirectoryID != nested.ID || failed.Status != StatusFailed {
+		t.Fatalf("nested failed child = %+v", failed)
 	}
 }

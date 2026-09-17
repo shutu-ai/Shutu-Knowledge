@@ -106,13 +106,8 @@ func TestCorpusRawStoreOSDiskFullPreservesAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open constrained raw store: %v", err)
 	}
-	manager := jobs.New(db, 2)
-	if err := manager.Start(context.Background()); err != nil {
-		t.Fatalf("start jobs: %v", err)
-	}
-	service := NewService(db, raw, config.Defaults(), manager)
+	service := NewService(db, raw, config.Defaults())
 	t.Cleanup(func() {
-		manager.Stop()
 		_ = db.Close()
 	})
 

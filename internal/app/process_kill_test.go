@@ -66,6 +66,11 @@ func TestMain(m *testing.M) {
 			os.Getenv(appKillMarkerEnv),
 		))
 	case "":
+		// App unit/integration tests must not download the production-pinned
+		// managed Node runtime from the network. Dedicated runtime tests cover
+		// that installer separately; application tests exercise the explicit
+		// helper-disabled path for deterministic, offline setup.
+		_ = os.Setenv("SHUTU_KNOWLEDGE_DISABLE_MANAGED_RUNTIME", "1")
 		os.Exit(m.Run())
 	default:
 		os.Exit(2)
@@ -193,6 +198,15 @@ func TestImportProcessKillReplaysExactBusinessEffect(t *testing.T) {
 			WHERE id = ?`,
 			operations.StateRunning, now, now, operation.ID); err != nil {
 			t.Fatal(err)
+		}
+		if mode == appKillPostPublish {
+			// Simulate a pre-marker historical row: the business publication is
+			// durable, but the operation item marker was not. The current path
+			// commits both atomically; this fixture keeps the fallback replay
+			// contract covered for older rows.
+			if _, err := first.DB.Exec(`DELETE FROM operation_items WHERE operation_id = ?`, operation.ID); err != nil {
+				t.Fatal(err)
+			}
 		}
 		first.Close()
 

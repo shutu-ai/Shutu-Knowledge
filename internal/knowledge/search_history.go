@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 )
@@ -37,6 +38,19 @@ func scanSearchHistory(row interface{ Scan(...any) error }) (SearchHistoryItem, 
 // SaveSearchHistory records one explicit recall invocation and retains the
 // newest 50 entries. This is deliberately separate from automatic retrieval.
 func (s *Service) SaveSearchHistory(req SearchRequest, result SearchResult) (SearchHistoryItem, error) {
+	return s.SaveSearchHistoryContext(context.Background(), req, result)
+}
+
+// SaveSearchHistoryContext binds the explicit search-history writes to the
+// request context so a disconnected recall request does not keep enqueueing
+// mutations after its response has been abandoned.
+func (s *Service) SaveSearchHistoryContext(ctx context.Context, req SearchRequest, result SearchResult) (SearchHistoryItem, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return SearchHistoryItem{}, err
+	}
 	query := strings.TrimSpace(req.Query)
 	if query == "" {
 		return SearchHistoryItem{}, nil
@@ -53,7 +67,7 @@ func (s *Service) SaveSearchHistory(req SearchRequest, result SearchResult) (Sea
 	if item.TopK <= 0 {
 		item.TopK = s.global.Retrieval.TopK
 	}
-	_, err = s.store.db.Exec(
+	_, err = s.store.db.ExecContext(ctx,
 		`INSERT INTO search_history (`+searchHistoryColumns+`)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.ID, nullableString(item.BaseID), item.Query, item.Mode, item.TopK,
@@ -62,7 +76,7 @@ func (s *Service) SaveSearchHistory(req SearchRequest, result SearchResult) (Sea
 	if err != nil {
 		return SearchHistoryItem{}, err
 	}
-	_, err = s.store.db.Exec(`DELETE FROM search_history WHERE id NOT IN (
+	_, err = s.store.db.ExecContext(ctx, `DELETE FROM search_history WHERE id NOT IN (
 		SELECT id FROM search_history ORDER BY created_at DESC, id DESC LIMIT 50
 	)`)
 	return item, err
@@ -70,13 +84,25 @@ func (s *Service) SaveSearchHistory(req SearchRequest, result SearchResult) (Sea
 
 // ListSearchHistory returns newest-first replay entries.
 func (s *Service) ListSearchHistory(limit int) ([]SearchHistoryItem, error) {
+	return s.ListSearchHistoryContext(context.Background(), limit)
+}
+
+// ListSearchHistoryContext uses the caller's cancellation boundary for the
+// bounded history query.
+func (s *Service) ListSearchHistoryContext(ctx context.Context, limit int) ([]SearchHistoryItem, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 20
 	}
 	if limit > 50 {
 		limit = 50
 	}
-	rows, err := s.store.db.Query(
+	rows, err := s.store.db.QueryContext(ctx,
 		`SELECT `+searchHistoryColumns+` FROM search_history
 		 ORDER BY created_at DESC, id DESC LIMIT ?`, limit,
 	)
@@ -97,11 +123,22 @@ func (s *Service) ListSearchHistory(limit int) ([]SearchHistoryItem, error) {
 
 // DeleteSearchHistory removes one item. An empty ID clears all history.
 func (s *Service) DeleteSearchHistory(id string) error {
-	if id == "" {
-		_, err := s.store.db.Exec(`DELETE FROM search_history`)
+	return s.DeleteSearchHistoryContext(context.Background(), id)
+}
+
+// DeleteSearchHistoryContext binds history cleanup to the caller context.
+func (s *Service) DeleteSearchHistoryContext(ctx context.Context, id string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := s.store.db.Exec(`DELETE FROM search_history WHERE id = ?`, id)
+	if id == "" {
+		_, err := s.store.db.ExecContext(ctx, `DELETE FROM search_history`)
+		return err
+	}
+	_, err := s.store.db.ExecContext(ctx, `DELETE FROM search_history WHERE id = ?`, id)
 	return err
 }
 

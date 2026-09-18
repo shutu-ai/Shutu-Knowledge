@@ -65,6 +65,21 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 		}
 	}
 
+	memory, err := service.SearchSemanticMemory(ctx, base.ID, semantic.SearchOptions{Query: "vector retrieval", TopK: 5})
+	if err != nil {
+		t.Fatalf("SearchSemanticMemory: %v", err)
+	}
+	memoryKinds := map[semantic.UnitKind]bool{}
+	for _, hit := range memory.Hits {
+		memoryKinds[hit.Unit.Type] = true
+		if len(hit.Evidence) == 0 {
+			t.Fatalf("semantic hit has no exact evidence: %+v", hit)
+		}
+	}
+	if !memoryKinds[semantic.UnitConcept] || !memoryKinds[semantic.UnitTopic] || !memoryKinds[semantic.UnitSummary] {
+		t.Fatalf("semantic memory kinds = %+v", memoryKinds)
+	}
+
 	after, err := service.Search(ctx, SearchRequest{BaseID: base.ID, Query: "1024-dimensional vectors", TopK: 2})
 	if err != nil || len(after.Hits) == 0 {
 		t.Fatalf("0.3 search after compilation: hits=%d err=%v", len(after.Hits), err)

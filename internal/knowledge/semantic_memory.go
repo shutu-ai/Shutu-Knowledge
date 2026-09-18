@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
@@ -242,4 +243,29 @@ func (s *Service) markSemanticDocumentDeleted(ctx context.Context, baseID, docum
 		BaseID: baseID, DocumentID: documentID, ChangeType: "deleted",
 		CreatedAt: timestamp, UpdatedAt: timestamp,
 	})
+}
+
+// SearchSemanticMemory activates Concepts, Topics, and Summaries from the
+// active compilation. It is an additional lane, not a replacement for the 0.3
+// evidence search. Every hit carries its exact derived-from evidence closure.
+func (s *Service) SearchSemanticMemory(ctx context.Context, baseID string, options semantic.SearchOptions) (semantic.SearchResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.SearchResponse{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.SearchResponse{}, ErrConflict
+	}
+	options.Query = strings.TrimSpace(options.Query)
+	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.SearchResponse{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.SearchResponse{}, err
+	}
+	return semantic.SearchCompilation(compilation, options)
 }

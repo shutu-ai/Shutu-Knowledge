@@ -43,9 +43,10 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 - Delete cleanup: PASS, including nodes and chunk links
 - Restart/recovery: PASS in the existing operations/runtime suite
 - Agent extension adapter: PASS in the full suite; local native host acceptance
-  passed healthz, duplicate-instance rejection, and crash-restart at
-  `.tmp/release-acceptance/20260918-085701/result.json`; a real external Agent
-  Host run was not performed
+  passed healthz, duplicate-instance rejection, and crash-restart. Remote Tag
+  CI release-host acceptance also passed on Windows, Ubuntu, and macOS in run
+  `35331687850`; a separate cross-repository external Agent Host run was not
+  performed
 - Windows package smoke: PASS, including online import/OCR/vector retrieval and offline restart retrieval
 
 ## Regression and performance
@@ -100,13 +101,13 @@ or credentials.
 - Visual figure understanding, entity/ontology extraction, GraphRAG, query
   routing v0, and a richer chunk-link inspector remain deferred to 0.4+.
 - Local CI-equivalent build, vet, Web typecheck/test/build/E2E, writer guard, and
-  benchmark smoke all pass. Remote Push CI and Tag CI were not run: the local
-  branch is ahead of `origin/master` and GitHub CLI reports no authenticated
-  account; no push/tag was performed.
+  benchmark smoke all pass. Remote Push CI run `35331665725` and Tag CI run
+  `35331687850` both passed, including Race, Benchmark, Browser E2E, runtime,
+  host, package, and static-audit gates.
 - A real external Agent Host acceptance run remains a release-host gate.
 
 ## Release status
 
-`NOT READY` until push/tag CI and external Agent Host acceptance are run and
-recorded. The local implementation, tests, artifact build, static audit,
-native host lifecycle acceptance, and final Windows package smoke are ready.
+`READY FOR 0.3.0 DOCUMENT INTELLIGENCE DELIVERY` after local validation and
+remote Push/Tag CI passed. Cross-repository external Agent Host acceptance is
+still recorded as a separate follow-up gate and is not claimed here.

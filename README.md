@@ -54,7 +54,8 @@ Key documents:
 - [docs/0.4_living_wiki.md](docs/0.4_living_wiki.md) — 0.4 regenerable KnowledgeUnit Wiki view
 - [docs/0.4_benchmark.md](docs/0.4_benchmark.md) — preliminary 0.3-vs-0.4 support-quality benchmark
 - [docs/0.4_api_ui.md](docs/0.4_api_ui.md) — semantic REST API and Web Knowledge Explorer
-- [docs/shutu_agent_0_4_requirements.md](docs/shutu_agent_0_4_requirements.md) — Agent-side 0.4 consumption requirements
+- [docs/shutu_agent_0.4_requirements.md](docs/shutu_agent_0.4_requirements.md) — Agent-side 0.4 consumption requirements
+- [docs/0.4_release_gate.md](docs/0.4_release_gate.md) — current 0.4 release-gate evidence and blockers
 - [docs/agent_contract_mapping.md](docs/agent_contract_mapping.md) — capability-to-contract mapping
 - [docs/dsh_knowledge_capability_inventory.md](docs/dsh_knowledge_capability_inventory.md) — audited reference behavior
 - [docs/dsh_knowledge_equivalence_matrix.md](docs/dsh_knowledge_equivalence_matrix.md) — parity tracking

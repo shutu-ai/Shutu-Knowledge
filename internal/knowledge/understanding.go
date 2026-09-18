@@ -47,6 +47,9 @@ func deriveKnowledge(docID string, generation int64, ir *documentir.Document) []
 	if text != "" {
 		out = append(out, newDerived(docID, generation, "document_summary", summarizeText(text), rootIDs(ir)))
 	}
+	if outline := documentOutline(ir); outline != "" {
+		out = append(out, newDerived(docID, generation, "document_outline", outline, outlineIDs(ir)))
+	}
 	for i, node := range ir.Nodes {
 		if node.Type != documentir.TypeHeading && node.Type != documentir.TypeSection {
 			continue
@@ -71,6 +74,44 @@ func deriveKnowledge(docID string, generation int64, ir *documentir.Document) []
 		out = append(out, newDerived(docID, generation, "key_concepts", strings.Join(concepts, ", "), rootIDs(ir)))
 	}
 	return out
+}
+
+func documentOutline(ir *documentir.Document) string {
+	if ir == nil {
+		return ""
+	}
+	var lines []string
+	for _, node := range ir.Nodes {
+		if node.Type != documentir.TypeHeading && node.Type != documentir.TypeSection {
+			continue
+		}
+		label := strings.TrimSpace(node.Text)
+		if label == "" {
+			label = node.Type
+		}
+		level := len(node.HeadingPath)
+		if level < 1 {
+			level = 1
+		}
+		if level > 6 {
+			level = 6
+		}
+		lines = append(lines, strings.Repeat("  ", level-1)+"- "+label)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func outlineIDs(ir *documentir.Document) []string {
+	var ids []string
+	if ir == nil {
+		return ids
+	}
+	for _, node := range ir.Nodes {
+		if node.Type == documentir.TypeHeading || node.Type == documentir.TypeSection {
+			ids = append(ids, node.ID)
+		}
+	}
+	return ids
 }
 
 func newDerived(docID string, generation int64, kind, content string, from []string) DerivedKnowledge {

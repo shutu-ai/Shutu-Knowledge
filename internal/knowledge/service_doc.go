@@ -1448,6 +1448,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			CreatedAt: now(),
 		}
 		c.NodeIDs, c.SourceAnchor = nodesForPiece(doc.IR, piece.Text, piece.Heading)
+		if structural := structuralContext(doc.IR, c.NodeIDs); structural != "" {
+			c.Context = strings.TrimSpace(c.Context + " " + structural)
+		}
 		c.EmbeddingText = strings.TrimSpace(c.Context + " " + c.Text)
 		c.EmbeddingHash = hashText(c.EmbeddingText)
 		if inlineVectors != nil {
@@ -1920,7 +1923,7 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 		if node.Type == documentir.TypeSheet {
 			hasRows := false
 			for _, child := range ir.Nodes {
-				if child.ParentID == node.ID && child.Type == documentir.TypeTableRow {
+				if child.ParentID == node.ID && (child.Type == documentir.TypeTable || child.Type == documentir.TypeTableRow) {
 					hasRows = true
 					break
 				}
@@ -2009,6 +2012,73 @@ func nodesForPiece(ir *documentir.Document, text, heading string) ([]string, doc
 		}
 	}
 	return ids, anchor
+}
+
+// structuralContext adds a bounded parent/header projection to the retrieval
+// representation. The chunk text remains the source evidence; this context
+// only helps a row/cell query retain the table heading and header row.
+func structuralContext(ir *documentir.Document, ids []string) string {
+	if ir == nil || len(ids) == 0 {
+		return ""
+	}
+	byID := make(map[string]documentir.Node, len(ir.Nodes))
+	for _, node := range ir.Nodes {
+		byID[node.ID] = node
+	}
+	parts := make([]string, 0, 4)
+	seen := map[string]bool{}
+	appendNode := func(node documentir.Node) {
+		value := strings.TrimSpace(node.Text)
+		if value == "" || node.Type == documentir.TypeDocument || seen[node.ID] {
+			return
+		}
+		seen[node.ID] = true
+		parts = append(parts, value)
+	}
+	for _, id := range ids {
+		node, ok := byID[id]
+		if !ok {
+			continue
+		}
+		if len(node.HeadingPath) > 0 {
+			parts = append(parts, "Section: "+strings.Join(node.HeadingPath, " / "))
+		}
+		for parent := node.ParentID; parent != ""; {
+			ancestor, exists := byID[parent]
+			if !exists {
+				break
+			}
+			if ancestor.Type == documentir.TypeHeading || ancestor.Type == documentir.TypeSection || ancestor.Type == documentir.TypeTable {
+				appendNode(ancestor)
+			}
+			parent = ancestor.ParentID
+		}
+		if node.Type == documentir.TypeTableCell || node.Type == documentir.TypeTableRow {
+			if node.Type == documentir.TypeTableCell {
+				if parent, exists := byID[node.ParentID]; exists {
+					appendNode(parent)
+				}
+			}
+			row := node
+			if row.Type == documentir.TypeTableCell {
+				row = byID[row.ParentID]
+			}
+			for _, candidate := range ir.Nodes {
+				if candidate.ParentID == row.ParentID && candidate.Type == documentir.TypeTableRow && candidate.Order < row.Order {
+					appendNode(candidate)
+					break
+				}
+			}
+		}
+		if len(parts) >= 4 {
+			break
+		}
+	}
+	value := strings.TrimSpace(strings.Join(parts, " | "))
+	if len([]rune(value)) > 600 {
+		value = string([]rune(value)[:600])
+	}
+	return value
 }
 
 // embedChunks embeds the stored chunks in batches, reusing stored vectors by

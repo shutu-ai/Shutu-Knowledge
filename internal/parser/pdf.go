@@ -88,12 +88,29 @@ func pdfIR(text string, data []byte) *documentir.Document {
 		pageID := fmt.Sprintf("tmp:page/%d", pageNumber)
 		d.Nodes = append(d.Nodes, documentir.Node{ID: pageID, Type: documentir.TypePage, ParentID: "tmp:document", Order: pageNumber, Text: pageText, PageNumber: pageNumber, SourceAnchor: anchor, Parser: "pdf", ParserVersion: "builtin-v1"})
 		for blockIndex, block := range blocks {
+			logical := fmt.Sprintf("page/%d/block/%d", pageNumber, blockIndex+1)
+			blockAnchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical, BBox: block.bbox}
+			if isPDFFigureCaption(block.text) {
+				figureID := "tmp:" + logical + "/figure"
+				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID, Type: documentir.TypeFigure, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: map[string]string{"figure_id": logical}, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID + "/caption", Type: documentir.TypeCaption, ParentID: figureID, Order: 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical + "/caption", BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				continue
+			}
+			if cells := splitPDFTableRow(block.text); len(cells) >= 2 {
+				tableID := "tmp:" + logical + "/table"
+				d.Nodes = append(d.Nodes, documentir.Node{ID: tableID, Type: documentir.TypeTable, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: map[string]string{"detected": "heuristic"}, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				rowID := tableID + "/row/1"
+				d.Nodes = append(d.Nodes, documentir.Node{ID: rowID, Type: documentir.TypeTableRow, ParentID: tableID, Order: 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical + "/table/row/1", BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				for cellIndex, cell := range cells {
+					cellLogical := fmt.Sprintf("%s/table/row/1/cell/%d", logical, cellIndex+1)
+					d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + cellLogical, Type: documentir.TypeTableCell, ParentID: rowID, Order: cellIndex + 1, Text: cell, PageNumber: pageNumber, BBox: block.bbox, Metadata: map[string]string{"position": fmt.Sprintf("%d", cellIndex+1), "row_span": "1", "col_span": "1"}, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: cellLogical, BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				}
+				continue
+			}
 			typ := documentir.TypeParagraph
 			if block.heading {
 				typ = documentir.TypeHeading
 			}
-			logical := fmt.Sprintf("page/%d/block/%d", pageNumber, blockIndex+1)
-			blockAnchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical, BBox: block.bbox}
 			d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: typ, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
 		}
 	}
@@ -199,6 +216,36 @@ func numberedHeading(value string) bool {
 		return r == '#' || r == '.'
 	}
 	return false
+}
+
+func isPDFFigureCaption(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	return strings.HasPrefix(lower, "figure") || strings.HasPrefix(lower, "fig.") || strings.HasPrefix(lower, "fig ")
+}
+
+func splitPDFTableRow(value string) []string {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "|") {
+		parts := strings.Split(value, "|")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+		return out
+	}
+	if strings.Count(value, "\t") > 0 {
+		parts := strings.Split(value, "\t")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func hasReplacementRune(text string) bool {

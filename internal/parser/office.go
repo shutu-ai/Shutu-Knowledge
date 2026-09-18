@@ -60,45 +60,60 @@ func officeIR(format, text string, entries map[string][]byte) *documentir.Docume
 	d := &documentir.Document{IRVersion: documentir.Version, Parser: format, ParserVersion: "builtin-v1"}
 	d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:document", Type: documentir.TypeDocument, Order: 0, Text: strings.TrimSpace(text), SourceAnchor: documentir.SourceAnchor{Kind: format, LogicalPath: "document"}, Parser: format, ParserVersion: "builtin-v1"})
 	if format == "pptx" {
-		for index, part := range strings.Split(strings.TrimSpace(text), "\n\n") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			n := index + 1
-			slideTitle := strings.TrimSpace(strings.SplitN(part, "\n", 2)[0])
-			d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:slide/%d", n), Type: documentir.TypeSlide, ParentID: "tmp:document", Order: n, Text: part, HeadingPath: []string{slideTitle}, Metadata: map[string]string{"title": slideTitle}, SlideNumber: n, SourceAnchor: documentir.SourceAnchor{Kind: "pptx", Slide: n, LogicalPath: fmt.Sprintf("slide/%d", n)}, Parser: format, ParserVersion: "builtin-v1"})
-			d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:slide/%d/block/1", n), Type: documentir.TypeBlock, ParentID: fmt.Sprintf("tmp:slide/%d", n), Order: 1, Text: part, SlideNumber: n, SourceAnchor: documentir.SourceAnchor{Kind: "pptx", Slide: n, Shape: "1", LogicalPath: fmt.Sprintf("slide/%d/shape/1", n)}, Parser: format, ParserVersion: "builtin-v1"})
+		return pptxIR(entries, text)
+	}
+	// XLSX gets a sheet/table/row/cell projection. The text projection remains
+	// the legacy tab-separated output, while formulas, headers, merged ranges,
+	// and used-range metadata stay attached to the corresponding cells.
+	sheets := xlsxStructuredSheets(entries)
+	if len(sheets) == 0 {
+		sheets = []xlsxStructuredSheet{{Name: "Sheet1", Rows: stringsToXLSXRows(text)}}
+	}
+	order := 0
+	for sheetIndex, sheet := range sheets {
+		order++
+		sheetID := fmt.Sprintf("tmp:sheet/%d", sheetIndex+1)
+		sheetNode := documentir.Node{ID: sheetID, Type: documentir.TypeSheet, ParentID: "tmp:document", Order: order, SheetName: sheet.Name, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, LogicalPath: fmt.Sprintf("sheet/%d", sheetIndex+1)}, Parser: format, ParserVersion: "builtin-v1"}
+		sheetNode.Text = strings.TrimSpace(sheet.Text())
+		sheetNode.Metadata = map[string]string{"used_range": sheet.UsedRange()}
+		d.Nodes = append(d.Nodes, sheetNode)
+		if len(sheet.Rows) == 0 {
+			continue
 		}
-		return d
-	}
-	// XLSX text is tab-separated rows. Preserve sheet/cell positions in the
-	// initial backend-independent projection; a future workbook relationship
-	// reader can replace the stable Sheet1 fallback without changing callers.
-	sheetName := "Sheet1"
-	if names := xlsxSheetNames(entries); len(names) > 0 {
-		sheetName = names[0]
-	}
-	sheetID := "tmp:sheet/1"
-	d.Nodes = append(d.Nodes, documentir.Node{ID: sheetID, Type: documentir.TypeSheet, ParentID: "tmp:document", Order: 1, SheetName: sheetName, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, LogicalPath: "sheet/1"}, Parser: format, ParserVersion: "builtin-v1"})
-	d.Nodes[len(d.Nodes)-1].Text = strings.TrimSpace(text)
-	for rowIndex, line := range strings.Split(strings.TrimSpace(text), "\n") {
-		values := strings.Split(line, "\t")
-		rowNumber := rowIndex + 1
-		rowID := fmt.Sprintf("tmp:row/%d", rowNumber)
-		d.Nodes = append(d.Nodes, documentir.Node{
-			ID: rowID, Type: documentir.TypeTableRow, ParentID: sheetID, Order: rowIndex * 1000,
-			Text: strings.TrimSpace(line), SheetName: sheetName,
-			SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, CellRange: fmt.Sprintf("A%d:%s%d", rowNumber, columnName(len(values)), rowNumber), LogicalPath: fmt.Sprintf("sheet/1/row/%d", rowNumber)},
-			Parser:       format, ParserVersion: "builtin-v1",
-		})
-		for colIndex, value := range values {
-			value = strings.TrimSpace(value)
-			if value == "" {
-				continue
+		order++
+		tableID := fmt.Sprintf("tmp:sheet/%d/table/1", sheetIndex+1)
+		tableNodeIndex := len(d.Nodes)
+		d.Nodes = append(d.Nodes, documentir.Node{ID: tableID, Type: documentir.TypeTable, ParentID: sheetID, Order: order, SheetName: sheet.Name, Metadata: map[string]string{"table_like": "true", "used_range": sheet.UsedRange()}, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, LogicalPath: fmt.Sprintf("sheet/%d/table/1", sheetIndex+1)}, Parser: format, ParserVersion: "builtin-v1"})
+		for rowIndex, row := range sheet.Rows {
+			order++
+			if rowIndex == 0 {
+				d.Nodes[tableNodeIndex].Text = fmt.Sprintf("Table %s: %s", sheet.Name, row.Text())
 			}
-			cell := fmt.Sprintf("%s%d", columnName(colIndex+1), rowNumber)
-			d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:cell/%s", cell), Type: documentir.TypeTableCell, ParentID: rowID, Order: colIndex, Text: value, SheetName: sheetName, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, CellRange: cell, LogicalPath: "sheet/1/cell/" + cell}, Parser: format, ParserVersion: "builtin-v1"})
+			rowID := fmt.Sprintf("tmp:sheet/%d/row/%d", sheetIndex+1, rowIndex+1)
+			rowNode := documentir.Node{ID: rowID, Type: documentir.TypeTableRow, ParentID: tableID, Order: order, Text: row.Text(), SheetName: sheet.Name, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, CellRange: row.Range(), LogicalPath: fmt.Sprintf("sheet/%d/row/%d", sheetIndex+1, rowIndex+1)}, Parser: format, ParserVersion: "builtin-v1"}
+			d.Nodes = append(d.Nodes, rowNode)
+			for cellIndex, cell := range row.Cells {
+				if strings.TrimSpace(cell.Value) == "" && cell.Formula == "" {
+					continue
+				}
+				metadata := map[string]string{}
+				if cell.Formula != "" {
+					metadata["formula"] = cell.Formula
+				}
+				if rowIndex == 0 {
+					metadata["header"] = "true"
+				} else if header := sheet.HeaderFor(cellIndex); header != "" {
+					metadata["header_value"] = header
+				}
+				if sheet.IsMerged(cell.Ref) {
+					metadata["merged"] = "true"
+				}
+				metadata["position"] = cell.Ref
+				metadata["row_span"] = "1"
+				metadata["col_span"] = "1"
+				logical := fmt.Sprintf("sheet/%d/cell/%s", sheetIndex+1, cell.Ref)
+				d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: documentir.TypeTableCell, ParentID: rowID, Order: cellIndex, Text: cell.Value, SheetName: sheet.Name, Metadata: metadata, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, CellRange: cell.Ref, LogicalPath: logical}, Parser: format, ParserVersion: "builtin-v1"})
+			}
 		}
 	}
 	return d
@@ -136,11 +151,13 @@ func docxIR(entries map[string][]byte, text string) *documentir.Document {
 		return d
 	}
 	decoder := xml.NewDecoder(bytes.NewReader(data))
-	var inP, inT, inCell bool
+	var inP, inT, inCell, inList bool
 	var style string
-	var current strings.Builder
+	var current, cellText strings.Builder
 	order := 0
+	cellOrder := 0
 	headingPath := []string{}
+	tableID, rowID, listID := "", "", ""
 	for {
 		token, err := decoder.Token()
 		if err == io.EOF {
@@ -152,27 +169,47 @@ func docxIR(entries map[string][]byte, text string) *documentir.Document {
 		switch t := token.(type) {
 		case xml.StartElement:
 			switch localName(t.Name.Local) {
+			case "tbl":
+				order++
+				tableID = fmt.Sprintf("tmp:table/%d", order)
+				d.Nodes = append(d.Nodes, documentir.Node{ID: tableID, Type: documentir.TypeTable, ParentID: "tmp:document", Order: order, SourceAnchor: documentir.SourceAnchor{Kind: "docx", LogicalPath: fmt.Sprintf("table/%d", order)}, Parser: "docx", ParserVersion: "builtin-v1"})
+			case "tr":
+				order++
+				rowID = fmt.Sprintf("%s/row/%d", tableID, order)
+				d.Nodes = append(d.Nodes, documentir.Node{ID: rowID, Type: documentir.TypeTableRow, ParentID: tableID, Order: order, SourceAnchor: documentir.SourceAnchor{Kind: "docx", LogicalPath: fmt.Sprintf("table/%d/row/%d", order, order)}, Parser: "docx", ParserVersion: "builtin-v1"})
+			case "tc":
+				inCell = true
+				cellOrder++
+				cellText.Reset()
 			case "p":
 				inP = true
 				current.Reset()
 				style = ""
+				inList = false
 			case "pStyle":
 				style = attrValue(t.Attr, "val")
+			case "numPr":
+				inList = true
+				if listID == "" {
+					order++
+					listID = fmt.Sprintf("tmp:list/%d", order)
+					d.Nodes = append(d.Nodes, documentir.Node{ID: listID, Type: documentir.TypeList, ParentID: "tmp:document", Order: order, SourceAnchor: documentir.SourceAnchor{Kind: "docx", LogicalPath: fmt.Sprintf("list/%d", order)}, Parser: "docx", ParserVersion: "builtin-v1"})
+				}
 			case "t":
 				inT = true
 			case "tab":
 				if inP {
 					current.WriteString("\t")
 				}
-			case "tc":
-				inCell = true
+			case "br":
+				if inP {
+					current.WriteString("\n")
+				}
 			}
 		case xml.EndElement:
 			switch localName(t.Name.Local) {
 			case "t":
 				inT = false
-			case "tc":
-				inCell = false
 			case "p":
 				value := strings.TrimSpace(current.String())
 				if value == "" {
@@ -180,21 +217,53 @@ func docxIR(entries map[string][]byte, text string) *documentir.Document {
 					continue
 				}
 				order++
-				isHeading := strings.Contains(strings.ToLower(style), "heading")
+				if inCell {
+					if cellText.Len() > 0 {
+						cellText.WriteString(" ")
+					}
+					cellText.WriteString(value)
+					inP = false
+					continue
+				}
+				styleLower := strings.ToLower(style)
+				isHeading := strings.Contains(styleLower, "heading")
 				typ := documentir.TypeParagraph
 				if isHeading {
 					typ = documentir.TypeHeading
-					headingPath = append(headingPath[:minInt(len(headingPath), 1)], value)
+					level := docxHeadingLevel(styleLower)
+					if level > len(headingPath)+1 {
+						level = len(headingPath) + 1
+					}
+					if level < 1 {
+						level = 1
+					}
+					headingPath = append(headingPath[:minInt(level-1, len(headingPath))], value)
+				} else if strings.Contains(styleLower, "caption") {
+					typ = documentir.TypeCaption
 				}
-				if inCell {
-					typ = documentir.TypeTableCell
+				parent := "tmp:document"
+				if inList {
+					parent = listID
+					typ = documentir.TypeListItem
 				}
-				path := fmt.Sprintf("paragraph/%d", order)
-				if inCell {
-					path = fmt.Sprintf("table/cell/%d", order)
-				}
-				d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:%s", path), Type: typ, ParentID: "tmp:document", Order: order, Text: value, HeadingPath: append([]string(nil), headingPath...), SourceAnchor: documentir.SourceAnchor{Kind: "docx", Paragraph: order, LogicalPath: path}, Parser: "docx", ParserVersion: "builtin-v1"})
+				logical := fmt.Sprintf("paragraph/%d", order)
+				d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: typ, ParentID: parent, Order: order, Text: value, HeadingPath: append([]string(nil), headingPath...), SourceAnchor: documentir.SourceAnchor{Kind: "docx", Paragraph: order, Section: strings.Join(headingPath, " / "), LogicalPath: logical}, Parser: "docx", ParserVersion: "builtin-v1"})
 				inP = false
+			case "tc":
+				if strings.TrimSpace(cellText.String()) != "" {
+					logical := fmt.Sprintf("table/cell/%d", cellOrder)
+					d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: documentir.TypeTableCell, ParentID: rowID, Order: cellOrder, Text: strings.TrimSpace(cellText.String()), Metadata: map[string]string{"position": fmt.Sprintf("%d", cellOrder), "row_span": "1", "col_span": "1"}, SourceAnchor: documentir.SourceAnchor{Kind: "docx", Paragraph: order, LogicalPath: logical}, Parser: "docx", ParserVersion: "builtin-v1"})
+				}
+				cellText.Reset()
+				inCell = false
+			case "tr":
+				rowID = ""
+			case "tbl":
+				tableID = ""
+			case "sectPr":
+				order++
+				logical := fmt.Sprintf("section/%d", order)
+				d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: documentir.TypeSection, ParentID: "tmp:document", Order: order, HeadingPath: append([]string(nil), headingPath...), SourceAnchor: documentir.SourceAnchor{Kind: "docx", Section: strings.Join(headingPath, " / "), LogicalPath: logical}, Parser: "docx", ParserVersion: "builtin-v1"})
 			}
 		case xml.CharData:
 			if inP && inT {
@@ -203,6 +272,19 @@ func docxIR(entries map[string][]byte, text string) *documentir.Document {
 		}
 	}
 	return d
+}
+
+func docxHeadingLevel(style string) int {
+	level := 0
+	place := 1
+	for i := len(style) - 1; i >= 0 && style[i] >= '0' && style[i] <= '9'; i-- {
+		level += int(style[i]-'0') * place
+		place *= 10
+	}
+	if level == 0 {
+		return 1
+	}
+	return level
 }
 
 func minInt(a, b int) int {

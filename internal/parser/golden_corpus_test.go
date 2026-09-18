@@ -42,16 +42,8 @@ func TestGoldenCorpusManifestAndIR(t *testing.T) {
 		t.Fatalf("unexpected manifest: %+v", manifest)
 	}
 
-	pdfBodies := map[string]string{
-		"simple.pdf":      "BT /F1 18 Tf 72 720 Td (Revenue Overview) Tj ET\nBT /F1 12 Tf 72 690 Td (APAC revenue Q4 150) Tj ET",
-		"multicolumn.pdf": "BT /F1 18 Tf 72 720 Td (Left Column) Tj ET\nBT /F1 12 Tf 72 690 Td (Right Column) Tj ET",
-		"tables.pdf":      "BT /F1 18 Tf 72 720 Td (Revenue Table) Tj ET\nBT /F1 12 Tf 72 690 Td (APAC 150 Q4) Tj ET",
-		"figures.pdf":     "BT /F1 18 Tf 72 720 Td (Figure 1) Tj ET\nBT /F1 12 Tf 72 690 Td (Revenue trend caption) Tj ET",
-		"scanned.pdf":     "BT /F1 12 Tf 72 690 Td (OCR fallback evidence) Tj ET",
-		"long.pdf":        "BT /F1 18 Tf 72 720 Td (Long report) Tj ET\nBT /F1 12 Tf 72 690 Td (Page one bounded evidence) Tj ET",
-	}
 	for _, name := range manifest.PDF {
-		result := parseOK(t, name, pdfFixture(t, pdfBodies[name]))
+		result := parseOK(t, name, goldenCorpusFile(t, name))
 		if result.IR == nil {
 			t.Fatalf("%s has no golden IR", name)
 		}
@@ -71,36 +63,49 @@ func TestGoldenCorpusManifestAndIR(t *testing.T) {
 		if name == "simple.pdf" && headings == 0 {
 			t.Fatalf("%s lost heading semantics", name)
 		}
+		if name == "tables.pdf" && (countNodes(result.IR, documentir.TypeTable) != 1 || countNodes(result.IR, documentir.TypeTableCell) != 3) {
+			t.Fatalf("%s lost table semantics", name)
+		}
+		if name == "figures.pdf" && (countNodes(result.IR, documentir.TypeFigure) != 1 || countNodes(result.IR, documentir.TypeCaption) != 1) {
+			t.Fatalf("%s lost figure semantics", name)
+		}
 	}
 
-	structured := zipFixture(t, map[string]string{"word/document.xml": string(goldenCorpusFile(t, "office", "structured.docx.xml"))})
+	structured := goldenCorpusFile(t, "office", "structured.docx")
 	structuredResult := parseOK(t, "structured.docx", structured)
 	if !hasNodeText(structuredResult.IR, documentir.TypeHeading, "Revenue Overview") {
 		t.Fatal("structured.docx lost heading node")
 	}
-	table := zipFixture(t, map[string]string{"word/document.xml": string(goldenCorpusFile(t, "office", "tables.docx.xml"))})
+	table := goldenCorpusFile(t, "office", "tables.docx")
 	tableResult := parseOK(t, "tables.docx", table)
 	if countNodes(tableResult.IR, documentir.TypeTableCell) != manifest.Expected.TableCells {
 		t.Fatalf("tables.docx table cells=%d want %d", countNodes(tableResult.IR, documentir.TypeTableCell), manifest.Expected.TableCells)
 	}
 
-	files := map[string]string{}
-	for slide := 1; slide <= manifest.Expected.Slides; slide++ {
-		files["ppt/slides/slide"+itoa(slide)+".xml"] = "<p:sld xmlns:p=\"p\" xmlns:a=\"a\"><a:t>Slide " + itoa(slide) + " APAC</a:t></p:sld>"
-	}
-	presentation := parseOK(t, "presentation.pptx", zipFixture(t, files))
+	presentation := parseOK(t, "presentation.pptx", goldenCorpusFile(t, "office", "presentation.pptx"))
 	if countNodes(presentation.IR, documentir.TypeSlide) != manifest.Expected.Slides {
 		t.Fatalf("presentation slides=%d want %d", countNodes(presentation.IR, documentir.TypeSlide), manifest.Expected.Slides)
 	}
 
-	workbook := zipFixture(t, map[string]string{
-		"xl/workbook.xml":          string(goldenCorpusFile(t, "office", "workbook.xml")),
-		"xl/sharedStrings.xml":     string(goldenCorpusFile(t, "office", "sharedStrings.xml")),
-		"xl/worksheets/sheet1.xml": string(goldenCorpusFile(t, "office", "sheet1.xml")),
-	})
+	workbook := goldenCorpusFile(t, "office", "spreadsheet.xlsx")
 	spreadsheet := parseOK(t, "spreadsheet.xlsx", workbook)
 	if !hasSheetCell(spreadsheet.IR, manifest.Expected.Sheet, manifest.Expected.Cell) {
 		t.Fatalf("spreadsheet lost %s!%s anchor", manifest.Expected.Sheet, manifest.Expected.Cell)
+	}
+	formulaFound, mergedFound := false, false
+	for _, node := range spreadsheet.IR.Nodes {
+		if node.Type != documentir.TypeTableCell {
+			continue
+		}
+		if node.SourceAnchor.CellRange == "B2" && node.Metadata["formula"] == "SUM(A2:A2)" {
+			formulaFound = true
+		}
+		if node.SourceAnchor.CellRange == "A1" && node.Metadata["merged"] == "true" {
+			mergedFound = true
+		}
+	}
+	if !formulaFound || !mergedFound {
+		t.Fatalf("spreadsheet lost formula/merged semantics")
 	}
 
 	for _, name := range []string{"english.md", "中文.md", "mixed.md"} {

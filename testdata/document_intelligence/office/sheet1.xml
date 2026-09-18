@@ -1,4 +1,4 @@
 <worksheet><sheetData>
   <row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
-  <row><c r="A2" t="s"><v>2</v></c><c r="B2" t="s"><v>3</v></c></row>
-</sheetData></worksheet>
+  <row><c r="A2" t="s"><v>2</v></c><c r="B2"><f>SUM(A2:A2)</f><v>150</v></c></row>
+</sheetData><mergeCells><mergeCell ref="A1:B1"/></mergeCells></worksheet>

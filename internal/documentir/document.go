@@ -28,6 +28,7 @@ const (
 	TypeTableRow  = "table_row"
 	TypeTableCell = "table_cell"
 	TypeFigure    = "figure"
+	TypeImage     = "image"
 	TypeCaption   = "caption"
 	TypeCode      = "code_block"
 	TypeFootnote  = "footnote"

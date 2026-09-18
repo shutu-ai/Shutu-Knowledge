@@ -2,7 +2,10 @@ package knowledge
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 )
 
 func TestStructuredIRIsPublishedWithSearchAndDeletedWithDocument(t *testing.T) {
@@ -30,8 +33,21 @@ func TestStructuredIRIsPublishedWithSearchAndDeletedWithDocument(t *testing.T) {
 		t.Fatalf("IR metadata: version=%q nodes=%d", ir.IRVersion, len(ir.Nodes))
 	}
 	derived, err := f.service.GetDerivedKnowledge(context.Background(), doc.ID)
-	if err != nil { t.Fatal(err) }
-	if len(derived) < 2 { t.Fatalf("derived knowledge missing: %+v", derived) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(derived) < 2 {
+		t.Fatalf("derived knowledge missing: %+v", derived)
+	}
+	foundOutline := false
+	for _, item := range derived {
+		if item.Kind == "document_outline" && strings.Contains(item.Content, "Storage") {
+			foundOutline = true
+		}
+	}
+	if !foundOutline {
+		t.Fatalf("deterministic document outline missing: %+v", derived)
+	}
 	result, err := f.service.Search(context.Background(), SearchRequest{Query: "evidence store", BaseID: base.ID, Mode: "lexical", TopK: 3})
 	if err != nil {
 		t.Fatal(err)
@@ -47,5 +63,21 @@ func TestStructuredIRIsPublishedWithSearchAndDeletedWithDocument(t *testing.T) {
 	}
 	if nodes != 0 {
 		t.Fatalf("IR nodes survived delete: %d", nodes)
+	}
+}
+
+func TestStructuredContextIncludesHeadingTableAndMatchedRow(t *testing.T) {
+	ir := &documentir.Document{Nodes: []documentir.Node{
+		{ID: "doc", Type: documentir.TypeDocument},
+		{ID: "table", Type: documentir.TypeTable, Text: "Revenue by region", ParentID: "doc"},
+		{ID: "header", Type: documentir.TypeTableRow, Text: "Region | Q4", ParentID: "table", Order: 1},
+		{ID: "row", Type: documentir.TypeTableRow, Text: "APAC | 150", ParentID: "table", Order: 2},
+		{ID: "cell", Type: documentir.TypeTableCell, Text: "150", ParentID: "row", HeadingPath: []string{"Revenue"}},
+	}}
+	value := structuralContext(ir, []string{"cell"})
+	for _, want := range []string{"Revenue", "Revenue by region", "APAC | 150", "Region | Q4"} {
+		if !strings.Contains(value, want) {
+			t.Fatalf("structural context missing %q: %q", want, value)
+		}
 	}
 }

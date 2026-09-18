@@ -22,6 +22,9 @@ func TestCompileContextCombinesOrientationFactsEvidenceAndCitations(t *testing.T
 	if pkg.CompilerVersion != "semantic-evidence-v1" || pkg.Generation != compilation.Generation {
 		t.Fatalf("context scope = %+v", pkg)
 	}
+	if pkg.Routing == nil || pkg.Routing.Intent != IntentFact || pkg.Intent != string(IntentFact) {
+		t.Fatalf("context routing missing/default: %+v", pkg.Routing)
+	}
 	if len(pkg.KnowledgeSummary) == 0 || len(pkg.Concepts) == 0 || len(pkg.Facts) == 0 {
 		t.Fatalf("context lacks semantic orientation: %+v", pkg)
 	}

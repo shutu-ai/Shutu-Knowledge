@@ -329,3 +329,9 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
 	})
 }
+
+// PlanKnowledgeQuery returns deterministic AUTO-mode diagnostics. It does not
+// call a model, mutate the query, or perform retrieval.
+func (s *Service) PlanKnowledgeQuery(query string) semantic.QueryPlan {
+	return semantic.RouteQuery(query)
+}

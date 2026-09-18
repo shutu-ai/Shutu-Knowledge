@@ -88,6 +88,13 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 		len(contextPackage.Facts) == 0 || len(contextPackage.Evidence) == 0 || len(contextPackage.Citations) == 0 {
 		t.Fatalf("context package lacks semantic/evidence sections: %+v", contextPackage)
 	}
+	if contextPackage.Routing == nil || contextPackage.Routing.Intent != semantic.IntentFact {
+		t.Fatalf("context routing = %+v", contextPackage.Routing)
+	}
+	globalPlan := service.PlanKnowledgeQuery("总结整个知识库")
+	if globalPlan.Intent != semantic.IntentGlobal || !globalPlan.UseHierarchicalSummary {
+		t.Fatalf("global plan = %+v", globalPlan)
+	}
 	if contextPackage.EstimatedTokens > contextPackage.TokenBudget {
 		t.Fatalf("context package tokens = %d, budget %d", contextPackage.EstimatedTokens, contextPackage.TokenBudget)
 	}

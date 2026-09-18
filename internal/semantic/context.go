@@ -41,6 +41,7 @@ type ContextEvidence struct {
 type ContextPackage struct {
 	Query            string             `json:"query"`
 	Intent           string             `json:"intent,omitempty"`
+	Routing          *QueryPlan         `json:"routing,omitempty"`
 	CompilerVersion  string             `json:"compilerVersion"`
 	Generation       int64              `json:"generation"`
 	KnowledgeSummary []string           `json:"knowledgeSummary,omitempty"`
@@ -77,8 +78,14 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 	if strings.TrimSpace(compilation.BaseID) == "" || compilation.Generation <= 0 {
 		return ContextPackage{}, fmt.Errorf("context compilation requires a semantic generation")
 	}
-	topK := clampContextCount(options.TopK, 8)
-	factTopK := clampContextCount(options.FactTopK, 4)
+	routing := RouteQuery(query)
+	intent := strings.TrimSpace(options.Intent)
+	if intent == "" {
+		intent = string(routing.Intent)
+	}
+	defaultTopK, defaultFactTopK := contextCountsForPlan(routing)
+	topK := clampContextCount(options.TopK, defaultTopK)
+	factTopK := clampContextCount(options.FactTopK, defaultFactTopK)
 	budget := options.TokenBudget
 	if budget <= 0 {
 		budget = DefaultContextTokenBudget
@@ -100,7 +107,7 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 	}
 
 	pkg := ContextPackage{
-		Query: query, Intent: strings.TrimSpace(options.Intent),
+		Query: query, Intent: intent, Routing: &routing,
 		CompilerVersion: contextCompilerVersion, Generation: compilation.Generation,
 		TokenBudget: budget,
 	}
@@ -243,6 +250,21 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 		// populated so tests can diagnose the section that exceeded budget.
 		p.RenderedContext = clipToContextTokens(p.RenderedContext, p.TokenBudget)
 		p.EstimatedTokens = chunk.EstimateTokens(p.RenderedContext)
+	}
+}
+
+func contextCountsForPlan(plan QueryPlan) (int, int) {
+	switch plan.Intent {
+	case IntentGlobal:
+		return 12, 2
+	case IntentCrossDocument, IntentComparison:
+		return 10, 4
+	case IntentMultiHop:
+		return 10, 5
+	case IntentTemporal:
+		return 6, 5
+	default:
+		return 6, 5
 	}
 }
 

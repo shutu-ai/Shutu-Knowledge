@@ -50,6 +50,7 @@ Key documents:
 - [docs/0.4_incremental_compilation.md](docs/0.4_incremental_compilation.md) — 0.4 durable dirty-set and delete propagation
 - [docs/0.4_semantic_memory.md](docs/0.4_semantic_memory.md) — 0.4 Concept/Topic/Summary retrieval
 - [docs/0.4_context_compiler.md](docs/0.4_context_compiler.md) — 0.4 semantic+evidence context package
+- [docs/0.4_query_routing.md](docs/0.4_query_routing.md) — 0.4 AUTO intent and lane routing
 - [docs/agent_contract_mapping.md](docs/agent_contract_mapping.md) — capability-to-contract mapping
 - [docs/dsh_knowledge_capability_inventory.md](docs/dsh_knowledge_capability_inventory.md) — audited reference behavior
 - [docs/dsh_knowledge_equivalence_matrix.md](docs/dsh_knowledge_equivalence_matrix.md) — parity tracking

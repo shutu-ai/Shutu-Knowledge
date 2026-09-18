@@ -3,14 +3,15 @@
 ## Version and candidate
 
 - Version: `0.3.0`
-- Validated implementation commit: `25bc392ea2f60652112e934debb57a65981dce4d`
+- Validated implementation commit: `405e8c531e8ce14994941e895612a03bb9501487`
 - Storage migration: `0018_document_intelligence.sql`
 
 ## Architecture
 
 `document-ir/v1` is a deterministic parser-independent representation. It
 contains ordered document/section/page/slide/sheet/block/paragraph/heading/
-table/row/cell/figure nodes, source anchors, confidence, and relationships.
+list/list-item/table/row/cell/figure/image/caption/footnote nodes, source
+anchors, confidence, and relationships.
 Node IDs are deterministic SHA-256 identifiers bound to the document ID.
 Chunks retain node links and the best specific source anchor; retrieval emits
 additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
@@ -20,18 +21,23 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 | Area | Result | Evidence |
 | --- | --- | --- |
 | 0.2 to 0.3 storage migration | PASS | Migration 0018, full normal and race suites |
-| PDF | PASS | Page/block/bbox IR test and golden corpus |
-| DOCX | PASS | Heading/table-cell IR test and golden corpus |
-| PPTX | PASS | Eight-slide anchor golden |
-| XLSX | PASS | Named sheet, row, and cell anchor golden |
+| PDF | PASS | Page/block/bbox IR test plus deterministic table/figure/caption detection and real PDF corpus |
+| DOCX | PASS | Heading/list/section/caption/table-cell IR test and real DOCX corpus |
+| PPTX | PASS | Eight-slide golden plus table/row/cell, figure/image, and speaker-notes coverage |
+| XLSX | PASS | Named sheet, used range, table/row/cell, formula/header/merged metadata and real XLSX corpus |
 | Legacy Office | OPTIONAL | Existing helper boundary remains explicit; no helper is bundled |
 | Fallback paths | PASS | OCR/content fallback paths publish the same IR contract and increment local fallback telemetry |
 
 ## Golden and lifecycle tests
 
-- Document IR golden: PASS (`TestGoldenCorpusManifestAndIR`)
+- Document IR golden: PASS (`TestGoldenCorpusManifestAndIR`), reading committed
+  `simple.pdf`, `multicolumn.pdf`, `tables.pdf`, `figures.pdf`, `scanned.pdf`,
+  `long.pdf`, `structured.docx`, `tables.docx`, `presentation.pptx`, and
+  `spreadsheet.xlsx` artifacts generated reproducibly by the corpus tool
 - Retrieval golden: PASS (`TestGoldenRetrievalAndCitationAccuracy`)
-- Citation accuracy: PASS, including section and XLSX `Revenue!A2` provenance
+- Citation accuracy: PASS, including section and XLSX `Revenue!A2` retrieval
+  citations; PDF page/bbox anchors, structural table/header/row context, and
+  generation-fenced provenance are covered by the parser/lifecycle tests
 - Update/delete/reindex generation fencing: PASS in the existing Knowledge suite
 - Delete cleanup: PASS, including nodes and chunk links
 - Restart/recovery: PASS in the existing operations/runtime suite
@@ -57,9 +63,11 @@ local baseline, not a production capacity claim.
 ## Release artifact
 
 - Filename: `shutu-knowledge-0.3.0-windows-amd64.zip`
-- Size: `12,450,617` bytes
-- SHA-256: `3ae00468d5ab2b554b92e077ab8a69b48d1f299b083eb4074f05e09b17c4efbf`
+- Size: `12,352,175` bytes
+- SHA-256: `b19290e095d59ef25d2213de9c4d36f270864c72628164bccbe5d00a46a75518`
 - Static package secret audit: PASS
+- Package smoke: PASS, including text import, OCR import, online retrieval,
+  runtime status, and offline restart retrieval
 
 ## Doctor and diagnostics
 
@@ -71,8 +79,8 @@ count without document text or credentials.
 
 ## Known limitations and deferred work
 
-- Golden PDF/OOXML bytes are generated deterministically in memory from
-  checked-in, reviewable fixtures; OCR/rendering remains an optional runtime.
+- The committed corpus uses intentionally small deterministic fixtures rather
+  than production-sized files; OCR/rendering remains an optional runtime.
 - Visual figure understanding, entity/ontology extraction, GraphRAG, query
   routing v0, and a richer chunk-link inspector remain deferred to 0.4+.
 - CI push/tag status was not queried because this workspace has no GitHub CLI
@@ -83,4 +91,4 @@ count without document text or credentials.
 
 `NOT READY` until push/tag CI and external Agent Host acceptance are run and
 recorded. The local implementation, tests, artifact build, static audit, and
-Windows package smoke are ready.
+final Windows package smoke are ready.

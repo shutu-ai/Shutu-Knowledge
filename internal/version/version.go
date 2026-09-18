@@ -9,7 +9,7 @@ import (
 
 // Version is the extension's own semantic version. It is independent of the
 // Agent version; compatibility is expressed through the Extension v1 contract.
-const Version = "0.4.0-rc.1"
+const Version = "0.4.0"
 
 // ExtensionVersion is the numeric identity required by Extension Protocol v1
 // manifests. Semantic-version prerelease/build suffixes remain in Version.

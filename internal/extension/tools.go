@@ -134,6 +134,26 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		}
 		return searchToolResult{SearchResult: result, Citations: citations(result.Hits)}, nil
 
+	case "knowledge_compile_context":
+		var args struct {
+			BaseID      string `json:"baseId"`
+			Query       string `json:"query"`
+			TokenBudget int    `json:"tokenBudget"`
+		}
+		if err := decodeArguments(request.Arguments, &args); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(args.BaseID) == "" {
+			return nil, fmt.Errorf("baseId is required for semantic context compilation")
+		}
+		if strings.TrimSpace(args.Query) == "" {
+			return nil, fmt.Errorf("semantic context query is required")
+		}
+		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
+			return nil, err
+		}
+		return service.CompileKnowledgeContext(ctx, args.BaseID, args.Query, args.TokenBudget)
+
 	case "knowledge_list_bases":
 		var args struct {
 			BaseID string `json:"baseId"`

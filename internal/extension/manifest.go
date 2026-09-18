@@ -76,6 +76,11 @@ func toolDefinitions() []extension.ToolDefinition {
 			"updatedBefore": map[string]any{"type": "integer", "description": "Epoch-ms upper bound on document update time."},
 			"extraQueries":  stringArray("Up to three extra phrasings or translations for rank fusion."),
 		}, "query"), extension.ToolRiskRead, false),
+		tool("knowledge_compile_context", "Compile a query-specific semantic-plus-evidence context from an active 0.4 semantic compilation. Prefer this for global summaries, cross-document comparisons, multi-hop questions, or when concise conceptual orientation plus exact citations is needed. It returns intent diagnostics, concepts/topics/summaries, critical facts, exact evidence, citations, and a token-bounded rendered context.", objectSchema(map[string]any{
+			"baseId":      stringProperty("Base id with an active semantic compilation."),
+			"query":       stringProperty("User question or retrieval query."),
+			"tokenBudget": integerProperty("Maximum estimated context tokens; defaults to 4096.", 512, 32768),
+		}, "baseId", "query"), extension.ToolRiskRead, false),
 		tool("knowledge_list_bases", "List enabled knowledge bases, or outline one base's document tree when baseId is supplied.", objectSchema(map[string]any{
 			"baseId": stringProperty("Optional base id to outline."),
 			"limit":  integerProperty("Maximum number of outline documents to return; defaults to 50 and is capped at 200.", 1, 200),

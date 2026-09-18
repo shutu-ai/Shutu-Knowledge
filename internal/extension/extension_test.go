@@ -20,6 +20,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/health"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/operations"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
 
 func testApp(t *testing.T) *app.App {
@@ -40,7 +41,7 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 	}
 	manifest := Manifest()
 	wantTools := []string{
-		"knowledge_search", "knowledge_list_bases", "knowledge_create_base",
+		"knowledge_search", "knowledge_compile_context", "knowledge_list_bases", "knowledge_create_base",
 		"knowledge_delete_base", "knowledge_add_document", "knowledge_list_documents",
 		"knowledge_delete_document", "knowledge_import_url", "knowledge_refresh_url",
 		"knowledge_stats", "knowledge_get_document", "knowledge_read_document",
@@ -71,7 +72,7 @@ func TestManifestValidatesAgainstSDK(t *testing.T) {
 			if definition.Risk != extension.ToolRiskDestructive || !definition.RequiresApproval {
 				t.Fatalf("%s risk: %+v", definition.Name, definition)
 			}
-		case "knowledge_search", "knowledge_list_bases", "knowledge_get_document", "knowledge_read_document":
+		case "knowledge_search", "knowledge_compile_context", "knowledge_list_bases", "knowledge_get_document", "knowledge_read_document":
 			if definition.Risk != extension.ToolRiskRead || definition.RequiresApproval {
 				t.Fatalf("%s risk: %+v", definition.Name, definition)
 			}
@@ -495,5 +496,41 @@ func TestAgentSDKImportLayering(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestKnowledgeCompileContextToolConsumesSemanticMemory(t *testing.T) {
+	application := testApp(t)
+	ctx := context.Background()
+	base, err := application.Knowledge.CreateBase("Agent semantic", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Knowledge.AddTextDocument(ctx, base.ID, "Vector Retrieval",
+		"# Vector Retrieval\n\nThe vector service uses 1024-dimensional vectors."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.Knowledge.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatal(err)
+	}
+	call, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name:      "knowledge_compile_context",
+		Arguments: map[string]any{"baseId": base.ID, "query": "The vector service uses 1024-dimensional vectors.", "tokenBudget": 1024},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.Error != "" {
+		t.Fatalf("knowledge_compile_context: %s", call.Error)
+	}
+	result, ok := call.Value.(semantic.ContextPackage)
+	if !ok {
+		t.Fatalf("semantic context result type = %T", call.Value)
+	}
+	if result.Routing == nil || len(result.Evidence) == 0 || len(result.Citations) == 0 || result.RenderedContext == "" {
+		t.Fatalf("semantic context result = %+v", result)
+	}
+	if result.EstimatedTokens > result.TokenBudget {
+		t.Fatalf("semantic context tokens = %d, budget %d", result.EstimatedTokens, result.TokenBudget)
 	}
 }

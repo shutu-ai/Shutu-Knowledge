@@ -46,7 +46,7 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
   passed healthz, duplicate-instance rejection, and crash-restart. Remote Tag
   CI release-host acceptance also passed on Windows, Ubuntu, and macOS in run
   `35331687850`; a separate cross-repository external Agent Host run was not
-  performed
+  performed and remains a non-blocking post-release integration validation item
 - Windows package smoke: PASS, including online import/OCR/vector retrieval and offline restart retrieval
 
 ## Regression and performance
@@ -104,10 +104,14 @@ or credentials.
   benchmark smoke all pass. Remote Push CI run `35331665725` and Tag CI run
   `35331687850` both passed, including Race, Benchmark, Browser E2E, runtime,
   host, package, and static-audit gates.
-- A real external Agent Host acceptance run remains a release-host gate.
+- Cross-repository external Agent Host acceptance was not independently run;
+  it is not part of the Shutu-Knowledge 0.3 release gate and remains a
+  non-blocking post-release integration validation item.
 
 ## Release status
 
-`READY FOR 0.3.0 DOCUMENT INTELLIGENCE DELIVERY` after local validation and
-remote Push/Tag CI passed. Cross-repository external Agent Host acceptance is
-still recorded as a separate follow-up gate and is not claimed here.
+`VALIDATED CANDIDATE: v0.3.0` after local validation and remote Push/Tag CI
+passed. Cross-repository external Agent Host acceptance is not claimed and is
+not a release blocker; it remains a non-blocking post-release integration
+validation item. Formal release closure is recorded in
+`docs/release_report_0.3.1.md`.

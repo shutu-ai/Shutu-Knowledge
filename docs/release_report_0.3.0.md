@@ -23,7 +23,7 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 | 0.2 to 0.3 storage migration | PASS | Migration 0018, full normal and race suites |
 | PDF | PASS | Page/block/bbox IR test plus deterministic table/figure/caption detection and real PDF corpus |
 | DOCX | PASS | Heading/list/section/caption/table-cell IR test and real DOCX corpus |
-| PPTX | PASS | Three-slide golden plus table/row/cell, figure/image, and speaker-notes coverage |
+| PPTX | PASS | Eight-slide golden, including churn content on slide 3, plus table/row/cell, figure/image, and speaker-notes coverage |
 | XLSX | PASS | Named sheet, used range, table/row/cell, formula/header/merged metadata and real XLSX corpus |
 | Legacy Office | OPTIONAL | Existing helper boundary remains explicit; no helper is bundled |
 | Fallback paths | PASS | OCR/content fallback paths publish the same IR contract and increment local fallback telemetry |

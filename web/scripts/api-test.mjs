@@ -7,7 +7,7 @@ let mode = "success";
 globalThis.fetch = (input, options) => {
   calls.push({ input, options });
   if (mode === "success") {
-    return Promise.resolve({ ok: true, status: 200, text: async () => "raw fixture" });
+    return Promise.resolve({ ok: true, status: 200, text: async () => "raw fixture", json: async () => ({}) });
   }
   return new Promise((resolve, reject) => {
     const abort = () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
@@ -22,6 +22,12 @@ const successRoute = new AbortController();
 setRouteSignal(successRoute.signal);
 assert.equal(await api.rawText("doc-1"), "raw fixture");
 assert.equal(calls[0].input, "/extensions/shutu-knowledge/api/documents/doc-1/raw?inline=1");
+await api.semanticWiki("base-1");
+await api.searchSemanticMemory("base-1", { query: "vector" });
+await api.compileKnowledgeContext("base-1", { query: "vector" });
+assert.equal(calls.at(-3).input, "/extensions/shutu-knowledge/api/bases/base-1/semantic/wiki");
+assert.equal(calls.at(-2).input, "/extensions/shutu-knowledge/api/bases/base-1/semantic/search");
+assert.equal(calls.at(-1).input, "/extensions/shutu-knowledge/api/bases/base-1/semantic/context");
 
 mode = "pending";
 const cancelledJSONRoute = new AbortController();

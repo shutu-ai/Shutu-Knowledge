@@ -31,6 +31,7 @@ type WikiPage struct {
 	RelatedPageIDs []string         `json:"relatedPageIds,omitempty"`
 	Evidence       []EvidenceSource `json:"evidence,omitempty"`
 	Generation     int64            `json:"generation"`
+	Markdown       string           `json:"markdown,omitempty"`
 }
 
 // WikiView is the complete deterministic projection of one compilation.
@@ -149,6 +150,7 @@ func topicWikiPage(compilation Compilation, topic Unit, units map[string]Unit) (
 		return WikiPage{}, fmt.Errorf("wiki topic %s: %w", topic.ID, err)
 	}
 	page.Evidence = evidence
+	page.Markdown = page.RenderMarkdown()
 	return page, nil
 }
 
@@ -175,6 +177,7 @@ func conceptWikiPage(compilation Compilation, concept Unit) (WikiPage, error) {
 		return WikiPage{}, fmt.Errorf("wiki concept %s: %w", concept.ID, err)
 	}
 	page.Evidence = evidence
+	page.Markdown = page.RenderMarkdown()
 	return page, nil
 }
 

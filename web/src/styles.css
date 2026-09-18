@@ -329,3 +329,10 @@ tr.selected { background: #f5f7fb; box-shadow: inset 2px 0 0 var(--accent); }
     transform: none;
   }
 }
+.semantic-context {
+  max-height: 420px; overflow: auto; margin: 0; padding: 12px; border-radius: 8px;
+  background: var(--quiet); white-space: pre-wrap; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.semantic-wiki-page { display: block; }
+.semantic-wiki-page summary { cursor: pointer; padding: 4px 0; }
+.semantic-wiki-page pre { margin-top: 8px; }

@@ -6,6 +6,7 @@ const navigation = [
   ["bases", "Knowledge Bases"],
   ["documents", "Documents"],
   ["import", "Import"],
+  ["knowledge", "Knowledge"],
   ["recall", "Recall Test"],
   ["models", "Models"],
   ["settings", "Settings"],
@@ -518,6 +519,7 @@ async function render(initialQuery = "", generation = ++routeGeneration) {
     if (state.route === "bases") await renderBases();
 if (state.route === "documents") await renderDocuments(generation, state.selectedBaseId);
     if (state.route === "import") await renderImport();
+    if (state.route === "knowledge") await renderKnowledge();
     if (state.route === "recall") await renderRecall(initialQuery);
     if (state.route === "settings") await renderSettings();
   } catch (error) {
@@ -1215,6 +1217,99 @@ async function renderImport() {
       h("button", { class: "button primary" }, localized("Import backend directory")),
     ]),
   ]));
+}
+
+async function renderKnowledge() {
+  if (!state.selectedBaseId) {
+    screen.append(h("section", { class: "section" }, [
+      h("div", { class: "section-head" }, h("h2", {}, "Knowledge")),
+      basePicker(async (value) => { syncBasePicker(value); await render(); }),
+      h("div", { class: "empty panel" }, "Select a knowledge base to compile semantic memory."),
+    ]));
+    return;
+  }
+  screen.append(h("section", { class: "section toolbar" }, [
+    basePicker(async (value) => { syncBasePicker(value); await render(); }),
+    h("button", { class: "button primary", onclick: () => guard(async () => {
+      await api.compileSemanticMemory(state.selectedBaseId);
+      await render();
+    }, "Semantic memory compiled") }, [icon(icons.refresh), "Compile semantic memory"]),
+  ]));
+
+  let compilation = null;
+  try { compilation = await api.semanticCompilation(state.selectedBaseId); }
+  catch (error) {
+    if (error.status !== 404) throw error;
+  }
+  const counts = { fact: 0, concept: 0, topic: 0, summary: 0, knowledge_page: 0 };
+  (compilation?.units ?? []).forEach((unit) => { counts[unit.type] = (counts[unit.type] ?? 0) + 1; });
+  screen.append(h("section", { class: "section" }, [
+    h("div", { class: "section-head" }, h("h2", {}, "Compilation status")),
+    h("div", { class: "panel panel-body" }, compilation ? [
+      h("div", { class: "metrics" }, [
+        metric("Generation", compilation.generation), metric("Facts", counts.fact),
+        metric("Concepts", counts.concept), metric("Topics", counts.topic),
+        metric("Summaries", counts.summary), metric("Relations", compilation.relations?.length ?? 0),
+      ]),
+      h("p", { class: "muted mono" }, `${compilation.compiler || "compiler"} ${compilation.compilerVersion || ""} · ${compilation.model || ""} ${compilation.modelVersion || ""} · prompt ${compilation.promptVersion || "none"}`),
+    ] : h("div", { class: "empty" }, "No active semantic compilation. Existing 0.3 retrieval remains available.")),
+  ]));
+
+  if (!compilation) return;
+  screen.append(h("section", { class: "section" }, [
+    h("div", { class: "section-head" }, h("h2", {}, "Knowledge explorer")),
+    table(["Type", "Title", "Confidence", "Evidence", "Derived from"], (compilation.units ?? []).slice(0, 100).map((unit) => h("tr", {},
+      h("td", {}, chip(unit.type)), h("td", { class: "truncate" }, unit.title),
+      h("td", {}, Number(unit.confidence ?? 0).toFixed(2)),
+      h("td", {}, number(unit.sources?.length ?? 0)), h("td", {}, number(unit.derivedFrom?.length ?? 0)),
+    ))),
+  ]));
+
+  const semanticResults = h("section", { class: "section", "aria-live": "polite" });
+  const contextResult = h("section", { class: "section", "aria-live": "polite" });
+  const queryForm = h("form", { class: "section panel panel-body", onsubmit: (event) => {
+    event.preventDefault();
+    guard(async () => {
+      const query = event.target.query.value;
+      const [semantic, context] = await Promise.all([
+        api.searchSemanticMemory(state.selectedBaseId, { query, topK: 8 }),
+        api.compileKnowledgeContext(state.selectedBaseId, { query, tokenBudget: 2048 }),
+      ]);
+      semanticResults.replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Semantic activation")),
+        table(["Type", "Unit", "Score", "Terms", "Evidence"], semantic.hits.map((hit) => h("tr", {},
+          h("td", {}, chip(hit.unit.type)), h("td", { class: "truncate" }, hit.unit.title),
+          h("td", {}, Number(hit.score ?? 0).toFixed(2)), h("td", { class: "truncate mono" }, (hit.matchedTerms ?? []).join(", ")),
+          h("td", {}, number(hit.evidence?.length ?? 0)),
+        ))));
+      contextResult.replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Compiled context")),
+        h("div", { class: "panel panel-body" }, [
+          h("div", { class: "toolbar" }, [
+            chip(context.routing?.intent ?? "fact"),
+            h("span", { class: "muted" }, `${context.estimatedTokens ?? 0}/${context.tokenBudget ?? 0} tokens`),
+            h("span", { class: "muted" }, `${context.evidence?.length ?? 0} evidence · ${context.citations?.length ?? 0} citations`),
+          ]),
+          h("pre", { class: "mono semantic-context" }, context.renderedContext || ""),
+        ]));
+    });
+  } }, [
+    h("h2", {}, "Semantic query"),
+    h("div", { class: "toolbar" }, [
+      h("input", { name: "query", required: true, style: "max-width:520px", placeholder: "Ask global, comparison, multi-hop, temporal, or fact question" }),
+      h("button", { class: "button primary" }, [icon(icons.search), "Activate knowledge"]),
+    ]),
+  ]);
+  screen.append(queryForm, semanticResults, contextResult);
+
+  const wikiPanel = h("section", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Living Wiki"),
+    h("button", { class: "button small", onclick: () => guard(async () => {
+      const wiki = await api.semanticWiki(state.selectedBaseId);
+      wikiPanel.replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Living Wiki")),
+        h("div", { class: "panel list" }, (wiki.pages ?? []).map((page) => h("details", { class: "list-row semantic-wiki-page" },
+          h("summary", {}, [h("strong", {}, page.title), h("span", { class: "muted" }, ` · ${page.evidence?.length ?? 0} evidence pointers`)]),
+          h("pre", { class: "mono semantic-context" }, page.markdown || ""),
+        ))));
+    }) }, "Regenerate view")));
+  screen.append(wikiPanel);
 }
 
 async function renderRecall(initialQuery = "") {

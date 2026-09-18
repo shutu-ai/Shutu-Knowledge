@@ -93,6 +93,12 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("DELETE /api/search-history", s.clearSearchHistory)
 	mux.HandleFunc("DELETE /api/search-history/{id}", s.deleteSearchHistory)
 	mux.HandleFunc("GET /api/documents/{id}/context", s.documentContext)
+	mux.HandleFunc("POST /api/bases/{id}/semantic/compile", s.compileSemanticMemory)
+	mux.HandleFunc("GET /api/bases/{id}/semantic", s.getSemanticCompilation)
+	mux.HandleFunc("POST /api/bases/{id}/semantic/search", s.searchSemanticMemory)
+	mux.HandleFunc("POST /api/bases/{id}/semantic/context", s.compileKnowledgeContext)
+	mux.HandleFunc("GET /api/bases/{id}/semantic/wiki", s.getSemanticWiki)
+	mux.HandleFunc("GET /api/semantic/units/{id}/evidence", s.resolveSemanticUnitEvidence)
 }
 
 func writeErr(w http.ResponseWriter, err error) {

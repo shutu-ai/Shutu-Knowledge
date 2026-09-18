@@ -119,6 +119,16 @@ func (s *Store) FailCompilation(ctx context.Context, baseID string, generation i
 	return nil
 }
 
+// NextGeneration returns one above the newest persisted generation. It does
+// not reserve the value; the caller's compilation write transaction remains
+// authoritative for uniqueness.
+func (s *Store) NextGeneration(ctx context.Context, baseID string) (int64, error) {
+	var generation int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(generation), 0) + 1
+		FROM knowledge_compilations WHERE base_id = ?`, baseID).Scan(&generation)
+	return generation, err
+}
+
 // GetActiveCompilation returns the currently published immutable set.
 func (s *Store) GetActiveCompilation(ctx context.Context, baseID string) (Compilation, error) {
 	var generation int64

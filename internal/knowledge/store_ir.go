@@ -180,3 +180,25 @@ func (s *store) listDocumentIR(ctx context.Context, docID string) (documentir.Do
 	}
 	return ir, nil
 }
+
+// chunkIDsByNode returns the active generation's exact chunk-node mapping for
+// semantic compilation. A missing mapping is not fabricated; the compiler can
+// still cite the IR node directly.
+func (s *store) chunkIDsByNode(ctx context.Context, docID string, generation int64) (map[string][]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT node_id, chunk_id
+		FROM chunk_node_links WHERE doc_id = ? AND index_generation = ?
+		ORDER BY node_id, link_order, chunk_id`, docID, generation)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var nodeID, chunkID string
+		if err := rows.Scan(&nodeID, &chunkID); err != nil {
+			return nil, err
+		}
+		out[nodeID] = append(out[nodeID], chunkID)
+	}
+	return out, rows.Err()
+}

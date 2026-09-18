@@ -24,6 +24,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 	"github.com/shutu-ai/shutu-knowledge/internal/scheduler"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -50,17 +51,18 @@ const (
 
 // Service is the Knowledge Core facade: bases, documents, lifecycle.
 type Service struct {
-	store        *store
-	raw          *storage.RawFileStore
-	parsers      *parser.Registry
-	ocr          parser.HelperRunner
-	ocrRenderer  parser.PageRenderer
-	content      parser.HelperRunner
-	imageDecoder parser.ExecHelper
-	global       config.Config
-	embedder     embedding.Provider
-	reranker     rerank.Provider
-	runtime      runtime.Caller
+	store         *store
+	semanticStore *semantic.Store
+	raw           *storage.RawFileStore
+	parsers       *parser.Registry
+	ocr           parser.HelperRunner
+	ocrRenderer   parser.PageRenderer
+	content       parser.HelperRunner
+	imageDecoder  parser.ExecHelper
+	global        config.Config
+	embedder      embedding.Provider
+	reranker      rerank.Provider
+	runtime       runtime.Caller
 	// ocrArtifacts maps the shared model bundle to the optional runtime
 	// helper contract; nil means the helper owns its artifact resolution.
 	ocrArtifacts func() (path string, ready bool)
@@ -97,6 +99,7 @@ func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config)
 	}
 	service := &Service{
 		store:            newStore(db),
+		semanticStore:    semantic.NewStore(db),
 		raw:              raw,
 		parsers:          parser.NewRegistry(registryOptions...),
 		global:           global,

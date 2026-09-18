@@ -1,7 +1,6 @@
 # Shutu Knowledge v0.4.0 release report
 
-Status: **PREPARING FINAL EVIDENCE** — the RC passed local validation, Windows
-package smoke, and push CI. Final version packaging and tag CI are in progress.
+Status: **READY**. The formal source, artifact, release tag, push/tag CI, Windows package smoke, migration/regression gates, and final no-P0 audit passed.
 
 ## Research
 
@@ -78,14 +77,49 @@ unchanged.
 
 ## CI
 
-- Push CI for RC candidate `46338297954eb16212a123b3109469304081b20e`:
+- RC push CI for `46338297954eb16212a123b3109469304081b20e`:
   [`35379456813`](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35379456813)
   — PASS.
-- Final tag CI: PENDING.
+- Final push CI for `6da3bcdd05741834a3bfea77db049905e9d838ff`:
+  [`35382537929`](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35382537929)
+  — PASS.
+- `v0.4.0` tag CI:
+  [`35382538099`](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35382538099)
+  — PASS. It completed Build, Test, Race, Benchmark, Browser E2E, real managed
+  runtime smoke, offline runtime restart, Windows/Ubuntu/macOS release-host
+  acceptance, formal package build/verification, and static secret audit.
 
 ## Artifact
 
-Final artifact evidence: PENDING.
+- Implementation/tag target: `6da3bcdd05741834a3bfea77db049905e9d838ff`
+- Annotated tag object: `0e18760b63272fbd1b9d7e6a91146875d881bca1`
+- Filename: `shutu-knowledge-0.4.0-windows-amd64.zip`
+- Size: `12,580,680` bytes
+- SHA-256: `d70a2ea2476b3f77f6e0d7de232bb48777a07038c14e37ab99069b23489ae49c`
+- Binary: `shutu-knowledge.exe`
+- Binary SHA-256: `e72ee90950bd2bffd5d9f7b67765ff0002a2014123fb3bd4e95b4f7869e41f66`
+- Local package smoke: PASS — startup, Markdown/OCR/DOCX/PPTX/XLSX import,
+  embedding, online vector retrieval, runtime status, and offline restart
+  retrieval.
+- Published asset digest matches the SHA-256 above.
+- GitHub Release: <https://github.com/shutu-ai/Shutu-Knowledge/releases/tag/v0.4.0>
+
+## GitHub release
+
+- Status: CREATED
+- Name: `Shutu Knowledge v0.4.0`
+- URL: <https://github.com/shutu-ai/Shutu-Knowledge/releases/tag/v0.4.0>
+- Asset uploaded: YES
+- Asset state: `uploaded`
+
+## No-P0 audit
+
+PASS. The requirement-by-requirement release audit found no P0: optional
+compilation and 0.3 compatibility, local-first storage, exact provenance,
+incremental/delete propagation, atomic generations, restart recovery, bounded
+context, query routing, temporal handling, Agent integration, benchmark
+improvement, package smoke, CI, and release publication all have direct
+evidence above or in the linked phase reports.
 
 ## Known limitations
 
@@ -103,6 +137,4 @@ and knowledge-to-agent planning are reserved for 0.5+.
 
 ## Release status
 
-NOT READY — final exact-source package, package smoke, tag CI, and no-P0 audit
-are not yet complete.
-
+READY

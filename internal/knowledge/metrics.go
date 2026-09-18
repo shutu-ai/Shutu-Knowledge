@@ -1,6 +1,10 @@
 package knowledge
 
-import "time"
+import (
+	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/operations"
+)
 
 // MetricsSnapshot is the process-local structured observability surface. It
 // aggregates behavior without recording document text, queries, credentials,
@@ -12,6 +16,8 @@ type MetricsSnapshot struct {
 	QueueWaitMS         int64            `json:"queueWaitMs"`
 	RunTimeMS           int64            `json:"runTimeMs"`
 	ParseDurationMS     int64            `json:"parseDurationMs"`
+	IRBuildDurationMS   int64            `json:"irBuildDurationMs"`
+	ChunkDurationMS     int64            `json:"chunkDurationMs"`
 	DiskReadMS          int64            `json:"diskReadMs"`
 	DBWaitMS            int64            `json:"dbWaitMs"`
 	DBTransactionMS     int64            `json:"dbTransactionMs"`
@@ -24,6 +30,8 @@ type MetricsSnapshot struct {
 	ParserFallbacks     int64            `json:"parserFallbacks"`
 	ParserSelections    map[string]int64 `json:"parserSelections,omitempty"`
 	EmbeddingDurationMS int64            `json:"embeddingDurationMs"`
+	PeakRSSBytes        uint64           `json:"peakRssBytes"`
+	IRStorageBytes      int64            `json:"irStorageBytes"`
 	Searches            int64            `json:"searches"`
 	SearchDurationMS    int64            `json:"searchDurationMs"`
 	RerankDurationMS    int64            `json:"rerankDurationMs"`
@@ -44,6 +52,22 @@ func (s *Service) recordMetric(update func(*MetricsSnapshot)) {
 	update(&s.metrics)
 }
 
+// observePeakRSS samples the process-level resident set without retaining any
+// document or provider data. It is called at bounded ingestion milestones and
+// when metrics are read, so the snapshot remains useful on both Windows and
+// Unix without putting a process query on every counter update.
+func (s *Service) observePeakRSS() {
+	rss := operations.CurrentProcessRSS()
+	if rss == 0 {
+		return
+	}
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	if rss > s.metrics.PeakRSSBytes {
+		s.metrics.PeakRSSBytes = rss
+	}
+}
+
 func durationMS(started time.Time) int64 {
 	if started.IsZero() {
 		return 0
@@ -60,6 +84,7 @@ func maxInt64(a, b int64) int64 {
 
 // Metrics returns a copy of the current structured counters.
 func (s *Service) Metrics() MetricsSnapshot {
+	s.observePeakRSS()
 	s.metricsMu.Lock()
 	defer s.metricsMu.Unlock()
 	out := s.metrics

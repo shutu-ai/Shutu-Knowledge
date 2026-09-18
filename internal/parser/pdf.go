@@ -93,8 +93,13 @@ func pdfIR(text string, data []byte) *documentir.Document {
 			blockAnchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical, BBox: block.bbox}
 			if isPDFFigureCaption(block.text) {
 				figureID := "tmp:" + logical + "/figure"
-				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID, Type: documentir.TypeFigure, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: map[string]string{"figure_id": logical}, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
-				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID + "/caption", Type: documentir.TypeCaption, ParentID: figureID, Order: 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical + "/caption", BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				metadata := map[string]string{"figure_id": logical}
+				if nearby := pdfNearbyText(blocks, blockIndex); nearby != "" {
+					metadata["nearby_text"] = nearby
+				}
+				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID, Type: documentir.TypeFigure, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: metadata, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				captionMetadata := map[string]string{"figure_id": logical, "role": "caption"}
+				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID + "/caption", Type: documentir.TypeCaption, ParentID: figureID, Order: 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: captionMetadata, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical + "/caption", BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
 				continue
 			}
 			if cells := splitPDFTableRow(block.text); len(cells) >= 2 {
@@ -175,7 +180,46 @@ func pdfPageBlocks(items []pdftext.Text) []pdfIRBlock {
 		return nil
 	}
 	sort.Float64s(heights)
-	tolerance := heights[len(heights)/2] * 0.6
+	median := heights[len(heights)/2]
+	var out []pdfIRBlock
+	for _, column := range pdfColumnGroups(usable, median) {
+		out = append(out, pdfColumnBlocks(column, median)...)
+	}
+	return out
+}
+
+// pdfColumnGroups separates clearly distant x-ranges before y-band grouping.
+// This preserves column-first reading order while keeping ordinary word gaps
+// in one line together. The threshold is deliberately conservative because
+// the native PDF reader does not expose a page-wide layout model.
+func pdfColumnGroups(items []pdftext.Text, median float64) [][]pdftext.Text {
+	ordered := append([]pdftext.Text(nil), items...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].X != ordered[j].X {
+			return ordered[i].X < ordered[j].X
+		}
+		return ordered[i].Y > ordered[j].Y
+	})
+	threshold := math.Max(80, median*6)
+	var groups [][]pdftext.Text
+	var current []pdftext.Text
+	lastStart := 0.0
+	for _, item := range ordered {
+		if len(current) > 0 && item.X-lastStart > threshold {
+			groups = append(groups, current)
+			current = nil
+		}
+		current = append(current, item)
+		lastStart = item.X
+	}
+	if len(current) > 0 {
+		groups = append(groups, current)
+	}
+	return groups
+}
+
+func pdfColumnBlocks(usable []pdftext.Text, median float64) []pdfIRBlock {
+	tolerance := median * 0.6
 	if tolerance <= 0 {
 		tolerance = 6
 	}
@@ -188,8 +232,9 @@ func pdfPageBlocks(items []pdftext.Text) []pdfIRBlock {
 		}
 		bands[band] = append(bands[band], item)
 	}
-	sort.Ints(order)
-	median := heights[len(heights)/2]
+	// PDF coordinates normally use a bottom-left origin, so larger Y values
+	// are visually higher and must be emitted first for reading order.
+	sort.Slice(order, func(i, j int) bool { return order[i] > order[j] })
 	out := make([]pdfIRBlock, 0, len(order))
 	for _, band := range order {
 		group := bands[band]
@@ -249,6 +294,17 @@ func numberedHeading(value string) bool {
 func isPDFFigureCaption(value string) bool {
 	lower := strings.ToLower(strings.TrimSpace(value))
 	return strings.HasPrefix(lower, "figure") || strings.HasPrefix(lower, "fig.") || strings.HasPrefix(lower, "fig ")
+}
+
+func pdfNearbyText(blocks []pdfIRBlock, index int) string {
+	var nearby []string
+	if index > 0 && strings.TrimSpace(blocks[index-1].text) != "" {
+		nearby = append(nearby, strings.TrimSpace(blocks[index-1].text))
+	}
+	if index+1 < len(blocks) && strings.TrimSpace(blocks[index+1].text) != "" {
+		nearby = append(nearby, strings.TrimSpace(blocks[index+1].text))
+	}
+	return strings.Join(nearby, " | ")
 }
 
 func splitPDFTableRow(value string) []string {
@@ -363,7 +419,7 @@ func reassemblePDFLayout(data []byte) (string, error) {
 			}
 			bands[band] = append(bands[band], item)
 		}
-		sort.Ints(bandNumbers)
+		sort.Slice(bandNumbers, func(i, j int) bool { return bandNumbers[i] > bandNumbers[j] })
 
 		lines := make([]string, 0, len(bandNumbers))
 		for _, band := range bandNumbers {

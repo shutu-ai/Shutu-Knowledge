@@ -1342,7 +1342,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			m.ImportDurationMS += elapsed
 			m.RunTimeMS += elapsed
 		})
+		s.observePeakRSS()
 	}()
+	s.observePeakRSS()
 	doc.Status = StatusProcessing
 	doc.Phase = PhaseParsing
 	doc.Progress = 0
@@ -1386,6 +1388,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, fmt.Errorf("contains no extractable text"))
 	}
 	opts := s.chunkOptions(cfg)
+	irBuildStarted := Now()
 	if doc.IR == nil || len(doc.IR.Nodes) == 0 {
 		parserName := "text"
 		if doc.SourceType == "file" {
@@ -1402,6 +1405,15 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if err := doc.IR.BindDocument(doc.ID); err != nil {
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
+	irBytes := 0
+	if encoded, err := doc.IR.MarshalJSONStable(); err == nil {
+		irBytes = len(encoded)
+	}
+	s.recordMetric(func(m *MetricsSnapshot) {
+		m.IRBuildDurationMS += durationMS(irBuildStarted)
+		m.IRStorageBytes += int64(irBytes)
+	})
+	s.observePeakRSS()
 	s.recordMetric(func(m *MetricsSnapshot) {
 		if m.ParserSelections == nil {
 			m.ParserSelections = map[string]int64{}
@@ -1425,9 +1437,8 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.CharCount = len([]rune(text))
 	doc.TokenCount = chunk.EstimateTokens(text)
 
-	embeddingStarted := Now()
+	chunkStarted := Now()
 	pieces, inlineVectors := s.buildPieces(ctx, text, doc, opts, providers.embedder)
-	s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += durationMS(embeddingStarted) })
 
 	// Build chunks with retrieval context (title + heading path) and the
 	// embedding-text hash the vector phase will reuse.
@@ -1464,6 +1475,8 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if len(rows) == 0 {
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, fmt.Errorf("chunker produced no chunks"))
 	}
+	s.recordMetric(func(m *MetricsSnapshot) { m.ChunkDurationMS += durationMS(chunkStarted) })
+	s.observePeakRSS()
 	targetModelKey := ""
 	if providers.embeddingActive && providers.embedder != nil && providers.embedder.ModelKey() != "none" {
 		targetModelKey = providers.embedder.ModelKey()
@@ -1499,7 +1512,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		if err := s.store.putDocumentContext(ctx, *doc); err != nil {
 			return err
 		}
-		embeddingStarted = Now()
+		embeddingStarted := Now()
 		code, cause := s.embedChunks(ctx, doc, rows, providers.embedder)
 		embeddingElapsed := durationMS(embeddingStarted)
 		s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += embeddingElapsed })
@@ -1557,6 +1570,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			}
 			return nil
 		}
+		s.observePeakRSS()
 	}
 
 	doc.ChunkCount = len(rows)

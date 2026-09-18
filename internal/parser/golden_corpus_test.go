@@ -67,12 +67,43 @@ func TestGoldenCorpusManifestAndIR(t *testing.T) {
 		if name == "simple.pdf" && headings == 0 {
 			t.Fatalf("%s lost heading semantics", name)
 		}
+		if name == "simple.pdf" {
+			for _, node := range result.IR.Nodes {
+				if node.Type == documentir.TypePage && (strings.Index(node.Text, "RevenueOverview") < 0 || strings.Index(node.Text, "RevenueOverview") > strings.Index(node.Text, "APACrevenue")) {
+					t.Fatalf("%s lost top-to-bottom reading order: %q", name, node.Text)
+				}
+			}
+		}
 		if name == "tables.pdf" && (countNodes(result.IR, documentir.TypeTable) != 1 || countNodes(result.IR, documentir.TypeTableCell) != 3) {
 			t.Fatalf("%s lost table semantics", name)
 		}
 		if name == "figures.pdf" && (countNodes(result.IR, documentir.TypeFigure) != 1 || countNodes(result.IR, documentir.TypeCaption) != 1) {
 			t.Fatalf("%s lost figure semantics", name)
 		}
+		if name == "figures.pdf" {
+			for _, node := range result.IR.Nodes {
+				if node.Type == documentir.TypeFigure && (node.Metadata["figure_id"] == "" || node.Metadata["nearby_text"] == "") {
+					t.Fatalf("%s figure lost identity/nearby text: %+v", name, node)
+				}
+			}
+		}
+	}
+
+	multicolumn := parseOK(t, "multicolumn.pdf", goldenCorpusFile(t, "multicolumn.pdf"))
+	var leftX, rightX float64
+	for _, node := range multicolumn.IR.Nodes {
+		if node.BBox == nil {
+			continue
+		}
+		switch {
+		case strings.Contains(node.Text, "LeftColumn"):
+			leftX = node.BBox.X1
+		case strings.Contains(node.Text, "RightColumn"):
+			rightX = node.BBox.X1
+		}
+	}
+	if leftX == 0 || rightX == 0 || leftX >= rightX {
+		t.Fatalf("multicolumn PDF lost left-to-right BBox ordering: left=%v right=%v", leftX, rightX)
 	}
 
 	structured := goldenCorpusFile(t, "office", "structured.docx")
@@ -89,6 +120,11 @@ func TestGoldenCorpusManifestAndIR(t *testing.T) {
 	presentation := parseOK(t, "presentation.pptx", goldenCorpusFile(t, "office", "presentation.pptx"))
 	if countNodes(presentation.IR, documentir.TypeSlide) != manifest.Expected.Slides {
 		t.Fatalf("presentation slides=%d want %d", countNodes(presentation.IR, documentir.TypeSlide), manifest.Expected.Slides)
+	}
+	for _, node := range presentation.IR.Nodes {
+		if node.Type == documentir.TypeFigure && (node.Metadata["figure_id"] == "" || node.Metadata["image_reference"] == "" || node.Metadata["nearby_text"] == "") {
+			t.Fatalf("presentation figure lost provenance metadata: %+v", node)
+		}
 	}
 
 	workbook := goldenCorpusFile(t, "office", "spreadsheet.xlsx")

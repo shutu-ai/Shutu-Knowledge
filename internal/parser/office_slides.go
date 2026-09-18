@@ -76,12 +76,16 @@ func pptxIR(entries map[string][]byte, text string) *documentir.Document {
 			}
 			shapeMetadata := map[string]string{}
 			if shape.Picture {
+				shapeMetadata["figure_id"] = logical
 				shapeMetadata["image_reference"] = logical
+				if slideText != "" {
+					shapeMetadata["nearby_text"] = slideText
+				}
 			}
 			d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: typ, ParentID: slideID, Order: order, Text: strings.TrimSpace(shape.Text), SlideNumber: n, Metadata: shapeMetadata, SourceAnchor: documentir.SourceAnchor{Kind: "pptx", Slide: n, Shape: fmt.Sprintf("%d", shapeIndex+1), LogicalPath: logical}, Parser: "pptx", ParserVersion: "builtin-v1"})
 			if shape.Picture {
 				imageLogical := logical + "/image"
-				d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + imageLogical, Type: documentir.TypeImage, ParentID: "tmp:" + logical, Order: 1, SlideNumber: n, Metadata: map[string]string{"image_reference": logical}, SourceAnchor: documentir.SourceAnchor{Kind: "pptx", Slide: n, Shape: fmt.Sprintf("%d", shapeIndex+1), LogicalPath: imageLogical}, Parser: "pptx", ParserVersion: "builtin-v1"})
+				d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + imageLogical, Type: documentir.TypeImage, ParentID: "tmp:" + logical, Order: 1, SlideNumber: n, Metadata: map[string]string{"figure_id": logical, "image_reference": logical, "nearby_text": slideText}, SourceAnchor: documentir.SourceAnchor{Kind: "pptx", Slide: n, Shape: fmt.Sprintf("%d", shapeIndex+1), LogicalPath: imageLogical}, Parser: "pptx", ParserVersion: "builtin-v1"})
 			}
 		}
 		if len(cells) > 0 {

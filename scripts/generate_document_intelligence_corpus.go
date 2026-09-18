@@ -22,7 +22,7 @@ func main() {
 	}
 	pdfBodies := map[string]string{
 		"simple.pdf":      "BT /F1 18 Tf 72 720 Td (Revenue Overview) Tj ET\nBT /F1 12 Tf 72 690 Td (APAC revenue Q4 150) Tj ET",
-		"multicolumn.pdf": "BT /F1 18 Tf 72 720 Td (Left Column) Tj ET\nBT /F1 12 Tf 72 690 Td (Right Column) Tj ET",
+		"multicolumn.pdf": "BT /F1 18 Tf 72 720 Td (Left Column) Tj ET\nBT /F1 12 Tf 72 690 Td (Left column evidence) Tj ET\nBT /F1 18 Tf 320 720 Td (Right Column) Tj ET\nBT /F1 12 Tf 320 690 Td (Right column evidence) Tj ET",
 		"tables.pdf":      "BT /F1 18 Tf 72 720 Td (Revenue Table) Tj ET\nBT /F1 12 Tf 72 690 Td (APAC | 150 | Q4) Tj ET",
 		"figures.pdf":     "BT /F1 18 Tf 72 720 Td (Figure 1) Tj ET\nBT /F1 12 Tf 72 690 Td (Revenue trend caption) Tj ET",
 		"scanned.pdf":     "BT /F1 12 Tf 72 690 Td (OCR fallback evidence) Tj ET",
@@ -140,7 +140,7 @@ func pdfBytesPages(pages []string) []byte {
 	xrefOffset := int64(out.Len())
 	fmt.Fprintf(&out, "xref\n0 %d\n0000000000 65535 f \n", len(objects)+1)
 	for index := 1; index <= len(objects); index++ {
-		fmt.Fprintf(&out, "%010d 00000 n \n", offsets[index])
+		fmt.Fprintf(&out, "%010d 00000 n\n", offsets[index])
 	}
 	fmt.Fprintf(&out, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xrefOffset)
 	return out.Bytes()

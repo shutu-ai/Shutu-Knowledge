@@ -24,6 +24,8 @@ func TestMetricsObserveIngestSearchModelAndJobFailures(t *testing.T) {
 
 	metrics := service.Metrics()
 	if metrics.Imports != 1 || metrics.ChunkCount < 2 || metrics.EmbeddingDurationMS < 0 ||
+		metrics.ParseDurationMS < 0 || metrics.IRBuildDurationMS < 0 || metrics.ChunkDurationMS < 0 ||
+		metrics.IRStorageBytes <= 0 || metrics.PeakRSSBytes == 0 ||
 		metrics.Searches != 1 || metrics.CandidateCount == 0 || metrics.ContextCount != int64(result.Total) {
 		t.Fatalf("successful metrics: %+v", metrics)
 	}

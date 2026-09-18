@@ -3,7 +3,7 @@
 ## Version and candidate
 
 - Version: `0.3.0`
-- Validated implementation commit: `405e8c531e8ce14994941e895612a03bb9501487`
+- Validated implementation commit: `008125936fc63e68224a8093f6777ce1d9c0c7d2`
 - Storage migration: `0018_document_intelligence.sql`
 
 ## Architecture
@@ -23,7 +23,7 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 | 0.2 to 0.3 storage migration | PASS | Migration 0018, full normal and race suites |
 | PDF | PASS | Page/block/bbox IR test plus deterministic table/figure/caption detection and real PDF corpus |
 | DOCX | PASS | Heading/list/section/caption/table-cell IR test and real DOCX corpus |
-| PPTX | PASS | Eight-slide golden plus table/row/cell, figure/image, and speaker-notes coverage |
+| PPTX | PASS | Three-slide golden plus table/row/cell, figure/image, and speaker-notes coverage |
 | XLSX | PASS | Named sheet, used range, table/row/cell, formula/header/merged metadata and real XLSX corpus |
 | Legacy Office | OPTIONAL | Existing helper boundary remains explicit; no helper is bundled |
 | Fallback paths | PASS | OCR/content fallback paths publish the same IR contract and increment local fallback telemetry |
@@ -32,8 +32,9 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 
 - Document IR golden: PASS (`TestGoldenCorpusManifestAndIR`), reading committed
   `simple.pdf`, `multicolumn.pdf`, `tables.pdf`, `figures.pdf`, `scanned.pdf`,
-  `long.pdf`, `structured.docx`, `tables.docx`, `presentation.pptx`, and
-  `spreadsheet.xlsx` artifacts generated reproducibly by the corpus tool
+  `long.pdf` (105 pages), `structured.docx`, `tables.docx`,
+  `presentation.pptx`, and `spreadsheet.xlsx` artifacts generated reproducibly
+  by the corpus tool
 - Retrieval golden: PASS (`TestGoldenRetrievalAndCitationAccuracy`)
 - Citation accuracy: PASS, including section and XLSX `Revenue!A2` retrieval
   citations; PDF page/bbox anchors, structural table/header/row context, and
@@ -41,7 +42,10 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 - Update/delete/reindex generation fencing: PASS in the existing Knowledge suite
 - Delete cleanup: PASS, including nodes and chunk links
 - Restart/recovery: PASS in the existing operations/runtime suite
-- Agent extension adapter: PASS in the full suite; a real external Agent Host run was not performed
+- Agent extension adapter: PASS in the full suite; local native host acceptance
+  passed healthz, duplicate-instance rejection, and crash-restart at
+  `.tmp/release-acceptance/20260918-085701/result.json`; a real external Agent
+  Host run was not performed
 - Windows package smoke: PASS, including online import/OCR/vector retrieval and offline restart retrieval
 
 ## Regression and performance
@@ -63,8 +67,9 @@ local baseline, not a production capacity claim.
 ## Release artifact
 
 - Filename: `shutu-knowledge-0.3.0-windows-amd64.zip`
-- Size: `12,352,175` bytes
-- SHA-256: `b19290e095d59ef25d2213de9c4d36f270864c72628164bccbe5d00a46a75518`
+- Size: `12,356,128` bytes
+- SHA-256: `83cef3a03ba3bbd201004a22181447b4e2bf3510259314d80f3bb1e76bc29daa`
+- Package source commit: `008125936fc63e68224a8093f6777ce1d9c0c7d2`
 - Static package secret audit: PASS
 - Package smoke: PASS, including text import, OCR import, online retrieval,
   runtime status, and offline restart retrieval
@@ -79,8 +84,9 @@ count without document text or credentials.
 
 ## Known limitations and deferred work
 
-- The committed corpus uses intentionally small deterministic fixtures rather
-  than production-sized files; OCR/rendering remains an optional runtime.
+- The committed corpus uses deterministic fixtures, including a 105-page PDF,
+  rather than production-sized Office/PDF files; OCR/rendering remains an
+  optional runtime.
 - Visual figure understanding, entity/ontology extraction, GraphRAG, query
   routing v0, and a richer chunk-link inspector remain deferred to 0.4+.
 - CI push/tag status was not queried because this workspace has no GitHub CLI

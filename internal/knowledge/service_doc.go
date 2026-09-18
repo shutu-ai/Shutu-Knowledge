@@ -21,6 +21,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
 
 // ConflictError reports same-name import conflicts (surfaced as 409 by web).
@@ -658,6 +659,9 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 			if err := ctx.Err(); err != nil {
 				return removed, err
 			}
+			if err := s.markSemanticDocumentDeleted(ctx, root.BaseID, ref.ID); err != nil {
+				return removed, err
+			}
 			rawPaths, err := s.store.deleteDocumentGenerationsWithContext(ctx, ref.ID)
 			if err != nil {
 				return removed, err
@@ -692,6 +696,19 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 		if len(refs) < cleanupDocumentPageSize {
 			break
 		}
+	}
+	if _, err := s.semanticStore.GetActiveCompilation(ctx, root.BaseID); err == nil {
+		// Delete propagation is synchronous when semantic memory is active.
+		// If the deterministic replacement fails, retire the old generation
+		// rather than expose provenance to deleted evidence; the durable queue
+		// remains available for a later full rebuild.
+		if _, compileErr := s.CompileSemanticMemory(ctx, root.BaseID); compileErr != nil {
+			if retireErr := s.semanticStore.RetireActiveCompilation(ctx, root.BaseID); retireErr != nil && !errors.Is(retireErr, semantic.ErrNotFound) {
+				return removed, retireErr
+			}
+		}
+	} else if !errors.Is(err, semantic.ErrNotFound) {
+		return removed, err
 	}
 	return removed, nil
 }
@@ -1568,6 +1585,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			if err := s.refreshDerivedKnowledge(ctx, doc); err != nil {
 				return err
 			}
+			if err := s.markSemanticDocumentUpdated(ctx, doc); err != nil {
+				return err
+			}
 			return nil
 		}
 		s.observePeakRSS()
@@ -1601,6 +1621,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		}
 	}
 	if err := s.refreshDerivedKnowledge(ctx, doc); err != nil {
+		return err
+	}
+	if err := s.markSemanticDocumentUpdated(ctx, doc); err != nil {
 		return err
 	}
 	return nil

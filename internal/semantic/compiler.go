@@ -3,6 +3,7 @@ package semantic
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -97,11 +98,20 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 	topics := collectTopics(documents, concepts)
 	assignConceptTopics(concepts, topics)
 
+	fingerprints := make(map[string]string, len(documents))
+	for _, doc := range documents {
+		fingerprints[doc.DocumentID] = SourceFingerprint(doc)
+	}
+	fingerprintJSON, err := json.Marshal(fingerprints)
+	if err != nil {
+		return Compilation{}, fmt.Errorf("marshal source fingerprints: %w", err)
+	}
 	compilation := Compilation{
 		BaseID: baseID, Generation: generation, State: CompilationBuilding,
 		Compiler: BuiltinCompiler, CompilerVersion: BuiltinCompilerVersion,
 		Model: BuiltinModel, ModelVersion: BuiltinModelVersion,
 		PromptVersion: BuiltinPromptVersion, SourceDocumentIDs: sourceIDs,
+		Metadata:  map[string]string{"source_fingerprints": string(fingerprintJSON)},
 		CreatedAt: createdAt,
 	}
 
@@ -118,6 +128,16 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 		return Compilation{}, err
 	}
 	return compilation, nil
+}
+
+// SourceFingerprint captures the immutable inputs that require recompilation:
+// active IR generation, source version, title, and normalized IR text.
+func SourceFingerprint(doc SourceDocument) string {
+	if doc.IR == nil {
+		return fmt.Sprintf("%d:%d:%s", doc.IndexGeneration, doc.SourceVersion, stableKey(doc.Title))
+	}
+	return fmt.Sprintf("%d:%d:%s", doc.IndexGeneration, doc.SourceVersion,
+		stableKey(doc.Title+"\x00"+doc.IR.Text()))
 }
 
 func validateSourceDocument(doc *SourceDocument) error {

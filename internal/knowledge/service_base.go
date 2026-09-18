@@ -927,6 +927,9 @@ func (s *Service) DeleteBaseWithContext(ctx context.Context, id string) error {
 	if err := s.store.deleteChunksByBaseWithContext(ctx, id); err != nil {
 		return err
 	}
+	if err := s.semanticStore.DeleteBase(ctx, id); err != nil {
+		return err
+	}
 	if err := s.raw.DeleteBase(id); err != nil {
 		return err
 	}

@@ -104,6 +104,22 @@ func (s *Store) ActivateCompilation(ctx context.Context, baseID string, generati
 	})
 }
 
+// RetireActiveCompilation removes semantic memory from visibility without
+// deleting immutable history. It is the conservative degradation path when
+// synchronous delete propagation fails.
+func (s *Store) RetireActiveCompilation(ctx context.Context, baseID string) error {
+	result, err := s.db.ExecPriority(ctx, storage.ControlWrite, `UPDATE knowledge_compilations
+		SET state = ?, completed_at = COALESCE(completed_at, strftime('%s','now'))
+		WHERE base_id = ? AND state = ?`, CompilationRetired, baseID, CompilationActive)
+	if err != nil {
+		return err
+	}
+	if changed(result) == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // FailCompilation records a terminal failed build without exposing it.
 func (s *Store) FailCompilation(ctx context.Context, baseID string, generation int64) error {
 	result, err := s.db.ExecPriority(ctx, storage.NormalWrite, `UPDATE knowledge_compilations
@@ -580,4 +596,111 @@ func changed(result sql.Result) int64 {
 	}
 	n, _ := result.RowsAffected()
 	return n
+}
+
+// DocumentChange is one durable incremental-compilation input.
+type DocumentChange struct {
+	BaseID             string
+	DocumentID         string
+	ChangeType         string
+	IndexGeneration    int64
+	SourceVersion      int64
+	ContentHash        string
+	CreatedAt          int64
+	UpdatedAt          int64
+	ResolvedGeneration int64
+}
+
+// MarkDocumentChanged records an unresolved update or delete. The row is keyed
+// per document, so repeated changes collapse to the latest observable state.
+func (s *Store) MarkDocumentChanged(ctx context.Context, change DocumentChange) error {
+	if change.ChangeType != "updated" && change.ChangeType != "deleted" {
+		return fmt.Errorf("unsupported semantic document change %q", change.ChangeType)
+	}
+	if strings.TrimSpace(change.BaseID) == "" || strings.TrimSpace(change.DocumentID) == "" {
+		return fmt.Errorf("semantic document change lacks base/document identity")
+	}
+	if change.CreatedAt <= 0 || change.UpdatedAt <= 0 {
+		return fmt.Errorf("semantic document change %s lacks timestamps", change.DocumentID)
+	}
+	_, err := s.db.ExecPriority(ctx, storage.NormalWrite, `INSERT INTO knowledge_compilation_queue
+		(base_id, doc_id, change_type, index_generation, source_version, content_hash,
+		 created_at, updated_at, resolved_generation)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+		ON CONFLICT(base_id, doc_id) DO UPDATE SET
+		  change_type = excluded.change_type,
+		  index_generation = excluded.index_generation,
+		  source_version = excluded.source_version,
+		  content_hash = excluded.content_hash,
+		  updated_at = excluded.updated_at,
+		  resolved_generation = NULL`,
+		change.BaseID, change.DocumentID, change.ChangeType, change.IndexGeneration,
+		change.SourceVersion, change.ContentHash, change.CreatedAt, change.UpdatedAt)
+	return err
+}
+
+// DeleteBase removes every semantic compilation and queue record for a base.
+// It is used only after base-scoped evidence cleanup has completed.
+func (s *Store) DeleteBase(ctx context.Context, baseID string) error {
+	return s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM knowledge_unit_derived_from
+			WHERE unit_id IN (SELECT id FROM knowledge_units WHERE base_id = ?)
+			   OR derived_unit_id IN (SELECT id FROM knowledge_units WHERE base_id = ?)`,
+			baseID, baseID); err != nil {
+			return err
+		}
+		simpleStatements := []string{
+			`DELETE FROM knowledge_unit_sources WHERE unit_id IN
+				(SELECT id FROM knowledge_units WHERE base_id = ?)`,
+			`DELETE FROM knowledge_relation_sources WHERE relation_id IN
+				(SELECT id FROM knowledge_relations WHERE base_id = ?)`,
+			`DELETE FROM knowledge_relations WHERE base_id = ?`,
+			`DELETE FROM knowledge_units WHERE base_id = ?`,
+			`DELETE FROM knowledge_compilations WHERE base_id = ?`,
+			`DELETE FROM knowledge_compilation_queue WHERE base_id = ?`,
+		}
+		for _, statement := range simpleStatements {
+			if _, err := tx.ExecContext(ctx, statement, baseID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PendingDocumentChanges returns the unresolved changes in deterministic
+// document order. It is the restart-recovery work list for a base.
+func (s *Store) PendingDocumentChanges(ctx context.Context, baseID string) ([]DocumentChange, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT base_id, doc_id, change_type,
+		index_generation, source_version, content_hash, created_at, updated_at,
+		COALESCE(resolved_generation, 0)
+		FROM knowledge_compilation_queue
+		WHERE base_id = ? AND resolved_generation IS NULL ORDER BY doc_id`, baseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DocumentChange
+	for rows.Next() {
+		var change DocumentChange
+		if err := rows.Scan(&change.BaseID, &change.DocumentID, &change.ChangeType,
+			&change.IndexGeneration, &change.SourceVersion, &change.ContentHash,
+			&change.CreatedAt, &change.UpdatedAt, &change.ResolvedGeneration); err != nil {
+			return nil, err
+		}
+		out = append(out, change)
+	}
+	return out, rows.Err()
+}
+
+// ResolveDocumentChanges marks every pending row consumed by a generation.
+func (s *Store) ResolveDocumentChanges(ctx context.Context, baseID string, generation, resolvedAt int64) error {
+	if generation <= 0 || resolvedAt <= 0 {
+		return fmt.Errorf("semantic resolution requires generation and timestamp")
+	}
+	_, err := s.db.ExecPriority(ctx, storage.NormalWrite, `UPDATE knowledge_compilation_queue
+		SET resolved_generation = ?, updated_at = ?
+		WHERE base_id = ? AND resolved_generation IS NULL`,
+		generation, resolvedAt, baseID)
+	return err
 }

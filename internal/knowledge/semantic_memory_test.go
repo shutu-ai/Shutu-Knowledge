@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -68,16 +69,72 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 	if err != nil || len(after.Hits) == 0 {
 		t.Fatalf("0.3 search after compilation: hits=%d err=%v", len(after.Hits), err)
 	}
-	second, err := service.CompileSemanticMemory(ctx, base.ID)
+	unchanged, err := service.CompileSemanticMemory(ctx, base.ID)
 	if err != nil {
-		t.Fatalf("second CompileSemanticMemory: %v", err)
+		t.Fatalf("no-op CompileSemanticMemory: %v", err)
 	}
-	if second.Generation <= compiled.Generation {
-		t.Fatalf("generation did not advance: %d then %d", compiled.Generation, second.Generation)
+	if unchanged.Generation != compiled.Generation {
+		t.Fatalf("unchanged compilation generation = %d, want %d", unchanged.Generation, compiled.Generation)
+	}
+
+	third, err := service.AddTextDocument(ctx, base.ID, "Incremental Vector", "# Vector Retrieval\n\nThe vector service uses 1024-dimensional vectors.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	incremental, err := service.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("incremental CompileSemanticMemory: %v", err)
+	}
+	if incremental.Generation <= compiled.Generation {
+		t.Fatalf("incremental generation did not advance: %d then %d", compiled.Generation, incremental.Generation)
+	}
+	summaryCount := 0
+	for _, unit := range incremental.Units {
+		if unit.Type == semantic.UnitSummary {
+			summaryCount++
+		}
+	}
+	if summaryCount != 3 {
+		t.Fatalf("incremental summaries = %d, want 3", summaryCount)
+	}
+
+	if err := service.DeleteDocument(third.ID); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := service.GetSemanticCompilation(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("delete propagation left no active generation: %v", err)
+	}
+	if deleted.Generation <= incremental.Generation {
+		t.Fatalf("delete generation did not advance: %d then %d", incremental.Generation, deleted.Generation)
+	}
+	for _, unit := range deleted.Units {
+		if unit.Type != semantic.UnitSummary {
+			continue
+		}
+		if unit.CanonicalKey == fmt.Sprintf("summary:doc:%s:source:%d", third.ID, third.SourceVersion) {
+			t.Fatalf("deleted summary survived propagation: %+v", unit)
+		}
+		sources, err := service.ResolveSemanticUnitEvidence(ctx, unit.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range sources {
+			if source.DocumentID == third.ID {
+				t.Fatalf("deleted evidence survived propagation: %+v", source)
+			}
+		}
+	}
+	noop, err := service.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("post-delete no-op compile: %v", err)
+	}
+	if noop.Generation != deleted.Generation {
+		t.Fatalf("post-delete no-op generation = %d, want %d", noop.Generation, deleted.Generation)
 	}
 	active, err := service.GetSemanticCompilation(ctx, base.ID)
-	if err != nil || active.Generation != second.Generation {
-		t.Fatalf("active generation = %d, want %d: %v", active.Generation, second.Generation, err)
+	if err != nil || active.Generation != deleted.Generation {
+		t.Fatalf("active generation = %d, want %d: %v", active.Generation, deleted.Generation, err)
 	}
 }
 

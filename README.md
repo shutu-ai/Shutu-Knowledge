@@ -43,6 +43,9 @@ readiness and out-of-box runtime parity are intentionally separate statuses.
 Key documents:
 
 - [docs/architecture.md](docs/architecture.md) — technical design
+- [docs/0.4_reference_research.md](docs/0.4_reference_research.md) — 0.4 mechanism research
+- [docs/0.4_gap_analysis.md](docs/0.4_gap_analysis.md) — 0.3-to-0.4 capability gap audit
+- [docs/0.4_knowledge_model.md](docs/0.4_knowledge_model.md) — 0.4 Knowledge Unit and storage foundation
 - [docs/agent_contract_mapping.md](docs/agent_contract_mapping.md) — capability-to-contract mapping
 - [docs/dsh_knowledge_capability_inventory.md](docs/dsh_knowledge_capability_inventory.md) — audited reference behavior
 - [docs/dsh_knowledge_equivalence_matrix.md](docs/dsh_knowledge_equivalence_matrix.md) — parity tracking

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"golang.org/x/net/html"
 )
 
@@ -19,7 +20,7 @@ func (htmlParser) Parse(_ string, data []byte) (Result, error) {
 	if strings.TrimSpace(text) == "" {
 		return Result{}, fmt.Errorf("contains no extractable text")
 	}
-	return Result{Title: title, Text: text}, nil
+	return Result{Title: title, Text: text, IR: documentir.FromText(title, text, "html", "builtin-v1"), Parser: "html", ParserVersion: "builtin-v1"}, nil
 }
 
 var skipElements = map[string]bool{

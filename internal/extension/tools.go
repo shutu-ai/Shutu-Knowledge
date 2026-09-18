@@ -100,6 +100,10 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			SourceTypes   []string `json:"sourceTypes"`
 			UpdatedAfter  int64    `json:"updatedAfter"`
 			UpdatedBefore int64    `json:"updatedBefore"`
+			Pages         []int    `json:"pages"`
+			Slides        []int    `json:"slides"`
+			Sheets        []string `json:"sheets"`
+			NodeTypes     []string `json:"nodeTypes"`
 			ExtraQueries  []string `json:"extraQueries"`
 		}
 		if err := decodeArguments(request.Arguments, &args); err != nil {
@@ -117,10 +121,11 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 			Query: args.Query, Queries: args.ExtraQueries, BaseID: args.BaseID,
 			TopK: args.TopK, Mode: args.Mode,
 		}
-		if args.DocIDs != nil || args.TitleIncludes != "" || args.SourceTypes != nil || args.UpdatedAfter != 0 || args.UpdatedBefore != 0 {
+		if args.DocIDs != nil || args.TitleIncludes != "" || args.SourceTypes != nil || args.UpdatedAfter != 0 || args.UpdatedBefore != 0 || args.Pages != nil || args.Slides != nil || args.Sheets != nil || args.NodeTypes != nil {
 			req.Filter = &knowledge.SearchFilter{
 				DocIDs: args.DocIDs, TitleIncludes: args.TitleIncludes, SourceTypes: args.SourceTypes,
 				UpdatedAfter: args.UpdatedAfter, UpdatedBefore: args.UpdatedBefore,
+				Structure: &knowledge.StructureFilter{Pages: args.Pages, Slides: args.Slides, Sheets: args.Sheets, NodeTypes: args.NodeTypes},
 			}
 		}
 		result, err := service.Search(ctx, req)
@@ -708,6 +713,20 @@ func citations(hits []knowledge.SearchHit) []string {
 		source := hit.DocumentTitle
 		if hit.Heading != "" {
 			source += " / " + hit.Heading
+		}
+		if hit.Citation != nil {
+			if hit.Citation.Page > 0 {
+				source += fmt.Sprintf(" / page %d", hit.Citation.Page)
+			}
+			if hit.Citation.Slide > 0 {
+				source += fmt.Sprintf(" / slide %d", hit.Citation.Slide)
+			}
+			if hit.Citation.Sheet != "" {
+				source += " / sheet " + hit.Citation.Sheet
+			}
+			if hit.Citation.CellRange != "" {
+				source += "!" + hit.Citation.CellRange
+			}
 		}
 		var quote strings.Builder
 		for _, line := range strings.Split(hit.Text, "\n") {

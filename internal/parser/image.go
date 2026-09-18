@@ -7,6 +7,8 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"path/filepath"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 )
 
 // imageParser validates raster image uploads and deliberately leaves text
@@ -25,5 +27,5 @@ func (imageParser) Parse(fileName string, data []byte) (Result, error) {
 	if config.Width <= 0 || config.Height <= 0 {
 		return Result{}, fmt.Errorf("image has no pixels")
 	}
-	return Result{Title: filepath.Base(fileName), NeedsOCR: true}, nil
+	return Result{Title: filepath.Base(fileName), IR: &documentir.Document{IRVersion: documentir.Version, Title: filepath.Base(fileName), Parser: "image", ParserVersion: "builtin-v1"}, Parser: "image", ParserVersion: "builtin-v1", NeedsOCR: true}, nil
 }

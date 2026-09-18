@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	pdftext "github.com/ledongthuc/pdf"
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 )
 
 // pdfParser extracts a PDF text layer with a pure-Go reader. Poorly shaped
@@ -30,7 +31,7 @@ func (pdfParser) Parse(_ string, data []byte) (Result, error) {
 	if plainErr != nil {
 		reassembled, layoutErr := reassemblePDFLayout(data)
 		if layoutErr == nil && AverageLineLength(reassembled) >= 12 {
-			return Result{Text: reassembled}, nil
+			return pdfResult(reassembled, data), nil
 		}
 		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
 	}
@@ -40,21 +41,164 @@ func (pdfParser) Parse(_ string, data []byte) (Result, error) {
 	// cannot detect it. Keep the native text as a fallback, but mark it
 	// unhealthy so the ingestion chain can try OCR/reconstruction.
 	if AverageLineLength(plain) >= 5 && !hasReplacementRune(plain) {
-		return Result{Text: plain}, nil
+		return pdfResult(plain, data), nil
 	}
 	reassembled, layoutErr := reassemblePDFLayout(data)
 	if layoutErr == nil && strings.TrimSpace(reassembled) != "" &&
 		AverageLineLength(reassembled) >= 12 && !hasReplacementRune(reassembled) {
-		return Result{Text: reassembled}, nil
+		return pdfResult(reassembled, data), nil
 	}
 	// Preserve the native text for the caller's OCR/fallback chain.
 	if strings.TrimSpace(plain) != "" {
-		return Result{Text: plain, NeedsOCR: true}, nil
+		result := pdfResult(plain, data)
+		result.NeedsOCR = true
+		return result, nil
 	}
 	if plainErr != nil {
 		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
 	}
 	return Result{}, fmt.Errorf("PDF contains no healthy extractable text")
+}
+
+func pdfResult(text string, data []byte) Result {
+	return Result{Text: text, IR: pdfIR(text, data), Parser: "pdf", ParserVersion: "builtin-v1"}
+}
+
+// pdfIR keeps page identity even though the legacy text projection remains a
+// single string. Bounding boxes are intentionally omitted until the parser
+// can prove coordinates for the selected text layer.
+func pdfIR(text string, data []byte) *documentir.Document {
+	d := &documentir.Document{IRVersion: documentir.Version, Parser: "pdf", ParserVersion: "builtin-v1"}
+	d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:document", Type: documentir.TypeDocument, Order: 0, Text: strings.TrimSpace(text), SourceAnchor: documentir.SourceAnchor{Kind: "pdf", LogicalPath: "document"}, Parser: "pdf", ParserVersion: "builtin-v1"})
+	reader, err := pdftext.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return d
+	}
+	for pageNumber := 1; pageNumber <= reader.NumPage(); pageNumber++ {
+		blocks := pdfPageBlocks(reader.Page(pageNumber).Content().Text)
+		lines := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			lines = append(lines, block.text)
+		}
+		pageText := strings.TrimSpace(strings.Join(lines, "\n"))
+		if pageText == "" {
+			continue
+		}
+		anchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, LogicalPath: fmt.Sprintf("page/%d", pageNumber)}
+		pageID := fmt.Sprintf("tmp:page/%d", pageNumber)
+		d.Nodes = append(d.Nodes, documentir.Node{ID: pageID, Type: documentir.TypePage, ParentID: "tmp:document", Order: pageNumber, Text: pageText, PageNumber: pageNumber, SourceAnchor: anchor, Parser: "pdf", ParserVersion: "builtin-v1"})
+		for blockIndex, block := range blocks {
+			typ := documentir.TypeParagraph
+			if block.heading {
+				typ = documentir.TypeHeading
+			}
+			logical := fmt.Sprintf("page/%d/block/%d", pageNumber, blockIndex+1)
+			blockAnchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical, BBox: block.bbox}
+			d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: typ, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+		}
+	}
+	if len(d.Nodes) == 1 && strings.TrimSpace(text) != "" {
+		fallback := documentir.FromText("", text, "pdf", "builtin-v1")
+		return fallback
+	}
+	return d
+}
+
+type pdfIRBlock struct {
+	text       string
+	bbox       *documentir.BBox
+	heading    bool
+	confidence float64
+	y          float64
+}
+
+func pdfPageBlocks(items []pdftext.Text) []pdfIRBlock {
+	usable := make([]pdftext.Text, 0, len(items))
+	heights := make([]float64, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.S) == "" {
+			continue
+		}
+		usable = append(usable, item)
+		h := item.FontSize
+		if h <= 0 {
+			h = 10
+		}
+		heights = append(heights, h)
+	}
+	if len(usable) == 0 {
+		return nil
+	}
+	sort.Float64s(heights)
+	tolerance := heights[len(heights)/2] * 0.6
+	if tolerance <= 0 {
+		tolerance = 6
+	}
+	bands := map[int][]pdftext.Text{}
+	order := []int{}
+	for _, item := range usable {
+		band := int(math.Round(item.Y / tolerance))
+		if _, ok := bands[band]; !ok {
+			order = append(order, band)
+		}
+		bands[band] = append(bands[band], item)
+	}
+	sort.Ints(order)
+	median := heights[len(heights)/2]
+	out := make([]pdfIRBlock, 0, len(order))
+	for _, band := range order {
+		group := bands[band]
+		sort.SliceStable(group, func(i, j int) bool { return group[i].X < group[j].X })
+		var text strings.Builder
+		minX, minY, maxX, maxY := math.MaxFloat64, math.MaxFloat64, -math.MaxFloat64, -math.MaxFloat64
+		large := false
+		for _, item := range group {
+			text.WriteString(item.S)
+			h := item.FontSize
+			if h <= 0 {
+				h = 10
+			}
+			if h > median*1.25 {
+				large = true
+			}
+			if item.X < minX {
+				minX = item.X
+			}
+			if item.Y < minY {
+				minY = item.Y
+			}
+			if item.X+item.W > maxX {
+				maxX = item.X + item.W
+			}
+			if item.Y+h > maxY {
+				maxY = item.Y + h
+			}
+		}
+		value := strings.TrimSpace(text.String())
+		if value == "" {
+			continue
+		}
+		confidence := 0.85
+		if len(group) == 1 {
+			confidence = 0.70
+		}
+		out = append(out, pdfIRBlock{text: value, bbox: &documentir.BBox{X1: minX, Y1: minY, X2: maxX, Y2: maxY}, heading: large || numberedHeading(value), confidence: confidence, y: group[0].Y})
+	}
+	return out
+}
+
+func numberedHeading(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		return r == '#' || r == '.'
+	}
+	return false
 }
 
 func hasReplacementRune(text string) bool {

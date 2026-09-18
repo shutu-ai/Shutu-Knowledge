@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 	"github.com/shutu-ai/shutu-knowledge/internal/retrieval"
@@ -27,11 +28,19 @@ var (
 // SearchFilter narrows a search to a subset of documents (ANDed). A nil
 // slice is unrestricted; an explicitly empty slice matches nothing.
 type SearchFilter struct {
-	DocIDs        []string `json:"docIds,omitempty"`
-	TitleIncludes string   `json:"titleIncludes,omitempty"`
-	SourceTypes   []string `json:"sourceTypes,omitempty"`
-	UpdatedAfter  int64    `json:"updatedAfter,omitempty"`
-	UpdatedBefore int64    `json:"updatedBefore,omitempty"`
+	DocIDs        []string         `json:"docIds,omitempty"`
+	TitleIncludes string           `json:"titleIncludes,omitempty"`
+	SourceTypes   []string         `json:"sourceTypes,omitempty"`
+	UpdatedAfter  int64            `json:"updatedAfter,omitempty"`
+	UpdatedBefore int64            `json:"updatedBefore,omitempty"`
+	Structure     *StructureFilter `json:"structure,omitempty"`
+}
+
+type StructureFilter struct {
+	Pages     []int    `json:"pages,omitempty"`
+	Slides    []int    `json:"slides,omitempty"`
+	Sheets    []string `json:"sheets,omitempty"`
+	NodeTypes []string `json:"nodeTypes,omitempty"`
 }
 
 // SearchRequest is one search.
@@ -85,21 +94,24 @@ type RetrievalDiagnostics struct {
 
 // SearchHit is one ranked result with lane scores and its context window.
 type SearchHit struct {
-	ChunkID         string           `json:"chunkId"`
-	DocID           string           `json:"docId"`
-	BaseID          string           `json:"baseId"`
-	DocumentTitle   string           `json:"documentTitle"`
-	Heading         string           `json:"heading,omitempty"`
-	Index           int              `json:"index"`
-	IndexGeneration int64            `json:"indexGeneration"`
-	SourceVersion   int64            `json:"sourceVersion"`
-	Text            string           `json:"text"`
-	Score           float64          `json:"score"`
-	VectorScore     float64          `json:"vectorScore,omitempty"`
-	LexicalScore    float64          `json:"lexicalScore,omitempty"`
-	FusionScore     float64          `json:"fusionScore,omitempty"`
-	RerankScore     float64          `json:"rerankScore,omitempty"`
-	ContextWindow   *evidence.Window `json:"contextWindow,omitempty"`
+	ChunkID         string                  `json:"chunkId"`
+	DocID           string                  `json:"docId"`
+	BaseID          string                  `json:"baseId"`
+	DocumentTitle   string                  `json:"documentTitle"`
+	Heading         string                  `json:"heading,omitempty"`
+	Index           int                     `json:"index"`
+	IndexGeneration int64                   `json:"indexGeneration"`
+	SourceVersion   int64                   `json:"sourceVersion"`
+	Text            string                  `json:"text"`
+	Score           float64                 `json:"score"`
+	VectorScore     float64                 `json:"vectorScore,omitempty"`
+	LexicalScore    float64                 `json:"lexicalScore,omitempty"`
+	FusionScore     float64                 `json:"fusionScore,omitempty"`
+	RerankScore     float64                 `json:"rerankScore,omitempty"`
+	ContextWindow   *evidence.Window        `json:"contextWindow,omitempty"`
+	NodeIDs         []string                `json:"nodeIds,omitempty"`
+	SourceAnchor    documentir.SourceAnchor `json:"sourceAnchor,omitempty"`
+	Citation        *CitationV2             `json:"citation,omitempty"`
 }
 
 // RerankStatus explains what the reranker did for this search.
@@ -664,6 +676,11 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	}
 
 	final := make([]Chunk, 0, topK)
+	if req.Filter != nil && req.Filter.Structure != nil {
+		if err := s.store.enrichChunkProvenance(ctx, snapshot, ordered); err != nil {
+			return SearchResult{}, err
+		}
+	}
 	for _, c := range ordered {
 		if len(final) == topK {
 			break
@@ -672,6 +689,9 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 			continue
 		}
 		if mode == "hybrid" && laneLexicals[c.ID] <= 0 && laneVectors[c.ID] < defaultVectorRelevanceFloor {
+			continue
+		}
+		if req.Filter != nil && !matchesStructureFilter(c, req.Filter.Structure) {
 			continue
 		}
 		final = append(final, c)
@@ -693,6 +713,9 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 			neighbors[c.DocID] = append(neighbors[c.DocID], c)
 		}
 	}
+	if err := s.store.enrichChunkProvenance(ctx, snapshot, final); err != nil {
+		return SearchResult{}, err
+	}
 
 	titles, err := s.documentTitles(ctx, snapshot, final)
 	if err != nil {
@@ -712,7 +735,18 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 			Score:           laneLexicals[c.ID],
 			VectorScore:     laneVectors[c.ID],
 			LexicalScore:    laneLexicals[c.ID],
+			NodeIDs:         append([]string(nil), c.NodeIDs...),
+			SourceAnchor:    c.SourceAnchor,
 		}
+		citation := &CitationV2{Document: titles[c.DocID], DocumentID: c.DocID, ChunkID: c.ID, Snippet: c.Text}
+		if len(c.NodeIDs) > 0 {
+			citation.NodeID = c.NodeIDs[0]
+		}
+		citation.Page, citation.Slide, citation.Sheet, citation.CellRange, citation.BBox = c.SourceAnchor.Page, c.SourceAnchor.Slide, c.SourceAnchor.Sheet, c.SourceAnchor.CellRange, c.SourceAnchor.BBox
+		if c.SourceAnchor.Section != "" {
+			citation.Section = c.SourceAnchor.Section
+		}
+		hit.Citation = citation
 		if rerankScores != nil {
 			hit.Score = rerankScores[c.ID]
 			hit.RerankScore = rerankScores[c.ID]
@@ -781,6 +815,57 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 		result.Hits = []SearchHit{}
 	}
 	return result, nil
+}
+
+func matchesStructureFilter(c Chunk, filter *StructureFilter) bool {
+	if filter == nil {
+		return true
+	}
+	if len(filter.Pages) > 0 && !containsInt(filter.Pages, c.SourceAnchor.Page) {
+		return false
+	}
+	if len(filter.Slides) > 0 && !containsInt(filter.Slides, c.SourceAnchor.Slide) {
+		return false
+	}
+	if len(filter.Sheets) > 0 && !containsStringFold(filter.Sheets, c.SourceAnchor.Sheet) {
+		return false
+	}
+	if len(filter.NodeTypes) > 0 {
+		found := false
+		for _, want := range filter.NodeTypes {
+			for _, got := range c.NodeTypes {
+				if strings.EqualFold(strings.TrimSpace(want), got) {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func containsInt(values []int, value int) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsStringFold(values []string, value string) bool {
+	for _, item := range values {
+		if strings.EqualFold(strings.TrimSpace(item), strings.TrimSpace(value)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) excludeInvisibleResults(ctx context.Context, result *SearchResult) error {

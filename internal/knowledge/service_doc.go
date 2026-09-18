@@ -18,6 +18,7 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/caption"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"github.com/shutu-ai/shutu-knowledge/internal/embedding"
 	"github.com/shutu-ai/shutu-knowledge/internal/parser"
 )
@@ -373,6 +374,17 @@ func (s *Service) GetDocumentWithContext(ctx context.Context, id string, include
 		}
 	}
 	return doc, chunks, nil
+}
+
+// GetDocumentIR returns the active generation's structured document view.
+// Legacy documents imported before 0.3 return a valid empty IR rather than
+// exposing an implementation-specific storage error.
+func (s *Service) GetDocumentIR(ctx context.Context, id string) (documentir.Document, error) {
+	return s.store.listDocumentIR(ctx, id)
+}
+
+func (s *Service) GetDerivedKnowledge(ctx context.Context, id string) ([]DerivedKnowledge, error) {
+	return s.store.listDerivedKnowledge(ctx, id)
 }
 
 // GetDocumentIncludingDeleting is restricted to operation recovery paths. A
@@ -1373,11 +1385,38 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if text == "" {
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, fmt.Errorf("contains no extractable text"))
 	}
+	opts := s.chunkOptions(cfg)
+	if doc.IR == nil || len(doc.IR.Nodes) == 0 {
+		parserName := "text"
+		if doc.SourceType == "file" {
+			parserName = parser.ExtensionOf(doc.FileName)
+		}
+		doc.IR = documentir.FromText(doc.Title, text, parserName, "builtin-v1")
+	}
+	doc.IR.Title = doc.Title
+	doc.IR.ParseConfig = map[string]string{
+		"ocrMode":   s.resolveOCRMode(cfg),
+		"processor": strings.TrimSpace(cfg.Processor),
+		"chunkMode": map[bool]string{true: "smart", false: "delimiter"}[opts.Smart],
+	}
+	if err := doc.IR.BindDocument(doc.ID); err != nil {
+		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
+	}
+	s.recordMetric(func(m *MetricsSnapshot) {
+		m.NodeCount += int64(len(doc.IR.Nodes))
+		for _, node := range doc.IR.Nodes {
+			if node.Type == documentir.TypeTable || node.Type == documentir.TypeTableCell {
+				m.TableCount++
+			}
+			if node.Type == documentir.TypeFigure {
+				m.FigureCount++
+			}
+		}
+	})
 	doc.RawText = text
 	doc.CharCount = len([]rune(text))
 	doc.TokenCount = chunk.EstimateTokens(text)
 
-	opts := s.chunkOptions(cfg)
 	embeddingStarted := Now()
 	pieces, inlineVectors := s.buildPieces(ctx, text, doc, opts, providers.embedder)
 	s.recordMetric(func(m *MetricsSnapshot) { m.EmbeddingDurationMS += durationMS(embeddingStarted) })
@@ -1400,6 +1439,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			Context:   contextText,
 			CreatedAt: now(),
 		}
+		c.NodeIDs, c.SourceAnchor = nodesForPiece(doc.IR, piece.Text, piece.Heading)
 		c.EmbeddingText = strings.TrimSpace(c.Context + " " + c.Text)
 		c.EmbeddingHash = hashText(c.EmbeddingText)
 		if inlineVectors != nil {
@@ -1418,7 +1458,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		targetModelKey = providers.embedder.ModelKey()
 	}
 	dbTransactionStarted := Now()
-	generation, err := s.store.putChunksReplace(ctx, rows, targetModelKey)
+	generation, err := s.store.putChunksReplace(ctx, rows, targetModelKey, doc.IR)
 	s.recordMetric(func(m *MetricsSnapshot) {
 		m.DBTransactionMS += durationMS(dbTransactionStarted)
 	})
@@ -1488,6 +1528,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 			if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
 				return s.failDocumentContext(ctx, doc, code, err)
 			}
+			doc.ActiveIndexGen = generation
 			rawPaths, pruneErr := s.store.pruneRetiredGenerationsWithContext(ctx, doc.ID, generation)
 			if pruneErr != nil {
 				return pruneErr
@@ -1499,6 +1540,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 				if err := s.raw.Delete(rawPath); err != nil {
 					return err
 				}
+			}
+			if err := s.refreshDerivedKnowledge(ctx, doc); err != nil {
+				return err
 			}
 			return nil
 		}
@@ -1518,6 +1562,7 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
+	doc.ActiveIndexGen = generation
 	rawPaths, err := s.store.pruneRetiredGenerationsWithContext(ctx, doc.ID, generation)
 	if err != nil {
 		return err
@@ -1529,6 +1574,9 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		if err := s.raw.Delete(rawPath); err != nil {
 			return err
 		}
+	}
+	if err := s.refreshDerivedKnowledge(ctx, doc); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1550,6 +1598,7 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 			APIHost: cfg.MineruAPIHost,
 		})
 		if err == nil && strings.TrimSpace(markdown) != "" {
+			doc.IR = documentir.FromText("", markdown, "mineru", "remote")
 			return markdown, "", nil
 		}
 	}
@@ -1559,6 +1608,9 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 		return "", "", ctxErr
 	}
 	nativeAvailable := parseErr == nil && strings.TrimSpace(parsed.Text) != ""
+	if parsed.IR != nil {
+		doc.IR = parsed.IR
+	}
 	// The parser may still provide fragmented native text while requesting a
 	// healthier OCR pass (upstream's text-layer health behavior).
 	nativeOK := nativeAvailable && !parsed.NeedsOCR
@@ -1800,7 +1852,7 @@ func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, o
 		embedder = providers[0]
 	}
 	if !opts.Semantic || embedder == nil || embedder.ModelKey() == "none" {
-		return s.structuralPieces(text, opts), nil
+		return s.structureAwarePieces(text, doc.IR, opts), nil
 	}
 	segments := chunk.SemanticSegments(text, opts.Separator)
 	if len(segments) == 0 {
@@ -1833,6 +1885,98 @@ func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, o
 func (s *Service) structuralPieces(text string, opts ChunkOptions) []chunk.Piece {
 	pieces := chunk.Chunk(text, opts.Size, opts.Overlap, chunk.Options{Smart: &opts.Smart, Separator: opts.Separator})
 	return chunk.RefineByTokenLimit(pieces, opts.TokenLimit, nil)
+}
+
+// structureAwarePieces keeps hard page/slide/sheet/table boundaries intact
+// before applying the existing paragraph/token chunker. It is deliberately a
+// small projection, not a second chunking engine.
+func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opts ChunkOptions) []chunk.Piece {
+	if ir == nil {
+		return s.structuralPieces(text, opts)
+	}
+	var pieces []chunk.Piece
+	for _, node := range ir.Nodes {
+		if node.Type != documentir.TypePage && node.Type != documentir.TypeSlide && node.Type != documentir.TypeSheet && node.Type != documentir.TypeTable && node.Type != documentir.TypeSection {
+			continue
+		}
+		if strings.TrimSpace(node.Text) == "" {
+			continue
+		}
+		heading := strings.Join(node.HeadingPath, " / ")
+		if heading == "" {
+			switch node.Type {
+			case documentir.TypePage:
+				heading = fmt.Sprintf("Page %d", node.PageNumber)
+			case documentir.TypeSlide:
+				heading = fmt.Sprintf("Slide %d", node.SlideNumber)
+			case documentir.TypeSheet:
+				heading = node.SheetName
+			case documentir.TypeTable:
+				heading = "Table"
+			}
+		}
+		for _, piece := range chunk.Chunk(node.Text, opts.Size, opts.Overlap, chunk.Options{Smart: &opts.Smart, Separator: opts.Separator}) {
+			piece.Heading = strings.TrimSpace(heading)
+			pieces = append(pieces, piece)
+		}
+	}
+	if len(pieces) == 0 {
+		return s.structuralPieces(text, opts)
+	}
+	return chunk.RefineByTokenLimit(pieces, opts.TokenLimit, nil)
+}
+
+func nodesForPiece(ir *documentir.Document, text, heading string) ([]string, documentir.SourceAnchor) {
+	if ir == nil {
+		return nil, documentir.SourceAnchor{}
+	}
+	target := strings.TrimSpace(chunk.Normalize(text))
+	var ids []string
+	var anchor documentir.SourceAnchor
+	bestAnchorScore := -1
+	seen := map[string]bool{}
+	for _, node := range ir.Nodes {
+		if node.Type == documentir.TypeDocument || strings.TrimSpace(node.Text) == "" {
+			continue
+		}
+		nodeText := strings.TrimSpace(chunk.Normalize(node.Text))
+		match := nodeText != "" && (strings.Contains(nodeText, target) || strings.Contains(target, nodeText))
+		if !match && heading != "" && strings.Contains(strings.Join(node.HeadingPath, " "), strings.TrimSpace(heading)) {
+			match = true
+		}
+		if !match || seen[node.ID] {
+			continue
+		}
+		seen[node.ID] = true
+		ids = append(ids, node.ID)
+		score := 20
+		switch node.Type {
+		case documentir.TypeTableCell:
+			score = 100
+		case documentir.TypeParagraph, documentir.TypeBlock, documentir.TypeHeading:
+			score = 80
+		case documentir.TypeCaption, documentir.TypeFigure:
+			score = 70
+		}
+		if anchor.Kind == "" || score > bestAnchorScore {
+			anchor = node.SourceAnchor
+			bestAnchorScore = score
+		}
+		if len(ids) >= 8 {
+			break
+		}
+	}
+	if len(ids) == 0 {
+		for _, node := range ir.Nodes {
+			if node.Type == documentir.TypeDocument {
+				continue
+			}
+			ids = append(ids, node.ID)
+			anchor = node.SourceAnchor
+			break
+		}
+	}
+	return ids, anchor
 }
 
 // embedChunks embeds the stored chunks in batches, reusing stored vectors by

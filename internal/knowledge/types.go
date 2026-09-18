@@ -3,7 +3,11 @@
 // values only — no Agent or storage types leak out of this package.
 package knowledge
 
-import "time"
+import (
+	"time"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
+)
 
 // BaseConfig carries per-base overrides; empty fields inherit the global
 // configuration at resolve time.
@@ -121,6 +125,9 @@ type Document struct {
 	ContentHash       string `json:"contentHash,omitempty"`
 	RawFilePath       string `json:"rawFilePath,omitempty"`
 	RawText           string `json:"-"`
+	// IR is runtime state; its durable generation-scoped form is stored in
+	// document_nodes and published with the same fence as chunks.
+	IR *documentir.Document `json:"-"`
 	// TitleLocked is internal state: user-named titles survive source
 	// refresh, while source-derived titles follow metadata changes.
 	TitleLocked    bool   `json:"-"`
@@ -162,16 +169,35 @@ type Chunk struct {
 	EmbeddingHash string `json:"-"`
 	// EmbeddingVec/EmbeddingModel are set on the semantic-chunking insert
 	// path; the regular phase-3 path persists vectors via PutChunkVectors.
-	EmbeddingVec    []float64 `json:"-"`
-	EmbeddingModel  string    `json:"-"`
-	CreatedAt       int64     `json:"-"`
-	HasEmbedding    bool      `json:"-"`
-	IndexGeneration int64     `json:"-"`
-	SourceVersion   int64     `json:"-"`
+	EmbeddingVec    []float64               `json:"-"`
+	EmbeddingModel  string                  `json:"-"`
+	CreatedAt       int64                   `json:"-"`
+	HasEmbedding    bool                    `json:"-"`
+	IndexGeneration int64                   `json:"-"`
+	SourceVersion   int64                   `json:"-"`
+	NodeIDs         []string                `json:"-"`
+	NodeTypes       []string                `json:"-"`
+	SourceAnchor    documentir.SourceAnchor `json:"-"`
 	// Stage values are used only while inserting a new generation before it
 	// becomes active. They keep reusable vectors attached to the new rows.
 	StageEmbedding      []byte `json:"-"`
 	StageEmbeddingModel string `json:"-"`
+}
+
+// CitationV2 is an additive source anchor. Legacy callers can continue using
+// document/chunk IDs while newer callers get the most precise parser anchor.
+type CitationV2 struct {
+	Document   string           `json:"document,omitempty"`
+	DocumentID string           `json:"documentId,omitempty"`
+	Page       int              `json:"page,omitempty"`
+	Slide      int              `json:"slide,omitempty"`
+	Sheet      string           `json:"sheet,omitempty"`
+	Section    string           `json:"section,omitempty"`
+	NodeID     string           `json:"nodeId,omitempty"`
+	ChunkID    string           `json:"chunkId,omitempty"`
+	BBox       *documentir.BBox `json:"bbox,omitempty"`
+	CellRange  string           `json:"cellRange,omitempty"`
+	Snippet    string           `json:"snippet,omitempty"`
 }
 
 // DocumentSummary is the list view of a document.

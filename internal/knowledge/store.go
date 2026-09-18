@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
@@ -1081,13 +1082,86 @@ func insertChunkTx(ctx context.Context, tx *sql.Tx, c Chunk) error {
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.DocID, c.BaseID, c.Index, c.Text, heading, c.Context, embedding, model, hash, c.CreatedAt, c.IndexGeneration,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	for order, nodeID := range c.NodeIDs {
+		if strings.TrimSpace(nodeID) == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chunk_node_links
+			(doc_id, index_generation, chunk_id, node_id, link_order)
+			VALUES (?, ?, ?, ?, ?)`, c.DocID, c.IndexGeneration, c.ID, nodeID, order); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func insertDocumentIRTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document, docID string, generation int64) error {
+	if ir == nil {
+		return nil
+	}
+	if ir.DocumentID != docID {
+		return fmt.Errorf("IR document ID %q does not match %q", ir.DocumentID, docID)
+	}
+	if err := ir.Validate(); err != nil {
+		return err
+	}
+	parseConfig, _ := json.Marshal(ir.ParseConfig)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO document_parse_metadata
+		(doc_id, index_generation, ir_version, parser, parser_version, parse_config)
+		VALUES (?, ?, ?, ?, ?, ?)`, docID, generation, ir.IRVersion, ir.Parser, ir.ParserVersion, string(parseConfig)); err != nil {
+		return err
+	}
+	for _, node := range ir.Nodes {
+		heading, _ := json.Marshal(node.HeadingPath)
+		anchor, _ := json.Marshal(node.SourceAnchor)
+		metadata, _ := json.Marshal(node.Metadata)
+		var bbox any
+		if node.BBox != nil {
+			data, _ := json.Marshal(node.BBox)
+			bbox = string(data)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO document_nodes
+			(doc_id, index_generation, node_id, parent_node_id, node_type, node_order,
+			 text, heading_path, source_anchor, page_number, slide_number, sheet_name,
+			 bbox, metadata, parser, parser_version, confidence)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			docID, generation, node.ID, irNullableString(node.ParentID), node.Type, node.Order,
+			node.Text, string(heading), string(anchor), irNullableInt(node.PageNumber), irNullableInt(node.SlideNumber), irNullableString(node.SheetName),
+			bbox, string(metadata), node.Parser, node.ParserVersion, node.Confidence); err != nil {
+			return err
+		}
+	}
+	for _, relation := range ir.Relationships {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO document_relationships
+			(doc_id, index_generation, relationship_id, from_node_id, to_node_id,
+			 relationship_type, relationship_order) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			docID, generation, relation.ID, relation.FromNodeID, relation.ToNodeID, relation.Type, relation.Order); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func irNullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+func irNullableInt(value int) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 
 // putChunksReplace stages a new generation without deleting the active one.
 // Activation happens only after the caller has validated and embedded the
 // staged rows; a crash therefore leaves the old searchable version intact.
-func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetModelKey string) (int64, error) {
+func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetModelKey string, irs ...*documentir.Document) (int64, error) {
 	const batchSize = 256
 	if len(chunks) == 0 {
 		return 0, nil
@@ -1096,6 +1170,10 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 		return 0, err
 	}
 	docID := chunks[0].DocID
+	var ir *documentir.Document
+	if len(irs) > 0 {
+		ir = irs[0]
+	}
 	s.stageMu.Lock()
 	defer s.stageMu.Unlock()
 
@@ -1117,6 +1195,11 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks
 		WHERE doc_id = ? AND index_generation > ?`, docID, current.ActiveIndexGen); err != nil {
 			return err
+		}
+		for _, table := range []string{"document_nodes", "document_relationships", "chunk_node_links", "document_parse_metadata"} {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE doc_id = ? AND index_generation > ?`, docID, current.ActiveIndexGen); err != nil {
+				return err
+			}
 		}
 		// Carry over stored vectors whose embedding-text hash survives the
 		// re-chunk and whose model identity equals the target space. Hash equality
@@ -1189,6 +1272,11 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 			if !current.HasDesiredIndexGen || current.DesiredIndexGen != generation || current.IndexState != IndexStateBuilding {
 				return ErrConflict
 			}
+			if start == 0 {
+				if err := insertDocumentIRTx(ctx, tx, ir, docID, generation); err != nil {
+					return err
+				}
+			}
 			for _, chunk := range batch {
 				if err := insertChunkTx(ctx, tx, chunk); err != nil {
 					return err
@@ -1244,6 +1332,12 @@ func (s *store) clearStagedGeneration(ctx context.Context, docID string, expecte
 		if err != nil || affected < batchSize {
 			if err != nil {
 				return err
+			}
+			for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata"} {
+				if _, cleanupErr := s.db.ExecPriority(ctx, storage.ControlWrite,
+					`DELETE FROM `+table+` WHERE doc_id = ? AND index_generation = ?`, docID, generation); cleanupErr != nil {
+					return cleanupErr
+				}
 			}
 			break
 		}
@@ -1578,6 +1672,11 @@ func (s *store) deleteChunks(docID string) error {
 	if _, err := s.db.Exec(`DELETE FROM chunks WHERE doc_id = ?`, docID); err != nil {
 		return err
 	}
+	for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata", "derived_knowledge"} {
+		if _, err := s.db.Exec(`DELETE FROM `+table+` WHERE doc_id = ?`, docID); err != nil {
+			return err
+		}
+	}
 	s.invalidateStatsCache()
 	return nil
 }
@@ -1607,6 +1706,12 @@ func (s *store) deleteDocumentGenerationWithContext(ctx context.Context, docID s
 			return err
 		}
 		if affected < batchSize {
+			for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata"} {
+				if _, cleanupErr := s.db.ExecPriority(ctx, storage.ControlWrite,
+					`DELETE FROM `+table+` WHERE doc_id = ? AND index_generation = ?`, docID, generation); cleanupErr != nil {
+					return cleanupErr
+				}
+			}
 			return nil
 		}
 		s.invalidateStatsCache()
@@ -1669,6 +1774,11 @@ func (s *store) deleteDocumentGenerationsWithContext(ctx context.Context, docID 
 	if _, err := s.db.ExecPriority(ctx, storage.ControlWrite, `DELETE FROM document_generations WHERE doc_id = ?`, docID); err != nil {
 		return nil, err
 	}
+	for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata", "derived_knowledge"} {
+		if _, err := s.db.ExecPriority(ctx, storage.ControlWrite, `DELETE FROM `+table+` WHERE doc_id = ?`, docID); err != nil {
+			return nil, err
+		}
+	}
 	s.invalidateStatsCache()
 	return rawPaths, nil
 }
@@ -1698,11 +1808,16 @@ func (s *store) deleteChunksByBaseWithContext(ctx context.Context, baseID string
 			return err
 		}
 		if affected == 0 {
+			for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata", "derived_knowledge"} {
+				if _, cleanupErr := s.db.ExecPriority(ctx, storage.ControlWrite, `DELETE FROM `+table+` WHERE doc_id IN (SELECT id FROM documents WHERE base_id = ?)`, baseID); cleanupErr != nil {
+					return cleanupErr
+				}
+			}
 			return nil
 		}
 		s.invalidateStatsCache()
 		if affected < batchSize {
-			return nil
+			continue
 		}
 	}
 }

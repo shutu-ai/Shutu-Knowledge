@@ -53,6 +53,8 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("POST /api/documents/reindex", s.reindexDocuments)
 	mux.HandleFunc("POST /api/documents/{id}/delete-tree", s.deleteDocumentTree)
 	mux.HandleFunc("GET /api/documents/{id}/chunks", s.listChunks)
+	mux.HandleFunc("GET /api/documents/{id}/structure", s.documentStructure)
+	mux.HandleFunc("GET /api/documents/{id}/understanding", s.documentUnderstanding)
 	mux.HandleFunc("GET /api/documents/{id}/raw", s.rawDocument)
 	mux.HandleFunc("POST /api/documents/{id}/reindex", s.reindexOne)
 	mux.HandleFunc("GET /api/jobs/{id}", s.jobStatus)
@@ -513,6 +515,24 @@ func (s *Server) documentContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, window)
+}
+
+func (s *Server) documentStructure(w http.ResponseWriter, r *http.Request) {
+	ir, err := s.app.Knowledge.GetDocumentIR(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, ir)
+}
+
+func (s *Server) documentUnderstanding(w http.ResponseWriter, r *http.Request) {
+	items, err := s.app.Knowledge.GetDerivedKnowledge(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, map[string]any{"items": items})
 }
 
 func (s *Server) listDocuments(w http.ResponseWriter, r *http.Request) {

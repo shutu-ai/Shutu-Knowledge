@@ -18,6 +18,10 @@ type MetricsSnapshot struct {
 	FTSTimeMS           int64 `json:"ftsTimeMs"`
 	VectorTimeMS        int64 `json:"vectorTimeMs"`
 	ChunkCount          int64 `json:"chunkCount"`
+	NodeCount           int64 `json:"nodeCount"`
+	TableCount          int64 `json:"tableCount"`
+	FigureCount         int64 `json:"figureCount"`
+	ParserFallbacks     int64 `json:"parserFallbacks"`
 	EmbeddingDurationMS int64 `json:"embeddingDurationMs"`
 	Searches            int64 `json:"searches"`
 	SearchDurationMS    int64 `json:"searchDurationMs"`

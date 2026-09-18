@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
@@ -21,6 +22,11 @@ import (
 type Result struct {
 	Title string
 	Text  string
+	// IR is the structured projection. Text remains the compatibility
+	// projection consumed by the existing ingestion and retrieval paths.
+	IR            *documentir.Document
+	Parser        string
+	ParserVersion string
 	// NeedsOCR marks a technically readable but fragmented/corrupt text
 	// layer. Callers should try OCR while retaining Text as a last resort.
 	NeedsOCR bool
@@ -189,7 +195,7 @@ func (textParser) Parse(_ string, data []byte) (Result, error) {
 	if strings.TrimSpace(text) == "" {
 		return Result{}, fmt.Errorf("contains no extractable text")
 	}
-	return Result{Text: text}, nil
+	return Result{Text: text, IR: documentir.FromText("", text, "text", "builtin-v1"), Parser: "text", ParserVersion: "builtin-v1"}, nil
 }
 
 // DecodeText decodes bytes as UTF-8 (BOM-aware), falling back to GB18030

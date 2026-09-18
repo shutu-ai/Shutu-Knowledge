@@ -1922,6 +1922,7 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 			break
 		}
 	}
+	useLeafStructure := ir.Parser == "docx" || ir.Parser == "epub"
 	var pieces []chunk.Piece
 	for _, node := range ir.Nodes {
 		include := false
@@ -1935,7 +1936,7 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 			// Page/slide nodes are already aggregate reading-order units. Office
 			// and text documents without those containers retain their leaf
 			// paragraph/list/heading boundaries here.
-			include = !hasPageOrSlide
+			include = !hasPageOrSlide && useLeafStructure
 		}
 		if !include {
 			continue

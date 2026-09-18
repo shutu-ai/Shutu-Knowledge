@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -28,7 +29,14 @@ func main() {
 		"long.pdf":        "BT /F1 18 Tf 72 720 Td (Long report) Tj ET\nBT /F1 12 Tf 72 690 Td (Page one bounded evidence) Tj ET",
 	}
 	for name, body := range pdfBodies {
-		if err := os.WriteFile(filepath.Join(*out, name), pdfBytes(body), 0o644); err != nil {
+		pages := []string{body}
+		if name == "long.pdf" {
+			pages = make([]string, 105)
+			for page := range pages {
+				pages[page] = fmt.Sprintf("BT /F1 18 Tf 72 720 Td (Long report section %d) Tj ET\nBT /F1 12 Tf 72 690 Td (Page %d bounded evidence) Tj ET", page+1, page+1)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(*out, name), pdfBytesPages(pages), 0o644); err != nil {
 			panic(err)
 		}
 	}
@@ -43,6 +51,8 @@ func main() {
 		body := fmt.Sprintf(`<p:sld xmlns:p="p" xmlns:a="a"><a:t>Slide %d APAC</a:t></p:sld>`, i)
 		if i == 1 {
 			body = `<p:sld xmlns:p="p" xmlns:a="a"><p:sp><a:t>Revenue title</a:t></p:sp><p:graphicFrame><a:tbl><a:tr><a:tc><a:t>Region</a:t></a:tc><a:tc><a:t>Q4</a:t></a:tc></a:tr></a:tbl></p:graphicFrame><p:pic/></p:sld>`
+		} else if i == 3 {
+			body = `<p:sld xmlns:p="p" xmlns:a="a"><p:sp><a:t>Churn and retention</a:t></p:sp><p:sp><a:t>Churn discussion and retention actions</a:t></p:sp></p:sld>`
 		}
 		slides[fmt.Sprintf("ppt/slides/slide%d.xml", i)] = body
 	}
@@ -94,13 +104,32 @@ func writeZip(path string, files map[string]string) {
 }
 
 func pdfBytes(content string) []byte {
+	return pdfBytesPages([]string{content})
+}
+
+func pdfBytesPages(pages []string) []byte {
+	if len(pages) == 0 {
+		pages = []string{""}
+	}
+	pageCount := len(pages)
+	pageObjectStart := 3
+	contentObjectStart := pageObjectStart + pageCount
+	fontObject := contentObjectStart + pageCount
 	objects := []string{
 		"<< /Type /Catalog /Pages 2 0 R >>",
-		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-		"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content),
-		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
 	}
+	kids := make([]string, 0, pageCount)
+	for page := 0; page < pageCount; page++ {
+		kids = append(kids, fmt.Sprintf("%d 0 R", pageObjectStart+page))
+	}
+	objects = append(objects, fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", strings.Join(kids, " "), pageCount))
+	for page := 0; page < pageCount; page++ {
+		objects = append(objects, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 %d 0 R >> >> /Contents %d 0 R >>", fontObject, contentObjectStart+page))
+	}
+	for _, content := range pages {
+		objects = append(objects, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content))
+	}
+	objects = append(objects, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 	var out bytes.Buffer
 	out.WriteString("%PDF-1.4\n")
 	offsets := make([]int64, len(objects)+1)

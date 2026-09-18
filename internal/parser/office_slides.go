@@ -408,6 +408,25 @@ func (r xlsxRow) Text() string {
 	return strings.Join(values, "\t")
 }
 
+func (r xlsxRow) Representation(sheet xlsxStructuredSheet) string {
+	if len(sheet.Rows) == 0 || len(r.Cells) == 0 || r.Range() == sheet.Rows[0].Range() {
+		return r.Text()
+	}
+	parts := make([]string, 0, len(r.Cells))
+	for index, cell := range r.Cells {
+		value := strings.TrimSpace(cell.Value)
+		if value == "" && cell.Formula == "" {
+			continue
+		}
+		if header := sheet.HeaderFor(index); header != "" {
+			parts = append(parts, header+"="+value)
+		} else {
+			parts = append(parts, cell.Ref+"="+value)
+		}
+	}
+	return strings.Join(parts, " | ")
+}
+
 func (r xlsxRow) Range() string {
 	if len(r.Cells) == 0 {
 		return ""
@@ -429,6 +448,19 @@ func (s xlsxStructuredSheet) Text() string {
 		}
 	}
 	return strings.Join(rows, "\n")
+}
+
+func (s xlsxStructuredSheet) Columns() string {
+	if len(s.Rows) == 0 {
+		return ""
+	}
+	values := make([]string, 0, len(s.Rows[0].Cells))
+	for _, cell := range s.Rows[0].Cells {
+		if value := strings.TrimSpace(cell.Value); value != "" {
+			values = append(values, value)
+		}
+	}
+	return strings.Join(values, ", ")
 }
 
 func (s xlsxStructuredSheet) UsedRange() string {

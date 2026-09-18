@@ -1915,9 +1915,29 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 	if ir == nil {
 		return s.structuralPieces(text, opts)
 	}
+	hasPageOrSlide := false
+	for _, node := range ir.Nodes {
+		if node.Type == documentir.TypePage || node.Type == documentir.TypeSlide {
+			hasPageOrSlide = true
+			break
+		}
+	}
 	var pieces []chunk.Piece
 	for _, node := range ir.Nodes {
-		if node.Type != documentir.TypePage && node.Type != documentir.TypeSlide && node.Type != documentir.TypeSheet && node.Type != documentir.TypeTable && node.Type != documentir.TypeTableRow && node.Type != documentir.TypeSection {
+		include := false
+		switch node.Type {
+		case documentir.TypePage, documentir.TypeSlide, documentir.TypeSheet,
+			documentir.TypeTable, documentir.TypeTableRow, documentir.TypeFigure,
+			documentir.TypeCaption, documentir.TypeFootnote:
+			include = true
+		case documentir.TypeSection, documentir.TypeHeading, documentir.TypeParagraph,
+			documentir.TypeBlock, documentir.TypeListItem:
+			// Page/slide nodes are already aggregate reading-order units. Office
+			// and text documents without those containers retain their leaf
+			// paragraph/list/heading boundaries here.
+			include = !hasPageOrSlide
+		}
+		if !include {
 			continue
 		}
 		if node.Type == documentir.TypeSheet {
@@ -1984,15 +2004,7 @@ func nodesForPiece(ir *documentir.Document, text, heading string) ([]string, doc
 		}
 		seen[node.ID] = true
 		ids = append(ids, node.ID)
-		score := 20
-		switch node.Type {
-		case documentir.TypeTableCell:
-			score = 100
-		case documentir.TypeParagraph, documentir.TypeBlock, documentir.TypeHeading:
-			score = 80
-		case documentir.TypeCaption, documentir.TypeFigure:
-			score = 70
-		}
+		score := sourceAnchorScore(node.Type, node.Metadata)
 		if anchor.Kind == "" || score > bestAnchorScore {
 			anchor = node.SourceAnchor
 			bestAnchorScore = score

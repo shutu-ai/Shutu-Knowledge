@@ -84,9 +84,10 @@ func pdfIR(text string, data []byte) *documentir.Document {
 		if pageText == "" {
 			continue
 		}
-		anchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, LogicalPath: fmt.Sprintf("page/%d", pageNumber)}
+		pageBBox := unionPDFBBoxes(blocks)
+		anchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, LogicalPath: fmt.Sprintf("page/%d", pageNumber), BBox: pageBBox}
 		pageID := fmt.Sprintf("tmp:page/%d", pageNumber)
-		d.Nodes = append(d.Nodes, documentir.Node{ID: pageID, Type: documentir.TypePage, ParentID: "tmp:document", Order: pageNumber, Text: pageText, PageNumber: pageNumber, SourceAnchor: anchor, Parser: "pdf", ParserVersion: "builtin-v1"})
+		d.Nodes = append(d.Nodes, documentir.Node{ID: pageID, Type: documentir.TypePage, ParentID: "tmp:document", Order: pageNumber, Text: pageText, PageNumber: pageNumber, BBox: pageBBox, SourceAnchor: anchor, Parser: "pdf", ParserVersion: "builtin-v1"})
 		for blockIndex, block := range blocks {
 			logical := fmt.Sprintf("page/%d/block/%d", pageNumber, blockIndex+1)
 			blockAnchor := documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical, BBox: block.bbox}
@@ -119,6 +120,33 @@ func pdfIR(text string, data []byte) *documentir.Document {
 		return fallback
 	}
 	return d
+}
+
+func unionPDFBBoxes(blocks []pdfIRBlock) *documentir.BBox {
+	var out *documentir.BBox
+	for _, block := range blocks {
+		if block.bbox == nil {
+			continue
+		}
+		if out == nil {
+			copy := *block.bbox
+			out = &copy
+			continue
+		}
+		if block.bbox.X1 < out.X1 {
+			out.X1 = block.bbox.X1
+		}
+		if block.bbox.Y1 < out.Y1 {
+			out.Y1 = block.bbox.Y1
+		}
+		if block.bbox.X2 > out.X2 {
+			out.X2 = block.bbox.X2
+		}
+		if block.bbox.Y2 > out.Y2 {
+			out.Y2 = block.bbox.Y2
+		}
+	}
+	return out
 }
 
 type pdfIRBlock struct {

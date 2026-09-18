@@ -57,8 +57,12 @@ func TestGoldenCorpusManifestAndIR(t *testing.T) {
 				headings++
 			}
 		}
-		if pages != 1 || len(result.IR.Nodes) < 3 {
-			t.Fatalf("%s golden IR: pages=%d nodes=%d", name, pages, len(result.IR.Nodes))
+		wantPages := 1
+		if name == "long.pdf" {
+			wantPages = 105
+		}
+		if pages != wantPages || len(result.IR.Nodes) < wantPages*2+1 {
+			t.Fatalf("%s golden IR: pages=%d want=%d nodes=%d", name, pages, wantPages, len(result.IR.Nodes))
 		}
 		if name == "simple.pdf" && headings == 0 {
 			t.Fatalf("%s lost heading semantics", name)

@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,7 +19,7 @@ func goldenXLSX(t *testing.T) []byte {
 	parts := map[string]string{
 		"xl/workbook.xml":          `<workbook><sheets><sheet name="Revenue" sheetId="1"/></sheets></workbook>`,
 		"xl/sharedStrings.xml":     `<sst><si><t>Region</t></si><si><t>Q4</t></si><si><t>APAC</t></si><si><t>150</t></si></sst>`,
-		"xl/worksheets/sheet1.xml": `<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row><c r="A2" t="s"><v>2</v></c><c r="B2" t="s"><v>3</v></c></row></sheetData></worksheet>`,
+		"xl/worksheets/sheet1.xml": `<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row><c r="A2" t="s"><v>2</v></c><c r="B2"><f>SUM(A2:A2)</f><v>150</v></c></row></sheetData><mergeCells><mergeCell ref="A1:B1"/></mergeCells></worksheet>`,
 	}
 	for name, content := range parts {
 		entry, err := archive.Create(name)
@@ -65,8 +67,17 @@ func TestGoldenRetrievalAndCitationAccuracy(t *testing.T) {
 	if !hasSheetCellForKnowledge(ir, "Revenue", "A2") {
 		t.Fatal("stored spreadsheet IR lost A2")
 	}
+	metadataPreserved := false
+	for _, node := range ir.Nodes {
+		if node.SourceAnchor.CellRange == "B2" && node.Metadata["formula"] == "SUM(A2:A2)" {
+			metadataPreserved = true
+		}
+	}
+	if !metadataPreserved {
+		t.Fatalf("stored spreadsheet IR lost node metadata: %+v", ir.Nodes)
+	}
 	spreadsheet, err := f.service.Search(context.Background(), SearchRequest{
-		BaseID: base.ID, Query: "APAC 150", Mode: "lexical", TopK: 3,
+		BaseID: base.ID, Query: "APAC Q4", Mode: "lexical", TopK: 3,
 		Filter: &SearchFilter{Structure: &StructureFilter{Sheets: []string{"Revenue"}, NodeTypes: []string{"table_cell"}}},
 	})
 	if err != nil {
@@ -79,6 +90,38 @@ func TestGoldenRetrievalAndCitationAccuracy(t *testing.T) {
 	if cellHit.Citation == nil || cellHit.Citation.Sheet != "Revenue" || cellHit.Citation.CellRange != "A2" ||
 		!strings.Contains(cellHit.Citation.Snippet, "APAC") || !strings.Contains(cellHit.Citation.Snippet, "150") {
 		t.Fatalf("spreadsheet citation is not row/cell accurate: citation=%+v anchor=%+v nodes=%v", cellHit.Citation, cellHit.SourceAnchor, cellHit.NodeIDs)
+	}
+
+	presentationBytes, err := os.ReadFile(filepath.Join("..", "..", "testdata", "document_intelligence", "office", "presentation.pptx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	presentation, err := f.service.AddFileDocument(context.Background(), base.ID, "presentation.pptx", presentationBytes, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slideResult, err := f.service.Search(context.Background(), SearchRequest{BaseID: base.ID, Query: "retention actions", Mode: "lexical", TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slideResult.Hits) != 1 || slideResult.Hits[0].DocID != presentation.ID || slideResult.Hits[0].Citation == nil || slideResult.Hits[0].Citation.Slide != 3 {
+		t.Fatalf("slide golden retrieval lost slide provenance: %+v", slideResult.Hits)
+	}
+
+	longPDF, err := os.ReadFile(filepath.Join("..", "..", "testdata", "document_intelligence", "long.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	longDocument, err := f.service.AddFileDocument(context.Background(), base.ID, "long.pdf", longPDF, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageResult, err := f.service.Search(context.Background(), SearchRequest{BaseID: base.ID, Query: "Page 12 bounded evidence", Mode: "lexical", TopK: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pageResult.Hits) != 1 || pageResult.Hits[0].DocID != longDocument.ID || pageResult.Hits[0].Citation == nil || pageResult.Hits[0].Citation.Page != 12 || pageResult.Hits[0].Citation.BBox == nil {
+		t.Fatalf("PDF golden retrieval lost page provenance: %+v", pageResult.Hits)
 	}
 }
 

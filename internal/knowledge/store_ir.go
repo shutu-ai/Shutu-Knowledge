@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 )
@@ -45,7 +46,7 @@ func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks
 		c.NodeTypes = nil
 		c.SourceAnchor = documentir.SourceAnchor{}
 		bestAnchorScore := -1
-		rows, err := q.QueryContext(ctx, `SELECT n.node_id, n.node_type, n.source_anchor
+		rows, err := q.QueryContext(ctx, `SELECT n.node_id, n.node_type, n.source_anchor, n.metadata
 			FROM chunk_node_links l JOIN document_nodes n
 			  ON n.doc_id = l.doc_id AND n.index_generation = l.index_generation AND n.node_id = l.node_id
 			WHERE l.doc_id = ? AND l.index_generation = ? AND l.chunk_id = ?
@@ -54,8 +55,8 @@ func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks
 			return err
 		}
 		for rows.Next() {
-			var nodeID, nodeType, rawAnchor string
-			if err := rows.Scan(&nodeID, &nodeType, &rawAnchor); err != nil {
+			var nodeID, nodeType, rawAnchor, rawMetadata string
+			if err := rows.Scan(&nodeID, &nodeType, &rawAnchor, &rawMetadata); err != nil {
 				_ = rows.Close()
 				return err
 			}
@@ -64,15 +65,9 @@ func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks
 			if rawAnchor != "" {
 				var anchor documentir.SourceAnchor
 				if err := json.Unmarshal([]byte(rawAnchor), &anchor); err == nil {
-					score := 20
-					switch nodeType {
-					case documentir.TypeTableCell:
-						score = 100
-					case documentir.TypeParagraph, documentir.TypeBlock, documentir.TypeHeading:
-						score = 80
-					case documentir.TypeCaption, documentir.TypeFigure:
-						score = 70
-					}
+					metadata := map[string]string{}
+					_ = json.Unmarshal([]byte(rawMetadata), &metadata)
+					score := sourceAnchorScore(nodeType, metadata)
 					if anchor.Kind != "" && score > bestAnchorScore {
 						c.SourceAnchor = anchor
 						bestAnchorScore = score
@@ -89,6 +84,29 @@ func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks
 	return nil
 }
 
+func sourceAnchorScore(nodeType string, metadata map[string]string) int {
+	score := 20
+	switch nodeType {
+	case documentir.TypeTableCell:
+		score = 100
+		if metadata != nil && metadata["header"] == "true" {
+			// A data cell is stronger evidence for a row query than the
+			// header cell whose label happens to occur in a row representation.
+			score = 90
+		}
+	case documentir.TypeParagraph, documentir.TypeBlock, documentir.TypeHeading:
+		score = 80
+	case documentir.TypePage, documentir.TypeSlide, documentir.TypeSheet:
+		// Structure-aware page/slide/sheet chunks retain the whole container;
+		// prefer that anchor over a coincident child block so page identity does
+		// not depend on the first matching line of text.
+		score = 90
+	case documentir.TypeCaption, documentir.TypeFigure:
+		score = 70
+	}
+	return score
+}
+
 // ListDocumentIR returns the active generation's structured nodes and
 // relationships. The method is intentionally read-only and source-scoped.
 func (s *store) listDocumentIR(ctx context.Context, docID string) (documentir.Document, error) {
@@ -98,7 +116,8 @@ func (s *store) listDocumentIR(ctx context.Context, docID string) (documentir.Do
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT node_id, COALESCE(parent_node_id, ''), node_type,
 		node_order, text, heading_path, source_anchor, COALESCE(page_number, 0),
-		COALESCE(slide_number, 0), COALESCE(sheet_name, ''), parser, parser_version, confidence
+		COALESCE(slide_number, 0), COALESCE(sheet_name, ''), COALESCE(bbox, '{}'),
+		COALESCE(metadata, '{}'), parser, parser_version, confidence
 		FROM document_nodes WHERE doc_id = ? AND index_generation = ? ORDER BY node_order, node_id`, docID, doc.ActiveIndexGen)
 	if err != nil {
 		return documentir.Document{}, err
@@ -114,13 +133,22 @@ func (s *store) listDocumentIR(ctx context.Context, docID string) (documentir.Do
 	}
 	for rows.Next() {
 		var n documentir.Node
-		var parent, headingRaw, anchorRaw string
-		if err := rows.Scan(&n.ID, &parent, &n.Type, &n.Order, &n.Text, &headingRaw, &anchorRaw, &n.PageNumber, &n.SlideNumber, &n.SheetName, &n.Parser, &n.ParserVersion, &n.Confidence); err != nil {
+		var parent, headingRaw, anchorRaw, bboxRaw, metadataRaw string
+		if err := rows.Scan(&n.ID, &parent, &n.Type, &n.Order, &n.Text, &headingRaw, &anchorRaw, &n.PageNumber, &n.SlideNumber, &n.SheetName, &bboxRaw, &metadataRaw, &n.Parser, &n.ParserVersion, &n.Confidence); err != nil {
 			return documentir.Document{}, err
 		}
 		n.DocumentID, n.ParentID = docID, parent
 		_ = json.Unmarshal([]byte(headingRaw), &n.HeadingPath)
 		_ = json.Unmarshal([]byte(anchorRaw), &n.SourceAnchor)
+		if strings.TrimSpace(bboxRaw) != "" && bboxRaw != "null" && bboxRaw != "{}" {
+			var bbox documentir.BBox
+			if err := json.Unmarshal([]byte(bboxRaw), &bbox); err == nil {
+				n.BBox = &bbox
+			}
+		}
+		if strings.TrimSpace(metadataRaw) != "" && metadataRaw != "null" && metadataRaw != "{}" {
+			_ = json.Unmarshal([]byte(metadataRaw), &n.Metadata)
+		}
 		ir.Nodes = append(ir.Nodes, n)
 	}
 	if err := rows.Err(); err != nil {

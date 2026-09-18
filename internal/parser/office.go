@@ -87,10 +87,10 @@ func officeIR(format, text string, entries map[string][]byte) *documentir.Docume
 		for rowIndex, row := range sheet.Rows {
 			order++
 			if rowIndex == 0 {
-				d.Nodes[tableNodeIndex].Text = fmt.Sprintf("Table %s: %s", sheet.Name, row.Text())
+				d.Nodes[tableNodeIndex].Text = fmt.Sprintf("Table: %s; Columns: %s", sheet.Name, sheet.Columns())
 			}
 			rowID := fmt.Sprintf("tmp:sheet/%d/row/%d", sheetIndex+1, rowIndex+1)
-			rowNode := documentir.Node{ID: rowID, Type: documentir.TypeTableRow, ParentID: tableID, Order: order, Text: row.Text(), SheetName: sheet.Name, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, CellRange: row.Range(), LogicalPath: fmt.Sprintf("sheet/%d/row/%d", sheetIndex+1, rowIndex+1)}, Parser: format, ParserVersion: "builtin-v1"}
+			rowNode := documentir.Node{ID: rowID, Type: documentir.TypeTableRow, ParentID: tableID, Order: order, Text: row.Representation(sheet), SheetName: sheet.Name, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheet.Name, CellRange: row.Range(), LogicalPath: fmt.Sprintf("sheet/%d/row/%d", sheetIndex+1, rowIndex+1)}, Parser: format, ParserVersion: "builtin-v1"}
 			d.Nodes = append(d.Nodes, rowNode)
 			for cellIndex, cell := range row.Cells {
 				if strings.TrimSpace(cell.Value) == "" && cell.Formula == "" {

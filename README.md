@@ -2,7 +2,9 @@
 
 An independent knowledge-base system for [shutu-agent](https://github.com/shutu-ai/shutu-agent), implementing capability equivalence with [dsh-knowledge](https://github.com/Soren-ABT/dsh-knowledge) through the frozen shutu-agent Extension Platform v1.
 
-Status: **v0.3.1 released — Document Intelligence Foundation.** Target
+Status: **0.4.0-rc.1 semantic-memory candidate in stabilization.** The current
+stable release remains v0.3.1; 0.4 compilation is optional and preserves the
+existing retrieval path. Target
 capability coverage is complete except documented non-blocking upstream
 Extension Contract limitations. The Agent
 dependency is the explicitly Apache-2.0 licensed public module
@@ -14,7 +16,8 @@ release gates, and
 records the current evidence-backed conclusion.
 
 Current stable release: **v0.3.1**. The Windows x64 package and GitHub Release
-are available from the `v0.3.1` tag.
+are available from the `v0.3.1` tag. The in-progress 0.4 candidate identifies
+itself as `0.4.0-rc.1`; its formal package/tag is not published yet.
 
 The 0.3.x line is in maintenance mode: bugfixes, security fixes, data-integrity
 fixes, compatibility fixes, parser/citation correctness fixes, and packaging

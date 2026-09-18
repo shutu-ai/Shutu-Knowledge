@@ -645,6 +645,12 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 	default:
 		return 0, err
 	}
+	semanticActive := false
+	if _, err := s.semanticStore.GetActiveCompilation(ctx, root.BaseID); err == nil {
+		semanticActive = true
+	} else if !errors.Is(err, semantic.ErrNotFound) {
+		return 0, err
+	}
 	removed := 0
 	afterID := ""
 	for {
@@ -697,18 +703,17 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 			break
 		}
 	}
-	if _, err := s.semanticStore.GetActiveCompilation(ctx, root.BaseID); err == nil {
+	if semanticActive {
 		// Delete propagation is synchronous when semantic memory is active.
 		// If the deterministic replacement fails, retire the old generation
 		// rather than expose provenance to deleted evidence; the durable queue
 		// remains available for a later full rebuild.
-		if _, compileErr := s.CompileSemanticMemory(ctx, root.BaseID); compileErr != nil {
-			if retireErr := s.semanticStore.RetireActiveCompilation(ctx, root.BaseID); retireErr != nil && !errors.Is(retireErr, semantic.ErrNotFound) {
+		propagationCtx := context.WithoutCancel(ctx)
+		if _, compileErr := s.CompileSemanticMemory(propagationCtx, root.BaseID); compileErr != nil {
+			if retireErr := s.semanticStore.RetireActiveCompilation(propagationCtx, root.BaseID); retireErr != nil && !errors.Is(retireErr, semantic.ErrNotFound) {
 				return removed, retireErr
 			}
 		}
-	} else if !errors.Is(err, semantic.ErrNotFound) {
-		return removed, err
 	}
 	return removed, nil
 }

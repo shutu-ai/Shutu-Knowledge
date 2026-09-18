@@ -1,6 +1,7 @@
 package semantic
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -114,5 +115,36 @@ func emptyDeltaForTest(baseID string, generation, timestamp int64) Compilation {
 		Compiler: BuiltinCompiler, CompilerVersion: BuiltinCompilerVersion,
 		Model: BuiltinModel, ModelVersion: BuiltinModelVersion,
 		PromptVersion: BuiltinPromptVersion, CreatedAt: timestamp,
+	}
+}
+
+func TestMergeIncrementalReconcilesVersionedSupersession(t *testing.T) {
+	oldDoc := sourceDocumentForCompile("doc-old-version", "Release", "# Release\n\nVersion 0.2 supports the 128k context window.", 1, 1)
+	newDoc := sourceDocumentForCompile("doc-new-version", "Release", "# Release\n\nVersion 0.3 supports the 1M context window.", 2, 2)
+	previous, err := Compile("base-inc-temporal", 1, []SourceDocument{oldDoc}, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, err := Compile("base-inc-temporal", 2, []SourceDocument{newDoc}, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := MergeIncremental(previous, delta, map[string]bool{"doc-new-version": true}, nil,
+		[]string{"doc-old-version", "doc-new-version"}, 2_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statuses int
+	for _, unit := range merged.Units {
+		if unit.Type != UnitFact || !strings.Contains(strings.ToLower(unit.Content), "context window") {
+			continue
+		}
+		statuses++
+		if strings.Contains(strings.ToLower(unit.Content), "128k") && (unit.Status != UnitSuperseded || unit.SupersededBy == "") {
+			t.Fatalf("old version not superseded after incremental merge: %+v", unit)
+		}
+	}
+	if statuses != 2 {
+		t.Fatalf("versioned fact count = %d, want 2", statuses)
 	}
 }

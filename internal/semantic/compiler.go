@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -124,6 +125,7 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 	compilation.Units = append(compilation.Units, conceptUnits...)
 	compilation.Units = append(compilation.Units, topicUnits...)
 	compilation.Units = append(compilation.Units, summaryUnits...)
+	compilation.Units = reconcileTemporalUnits(compilation.Units, baseID, generation, createdAt)
 	if err := compilation.Validate(); err != nil {
 		return Compilation{}, err
 	}
@@ -138,6 +140,106 @@ func SourceFingerprint(doc SourceDocument) string {
 	}
 	return fmt.Sprintf("%d:%d:%s", doc.IndexGeneration, doc.SourceVersion,
 		stableKey(doc.Title+"\x00"+doc.IR.Text()))
+}
+
+type temporalFact struct {
+	version float64
+	unit    *Unit
+}
+
+// reconcileTemporalUnits applies conservative versioned supersession. It only
+// groups explicit “Version X <predicate> <attribute>” facts after stripping
+// numeric values/units from the attribute, so ordinary different facts are not
+// mistaken for conflicts.
+func reconcileTemporalUnits(units []Unit, baseID string, generation int64, now int64) []Unit {
+	groups := map[string][]temporalFact{}
+	for i := range units {
+		if units[i].Type != UnitFact {
+			continue
+		}
+		version, predicate, attribute, ok := parseVersionedFact(units[i].Content)
+		if !ok {
+			continue
+		}
+		key := predicate + "\x00" + attribute
+		unit := &units[i]
+		groups[key] = append(groups[key], temporalFact{version: version, unit: unit})
+	}
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].version != group[j].version {
+				return group[i].version < group[j].version
+			}
+			return group[i].unit.CanonicalKey < group[j].unit.CanonicalKey
+		})
+		successor := group[len(group)-1]
+		successor.unit.Status = UnitActive
+		successor.unit.SupersededBy = ""
+		successor.unit.UpdatedAt = now
+		for _, superseded := range group[:len(group)-1] {
+			superseded.unit.Status = UnitSuperseded
+			superseded.unit.SupersededBy = UnitID(baseID, generation, UnitFact, successor.unit.CanonicalKey)
+			superseded.unit.UpdatedAt = now
+		}
+	}
+	return units
+}
+
+func parseVersionedFact(content string) (float64, string, string, bool) {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(content)), " ")
+	lower := strings.ToLower(normalized)
+	version := lower
+	rest := ""
+	for _, prefix := range []string{"version ", "版本 "} {
+		if strings.HasPrefix(lower, prefix) {
+			version = lower[len(prefix):]
+			break
+		}
+	}
+	if version == lower {
+		return 0, "", "", false
+	}
+	fields := strings.SplitN(version, " ", 2)
+	if len(fields) != 2 {
+		return 0, "", "", false
+	}
+	number, err := parseVersionNumber(fields[0])
+	if err != nil {
+		return 0, "", "", false
+	}
+	rest = fields[1]
+	predicate := ""
+	for _, candidate := range []string{"supports ", "uses ", "requires ", "provides ", "支持 ", "使用 ", "需要 ", "提供 "} {
+		if strings.HasPrefix(rest, candidate) {
+			predicate = strings.TrimSpace(candidate)
+			rest = rest[len(candidate):]
+			break
+		}
+	}
+	if predicate == "" {
+		return 0, "", "", false
+	}
+	attribute := normalizeTemporalAttribute(rest)
+	if attribute == "" {
+		return 0, "", "", false
+	}
+	return number, predicate, attribute, true
+}
+
+func parseVersionNumber(value string) (float64, error) {
+	return strconv.ParseFloat(strings.TrimSuffix(value, "x"), 64)
+}
+
+func normalizeTemporalAttribute(value string) string {
+	value = strings.ToLower(value)
+	replacements := []string{"the ", "a ", "an ", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", ",", "%", "k", "m", "x"}
+	for _, replacement := range replacements {
+		value = strings.ReplaceAll(value, replacement, " ")
+	}
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func validateSourceDocument(doc *SourceDocument) error {
@@ -559,7 +661,14 @@ func cleanFact(text string) string {
 func splitSentences(text string) []string {
 	var out []string
 	var current []rune
-	for _, r := range text {
+	runes := []rune(text)
+	for i, r := range runes {
+		keepDecimal := r == '.' && i > 0 && i+1 < len(runes) &&
+			unicode.IsDigit(runes[i-1]) && unicode.IsDigit(runes[i+1])
+		if keepDecimal {
+			current = append(current, r)
+			continue
+		}
 		switch r {
 		case '.', '!', '?', '。', '！', '？', '\n':
 			if len(current) > 0 {
@@ -578,7 +687,6 @@ func splitSentences(text string) []string {
 	}
 	return out
 }
-
 func normalizeConceptKey(value string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
 }

@@ -51,6 +51,7 @@ func MergeIncremental(previous, delta Compilation, dirtyDocuments, deletedDocume
 	for _, unit := range merged {
 		unitOrder = append(unitOrder, unit)
 	}
+	unitOrder = reconcileTemporalUnits(unitOrder, delta.BaseID, delta.Generation, now)
 	sort.Slice(unitOrder, func(i, j int) bool {
 		if unitOrder[i].Type != unitOrder[j].Type {
 			return unitOrder[i].Type < unitOrder[j].Type

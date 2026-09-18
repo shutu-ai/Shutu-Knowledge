@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
@@ -117,5 +118,43 @@ func sourceDocumentForCompile(id, title, text string, generation, version int64)
 		BaseID: "base-1", DocumentID: id, Title: title,
 		IndexGeneration: generation, SourceVersion: version, IR: ir,
 		ChunkIDsByNode: chunks, UpdatedAt: 500,
+	}
+}
+
+func TestCompilerMarksOlderVersionedFactSuperseded(t *testing.T) {
+	documents := []SourceDocument{
+		sourceDocumentForCompile("doc-old", "Release", "# Release\n\nVersion 0.2 supports the 128k context window.", 1, 1),
+		sourceDocumentForCompile("doc-new", "Release", "# Release\n\nVersion 0.3 supports the 1M context window.", 2, 2),
+	}
+	compilation, err := Compile("base-temporal", 1, documents, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldFact, newFact *Unit
+	for i, unit := range compilation.Units {
+		if unit.Type != UnitFact {
+			continue
+		}
+		if strings.Contains(strings.ToLower(unit.Content), "128k") {
+			oldFact = &compilation.Units[i]
+		}
+		if strings.Contains(strings.ToLower(unit.Content), "1m") {
+			newFact = &compilation.Units[i]
+		}
+	}
+	if oldFact == nil || newFact == nil {
+		t.Fatalf("versioned facts missing: %+v", compilation.Units)
+	}
+	if oldFact.Status != UnitSuperseded || oldFact.SupersededBy != newFact.ID || newFact.Status != UnitActive {
+		t.Fatalf("temporal lifecycle = old %+v new %+v", *oldFact, *newFact)
+	}
+	response, err := SearchCompilation(compilation, SearchOptions{Query: "version context window", Kinds: []UnitKind{UnitFact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hit := range response.Hits {
+		if hit.Unit.ID == oldFact.ID {
+			t.Fatalf("superseded fact returned as active: %+v", hit.Unit)
+		}
 	}
 }

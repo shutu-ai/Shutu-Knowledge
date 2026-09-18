@@ -3,7 +3,7 @@
 ## Version and candidate
 
 - Version: `0.3.0`
-- Validated implementation commit: `008125936fc63e68224a8093f6777ce1d9c0c7d2`
+- Validated implementation commit: `a4aa1267f43c33fd197ced9f5fa37dad81d78375`
 - Storage migration: `0018_document_intelligence.sql`
 
 ## Architecture
@@ -54,6 +54,9 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 - `go test -race ./... -count=1 -timeout=30m`: PASS; no race reports
 - `npm test`: PASS
 - `npm run build`: PASS; embedded six-file Web bundle rebuilt
+- Ingestion diagnostics now expose parse, IR-build, structure-aware chunk,
+  embedding, peak RSS, and serialized IR-size measurements without recording
+  document content or credentials.
 - One-shot local benchmark on Windows amd64, Intel Core Ultra 7 255H:
   - corpus ingestion: 22.761 ms/op, 93,344 B/op
   - lexical retrieval: 23.846 ms/op, 105,208 B/op
@@ -67,9 +70,9 @@ local baseline, not a production capacity claim.
 ## Release artifact
 
 - Filename: `shutu-knowledge-0.3.0-windows-amd64.zip`
-- Size: `12,356,128` bytes
-- SHA-256: `83cef3a03ba3bbd201004a22181447b4e2bf3510259314d80f3bb1e76bc29daa`
-- Package source commit: `008125936fc63e68224a8093f6777ce1d9c0c7d2`
+- Size: `12,357,535` bytes
+- SHA-256: `609ef97f677c345ccfab5e808b3445ae22bd5566aa9643bc19082619f2665cc5`
+- Package source commit: `a4aa1267f43c33fd197ced9f5fa37dad81d78375`
 - Static package secret audit: PASS
 - Package smoke: PASS, including text import, OCR import, online retrieval,
   runtime status, and offline restart retrieval
@@ -79,14 +82,15 @@ local baseline, not a production capacity claim.
 Doctor and `/api/status` expose critical `document-parser`, `document-ir`,
 and `structured-index` checks. Optional LLM enrichment is reported as
 `ENRICHMENT UNAVAILABLE` without failing core readiness. Local metrics include
-parser selection, parse duration, node/table/figure/chunk counts, and fallback
-count without document text or credentials.
+parser selection, parse/IR/chunk/embedding durations, peak RSS, serialized IR
+size, node/table/figure/chunk counts, and fallback count without document text
+or credentials.
 
 ## Known limitations and deferred work
 
-- The committed corpus uses deterministic fixtures, including a 105-page PDF,
-  rather than production-sized Office/PDF files; OCR/rendering remains an
-  optional runtime.
+- The committed corpus uses deterministic fixtures, including a true
+  coordinate-separated multicolumn PDF and a 105-page PDF, rather than
+  production-sized Office/PDF files; OCR/rendering remains an optional runtime.
 - Visual figure understanding, entity/ontology extraction, GraphRAG, query
   routing v0, and a richer chunk-link inspector remain deferred to 0.4+.
 - CI push/tag status was not queried because this workspace has no GitHub CLI
@@ -96,5 +100,5 @@ count without document text or credentials.
 ## Release status
 
 `NOT READY` until push/tag CI and external Agent Host acceptance are run and
-recorded. The local implementation, tests, artifact build, static audit, and
-final Windows package smoke are ready.
+recorded. The local implementation, tests, artifact build, static audit,
+native host lifecycle acceptance, and final Windows package smoke are ready.

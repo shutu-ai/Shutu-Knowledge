@@ -1,6 +1,6 @@
 # Shutu-Knowledge 0.2 Stabilization Scope
 
-Audit date: 2026-09-17
+Audit date: 2026-09-18
 
 This document freezes the 0.2 scope around the Windows Tier-1 personal
 knowledge-base path. It does not reopen the architecture plan or add new
@@ -13,10 +13,12 @@ retrieval/runtime subsystems.
 | Managed runtime smoke | PASS | Current-source embedding, rerank, OCR, PDF, corruption recovery, lifecycle, and offline restart smoke completed. |
 | Formal release package | PASS | Clean formal ZIP passed checksums, required notices, static secret audit, packaged startup/import/search, and offline restart. |
 | Agent integration | PASS | Current candidate removal gate passed catalog validation, real Agent health, and zero removed/unexpected tools or routes. |
+| Release gate semantics | PASS | Normal builds enforce production p95 budgets; race builds enforce concurrency correctness and bounded completion without reusing production latency thresholds. |
 
-No new P0 correctness defect remains open after the storage shutdown fix: the
-full serial race suite passed after the fix, and all three release rows above
-now have current-candidate evidence.
+No new P0 correctness or production-performance defect remains open. The
+immutable `v0.2.0` tag is retained as a historical candidate; `v0.2.1` is the
+released source after separating normal production performance from race
+correctness validation.
 
 ## Must fix (P1)
 
@@ -38,6 +40,8 @@ now have current-candidate evidence.
   richer document-understanding work.
 - A full installer/updater UI if the formal portable ZIP remains insufficient;
   the 0.2 gate uses the existing verified portable Windows package.
+- Document IR, LLM Wiki, Knowledge Graph, new retrieval/storage architecture,
+  and large-scale platform expansion are 0.3 backlog items.
 
 ## Deferred from 0.2 Release Gate
 
@@ -45,3 +49,12 @@ The unfinished architecture-plan scale and release-host experiments are
 explicitly deferred. They must not be used to keep the Windows personal
 knowledge-base release open after the hard gates in
 `docs/release_0.2_acceptance.md` pass.
+
+## Final status
+
+```text
+Version: 0.2.1
+Status: Released
+Primary Platform: Windows x64
+Maintenance: Active
+```

@@ -24,6 +24,16 @@ func percentileDuration(values []time.Duration, percentile float64) time.Duratio
 	return sorted[int(float64(len(sorted)-1)*percentile)]
 }
 
+func maxDuration(values []time.Duration) time.Duration {
+	var maximum time.Duration
+	for _, value := range values {
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum
+}
+
 type busyGateEmbedder struct {
 	once    sync.Once
 	started chan struct{}
@@ -230,7 +240,20 @@ func TestSustainedBusyWriterKeepsHTTPControlPathsBounded(t *testing.T) {
 	submitP95 := percentileDuration(submitLatencies, .95)
 	statusP95 := percentileDuration(statusLatencies, .95)
 	cancelP95 := percentileDuration(cancelLatencies, .95)
-	if submitP95 > 250*time.Millisecond || statusP95 > 100*time.Millisecond ||
+	submitMax := maxDuration(submitLatencies)
+	statusMax := maxDuration(statusLatencies)
+	cancelMax := maxDuration(cancelLatencies)
+	if busyHTTPRaceBuild {
+		// The race detector deliberately changes scheduler and request latency.
+		// Keep this gate about bounded completion and correctness; production
+		// p95 budgets are asserted by the normal-build branch below.
+		const raceDiagnosticBudget = 2 * requestBudget
+		if submitMax > raceDiagnosticBudget || statusMax > raceDiagnosticBudget ||
+			cancelMax > raceDiagnosticBudget {
+			t.Fatalf("unbounded busy HTTP control path under race: submitMax=%s statusMax=%s cancelMax=%s budget=%s",
+				submitMax, statusMax, cancelMax, raceDiagnosticBudget)
+		}
+	} else if submitP95 > 250*time.Millisecond || statusP95 > 100*time.Millisecond ||
 		cancelP95 > 250*time.Millisecond {
 		t.Fatalf("unbounded busy HTTP control path: submitP95=%s statusP95=%s cancelP95=%s",
 			submitP95, statusP95, cancelP95)
@@ -319,6 +342,7 @@ func TestSustainedBusyWriterKeepsHTTPControlPathsBounded(t *testing.T) {
 		t.Fatalf("writer recovery duplicated acceptance: operations=%d submitted=%d",
 			acceptedCommands, submittedEvents)
 	}
-	t.Logf("busy HTTP rounds submit=%d status=%d cancel=%d submitP95=%s statusP95=%s cancelP95=%s drain=%s",
-		submitRounds, statusRounds, cancelRounds, submitP95, statusP95, cancelP95, cancelDrain)
+	t.Logf("busy HTTP rounds submit=%d status=%d cancel=%d submitP95=%s statusP95=%s cancelP95=%s submitMax=%s statusMax=%s cancelMax=%s drain=%s",
+		submitRounds, statusRounds, cancelRounds, submitP95, statusP95, cancelP95,
+		submitMax, statusMax, cancelMax, cancelDrain)
 }

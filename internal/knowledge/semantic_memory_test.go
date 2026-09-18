@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
@@ -97,6 +98,17 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 	}
 	if contextPackage.EstimatedTokens > contextPackage.TokenBudget {
 		t.Fatalf("context package tokens = %d, budget %d", contextPackage.EstimatedTokens, contextPackage.TokenBudget)
+	}
+
+	wiki, err := service.GetSemanticWiki(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("GetSemanticWiki: %v", err)
+	}
+	if !wiki.Regenerable || len(wiki.Pages) == 0 || len(wiki.Pages[0].Evidence) == 0 {
+		t.Fatalf("wiki view = %+v", wiki)
+	}
+	if !strings.Contains(wiki.Pages[0].RenderMarkdown(), "Generated Wiki view") {
+		t.Fatal("wiki markdown lacks generated-view boundary")
 	}
 
 	after, err := service.Search(ctx, SearchRequest{BaseID: base.ID, Query: "1024-dimensional vectors", TopK: 2})

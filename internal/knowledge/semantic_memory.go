@@ -335,3 +335,27 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 func (s *Service) PlanKnowledgeQuery(query string) semantic.QueryPlan {
 	return semantic.RouteQuery(query)
 }
+
+// GetSemanticWiki returns the deterministic, regenerable Living Wiki view for
+// the active compilation. Wiki pages are projections of KnowledgeUnits and
+// never become the source of truth.
+func (s *Service) GetSemanticWiki(ctx context.Context, baseID string) (semantic.WikiView, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.WikiView{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.WikiView{}, ErrConflict
+	}
+	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.WikiView{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.WikiView{}, err
+	}
+	return semantic.RenderWiki(compilation)
+}

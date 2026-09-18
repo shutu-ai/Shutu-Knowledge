@@ -38,6 +38,13 @@ func (s *store) listDerivedKnowledge(ctx context.Context, docID string) ([]Deriv
 func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks []Chunk) error {
 	for i := range chunks {
 		c := &chunks[i]
+		// Search may enrich the candidate list before structure filtering and
+		// enrich the final list again. Rebuild the projection idempotently so
+		// node IDs are not duplicated and the most specific anchor wins.
+		c.NodeIDs = nil
+		c.NodeTypes = nil
+		c.SourceAnchor = documentir.SourceAnchor{}
+		bestAnchorScore := -1
 		rows, err := q.QueryContext(ctx, `SELECT n.node_id, n.node_type, n.source_anchor
 			FROM chunk_node_links l JOIN document_nodes n
 			  ON n.doc_id = l.doc_id AND n.index_generation = l.index_generation AND n.node_id = l.node_id
@@ -54,10 +61,22 @@ func (s *store) enrichChunkProvenance(ctx context.Context, q queryRunner, chunks
 			}
 			c.NodeIDs = append(c.NodeIDs, nodeID)
 			c.NodeTypes = append(c.NodeTypes, nodeType)
-			if c.SourceAnchor.Kind == "" && rawAnchor != "" {
+			if rawAnchor != "" {
 				var anchor documentir.SourceAnchor
 				if err := json.Unmarshal([]byte(rawAnchor), &anchor); err == nil {
-					c.SourceAnchor = anchor
+					score := 20
+					switch nodeType {
+					case documentir.TypeTableCell:
+						score = 100
+					case documentir.TypeParagraph, documentir.TypeBlock, documentir.TypeHeading:
+						score = 80
+					case documentir.TypeCaption, documentir.TypeFigure:
+						score = 70
+					}
+					if anchor.Kind != "" && score > bestAnchorScore {
+						c.SourceAnchor = anchor
+						bestAnchorScore = score
+					}
 				}
 			}
 		}

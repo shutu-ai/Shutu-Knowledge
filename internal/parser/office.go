@@ -83,13 +83,22 @@ func officeIR(format, text string, entries map[string][]byte) *documentir.Docume
 	d.Nodes = append(d.Nodes, documentir.Node{ID: sheetID, Type: documentir.TypeSheet, ParentID: "tmp:document", Order: 1, SheetName: sheetName, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, LogicalPath: "sheet/1"}, Parser: format, ParserVersion: "builtin-v1"})
 	d.Nodes[len(d.Nodes)-1].Text = strings.TrimSpace(text)
 	for rowIndex, line := range strings.Split(strings.TrimSpace(text), "\n") {
-		for colIndex, value := range strings.Split(line, "\t") {
+		values := strings.Split(line, "\t")
+		rowNumber := rowIndex + 1
+		rowID := fmt.Sprintf("tmp:row/%d", rowNumber)
+		d.Nodes = append(d.Nodes, documentir.Node{
+			ID: rowID, Type: documentir.TypeTableRow, ParentID: sheetID, Order: rowIndex * 1000,
+			Text: strings.TrimSpace(line), SheetName: sheetName,
+			SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, CellRange: fmt.Sprintf("A%d:%s%d", rowNumber, columnName(len(values)), rowNumber), LogicalPath: fmt.Sprintf("sheet/1/row/%d", rowNumber)},
+			Parser:       format, ParserVersion: "builtin-v1",
+		})
+		for colIndex, value := range values {
 			value = strings.TrimSpace(value)
 			if value == "" {
 				continue
 			}
-			cell := fmt.Sprintf("%s%d", columnName(colIndex+1), rowIndex+1)
-			d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:cell/%s", cell), Type: documentir.TypeTableCell, ParentID: sheetID, Order: rowIndex*1000 + colIndex, Text: value, SheetName: sheetName, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, CellRange: cell, LogicalPath: "sheet/1/cell/" + cell}, Parser: format, ParserVersion: "builtin-v1"})
+			cell := fmt.Sprintf("%s%d", columnName(colIndex+1), rowNumber)
+			d.Nodes = append(d.Nodes, documentir.Node{ID: fmt.Sprintf("tmp:cell/%s", cell), Type: documentir.TypeTableCell, ParentID: rowID, Order: colIndex, Text: value, SheetName: sheetName, SourceAnchor: documentir.SourceAnchor{Kind: "xlsx", Sheet: sheetName, CellRange: cell, LogicalPath: "sheet/1/cell/" + cell}, Parser: format, ParserVersion: "builtin-v1"})
 		}
 	}
 	return d

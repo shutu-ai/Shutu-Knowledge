@@ -1403,6 +1403,14 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 		return s.failDocumentContext(ctx, doc, ErrParseFailed, err)
 	}
 	s.recordMetric(func(m *MetricsSnapshot) {
+		if m.ParserSelections == nil {
+			m.ParserSelections = map[string]int64{}
+		}
+		parserName := doc.IR.Parser
+		if parserName == "" {
+			parserName = "unknown"
+		}
+		m.ParserSelections[parserName]++
 		m.NodeCount += int64(len(doc.IR.Nodes))
 		for _, node := range doc.IR.Nodes {
 			if node.Type == documentir.TypeTable || node.Type == documentir.TypeTableCell {
@@ -1616,6 +1624,12 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	nativeOK := nativeAvailable && !parsed.NeedsOCR
 
 	mode := s.resolveOCRMode(cfg)
+	fallbackUsed := mode == "forced" || parseErr != nil || !nativeOK
+	defer func() {
+		if fallbackUsed {
+			s.recordMetric(func(m *MetricsSnapshot) { m.ParserFallbacks++ })
+		}
+	}()
 	ocrUsable := (isPDF || isImage) && s.ocr != nil && s.ocr.Available()
 	contentUsable := isPDF && s.content != nil && s.content.Available()
 	runOCR := func() (string, bool) {
@@ -1663,9 +1677,11 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 
 	if mode == "forced" {
 		if text, ok := runOCR(); ok {
+			doc.IR = documentir.FromText(parsed.Title, text, "ocr", "builtin-v1")
 			return text, parsed.Title, nil
 		}
 		if text, ok := runContentConverter(); ok {
+			doc.IR = documentir.FromText(parsed.Title, text, "content-converter", "builtin-v1")
 			return text, parsed.Title, nil
 		}
 		if nativeAvailable {
@@ -1690,9 +1706,11 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 		// A fragmented layer is still native evidence, so try OCR before
 		// replacing it with a converter's reconstruction.
 		if text, ok := runOCR(); ok {
+			doc.IR = documentir.FromText(parsed.Title, text, "ocr", "builtin-v1")
 			return text, parsed.Title, nil
 		}
 		if text, ok := runContentConverter(); ok {
+			doc.IR = documentir.FromText(parsed.Title, text, "content-converter", "builtin-v1")
 			return text, parsed.Title, nil
 		}
 	}
@@ -1896,8 +1914,20 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 	}
 	var pieces []chunk.Piece
 	for _, node := range ir.Nodes {
-		if node.Type != documentir.TypePage && node.Type != documentir.TypeSlide && node.Type != documentir.TypeSheet && node.Type != documentir.TypeTable && node.Type != documentir.TypeSection {
+		if node.Type != documentir.TypePage && node.Type != documentir.TypeSlide && node.Type != documentir.TypeSheet && node.Type != documentir.TypeTable && node.Type != documentir.TypeTableRow && node.Type != documentir.TypeSection {
 			continue
+		}
+		if node.Type == documentir.TypeSheet {
+			hasRows := false
+			for _, child := range ir.Nodes {
+				if child.ParentID == node.ID && child.Type == documentir.TypeTableRow {
+					hasRows = true
+					break
+				}
+			}
+			if hasRows {
+				continue
+			}
 		}
 		if strings.TrimSpace(node.Text) == "" {
 			continue
@@ -1911,6 +1941,8 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 				heading = fmt.Sprintf("Slide %d", node.SlideNumber)
 			case documentir.TypeSheet:
 				heading = node.SheetName
+			case documentir.TypeTableRow:
+				heading = node.SourceAnchor.CellRange
 			case documentir.TypeTable:
 				heading = "Table"
 			}

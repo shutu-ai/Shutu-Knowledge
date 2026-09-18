@@ -83,4 +83,10 @@ if (!app.includes('class: "toast-dismiss"') || !app.includes('"Dismiss notificat
 for (const required of ["function stableID", "function chunkBodyID", "function chunkIsExpanded", "data-chunk-toggle", "Expand all", "Collapse all"]) {
   if (!app.includes(required)) throw new Error(`missing chunk expansion behavior: ${required}`);
 }
+for (const required of ["setPreview(doc, \"structure\")", "api.structure", "data-search-provenance", "sourceAnchorLabel"]) {
+  if (!app.includes(required)) throw new Error(`missing document intelligence UI: ${required}`);
+}
+if (!api.includes("/structure") || !api.includes("/understanding")) {
+  throw new Error("missing document intelligence API routes");
+}
 console.log("web contract: ok");

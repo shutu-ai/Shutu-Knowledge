@@ -142,9 +142,6 @@ func (d *Document) BindDocument(documentID string) error {
 		n := &d.Nodes[i]
 		n.ParentID = oldToNew[n.ParentID]
 		n.ChildrenIDs = nil
-		for j, child := range n.ChildrenIDs {
-			n.ChildrenIDs[j] = oldToNew[child]
-		}
 	}
 	for _, node := range d.Nodes {
 		if node.ParentID == "" {

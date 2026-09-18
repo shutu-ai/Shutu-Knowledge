@@ -119,6 +119,8 @@ export const api = {
     request(`/api/bases/${id}/documents/children?parentId=${encodeURIComponent(parentId)}&limit=${limit}&offset=${offset}`),
   document: (id) => request(`/api/documents/${id}?includeChunks=false`),
   documentWithChunks: (id) => request(`/api/documents/${id}`),
+  structure: (id) => request(`/api/documents/${id}/structure`),
+  understanding: (id) => request(`/api/documents/${id}/understanding`),
   updateDocument: (id, title) => request(`/api/documents/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
   chunks: (id, limit = 20, offset = 0) => request(`/api/documents/${id}/chunks?limit=${limit}&offset=${offset}`),
   addText: (baseID, body) => post(`/api/bases/${baseID}/documents`, body),

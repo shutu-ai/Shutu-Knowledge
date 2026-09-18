@@ -169,6 +169,22 @@ func cmdDoctor(ctx context.Context) error {
 	out, _ := json.MarshalIndent(report.Components, "", "  ")
 	fmt.Println("health:", report.Status)
 	fmt.Println(string(out))
+	coreReady := report.Ready
+	enrichmentUnavailable := false
+	for _, component := range report.Components {
+		if component.Name == "document-enrichment" && component.Status == "degraded" {
+			enrichmentUnavailable = true
+		}
+		if (component.Name == "document-parser" || component.Name == "document-ir" || component.Name == "structured-index") && component.Status != "ok" {
+			coreReady = false
+		}
+	}
+	if coreReady {
+		fmt.Println("document intelligence: CORE READY")
+	}
+	if enrichmentUnavailable {
+		fmt.Println("document enrichment: ENRICHMENT UNAVAILABLE (optional)")
+	}
 	var doctorRuntimeStatus map[string]runtime.Health
 	if application.Runtime != nil {
 		runtimeStatus := application.Runtime.Status(ctx)

@@ -1,0 +1,12 @@
+{
+  "version": "document-intelligence-golden-v1",
+  "pdf": ["simple.pdf", "multicolumn.pdf", "tables.pdf", "figures.pdf", "scanned.pdf", "long.pdf"],
+  "office": ["structured.docx", "tables.docx", "presentation.pptx", "spreadsheet.xlsx"],
+  "languages": ["English", "Chinese", "Mixed"],
+  "expected": {
+    "presentation.pptx.slides": 8,
+    "spreadsheet.xlsx.sheet": "Revenue",
+    "spreadsheet.xlsx.cell": "A2",
+    "tables.docx.tableCells": 4
+  }
+}

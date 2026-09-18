@@ -717,6 +717,7 @@ async function renderDocuments(generation = routeGeneration, baseId = state.sele
     }) }, "Refresh") : null,
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => setPreview(doc, "text") }, "Text") : null,
     doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => setPreview(doc, "chunks") }, "Chunks") : null,
+    doc.sourceType !== "directory" ? h("button", { class: "button small", onclick: () => setPreview(doc, "structure") }, "Structure") : null,
     h("button", { class: "button small", onclick: () => guard(async () => {
       const title = window.prompt("Rename document", doc.title);
       if (!title || title === doc.title) return;
@@ -872,6 +873,57 @@ function chunkIsExpanded(doc, chunk) {
   return state.chunkExpansionAll || state.expandedChunks.has(chunkKey(doc, chunk));
 }
 
+function sourceAnchorLabel(anchor = {}) {
+  const parts = [];
+  if (anchor.page) parts.push(`page ${anchor.page}`);
+  if (anchor.slide) parts.push(`slide ${anchor.slide}`);
+  if (anchor.sheet) parts.push(`sheet ${anchor.sheet}`);
+  if (anchor.cell_range) parts.push(anchor.cell_range);
+  if (anchor.section) parts.push(anchor.section);
+  if (anchor.paragraph) parts.push(`paragraph ${anchor.paragraph}`);
+  if (anchor.block) parts.push(`block ${anchor.block}`);
+  if (anchor.bbox) {
+    const { x1, y1, x2, y2 } = anchor.bbox;
+    parts.push(`bbox ${[x1, y1, x2, y2].map((value) => Number(value).toFixed(1)).join(",")}`);
+  }
+  return parts.join(" · ");
+}
+
+function structureTree(nodes) {
+  const children = new Map();
+  for (const node of nodes) {
+    const parent = node.parent_id || "";
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(node);
+  }
+  for (const values of children.values()) values.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const renderNode = (node, depth) => {
+    const nested = children.get(node.id) ?? [];
+    const anchor = sourceAnchorLabel(node.source_anchor);
+    const details = [node.type, anchor, node.confidence ? `confidence ${Math.round(node.confidence * 100)}%` : ""].filter(Boolean).join(" · ");
+    return h("div", { class: "panel panel-body", style: `margin:8px 0 8px ${Math.min(depth, 8) * 16}px` }, [
+      h("div", { class: "toolbar", style: "justify-content:space-between" }, [
+        h("strong", {}, node.text || node.type),
+        h("span", { class: "muted mono" }, details),
+      ]),
+      node.text ? h("div", { class: "muted context", style: "margin-top:6px; white-space:pre-wrap" }, node.text.slice(0, 300)) : null,
+      nested.length ? h("div", {}, nested.map((child) => renderNode(child, depth + 1))) : null,
+    ]);
+  };
+  return (children.get("") ?? []).map((node) => renderNode(node, 0));
+}
+
+function derivedCard(item) {
+  const value = item.value ?? item.text ?? item.content ?? "";
+  return h("div", { class: "panel panel-body" }, [
+    h("div", { class: "toolbar", style: "justify-content:space-between" }, [
+      h("strong", {}, item.kind || item.type || "derived knowledge"),
+      h("span", { class: "muted mono" }, `${item.model || "unknown"} · ${item.modelVersion || ""}`),
+    ]),
+    h("div", { class: "context", style: "white-space:pre-wrap; margin-top:6px" }, typeof value === "string" ? value : JSON.stringify(value, null, 2)),
+  ]);
+}
+
 async function renderPreview(container, doc, mode) {
   container.replaceChildren(h("div", { class: "section-head" }, [
     h("h2", {}, `Preview · ${doc.title}`),
@@ -910,6 +962,23 @@ async function renderPreview(container, doc, mode) {
           h("pre", { class: "context", id: bodyID }, visible),
         ]);
       }) : h("div", { class: "empty" }, "No chunks")));
+      return;
+    }
+    if (mode === "structure") {
+      const [ir, understanding] = await Promise.all([api.structure(doc.id), api.understanding(doc.id)]);
+      const nodes = ir.nodes ?? [];
+      const derived = understanding.items ?? [];
+      container.append(h("div", { class: "toolbar", style: "justify-content:space-between; margin:10px 0" }, [
+        h("span", { class: "muted" }, `${ir.ir_version || "document IR"} · ${nodes.length} nodes · ${ir.parser || "parser unknown"}`),
+        h("span", { class: "muted mono" }, ir.parser_version || ""),
+      ]));
+      if (derived.length) {
+        container.append(h("div", { class: "section" }, [h("h3", {}, "Understanding"), h("div", { class: "list" }, derived.map(derivedCard))]));
+      }
+      container.append(h("div", { class: "section" }, [
+        h("h3", {}, "Document structure"),
+        nodes.length ? h("div", {}, structureTree(nodes)) : h("div", { class: "empty" }, "No structured nodes"),
+      ]));
       return;
     }
     const text = await api.rawText(doc.id);
@@ -1235,9 +1304,17 @@ async function renderRecall(initialQuery = "") {
 
   function citationText(hit, index) {
     const heading = hit.heading ? ` — ${hit.heading}` : "";
+    const citation = hit.citation || {};
+    const location = [
+      citation.section ? `section=${citation.section}` : "",
+      citation.page ? `page=${citation.page}` : "",
+      citation.slide ? `slide=${citation.slide}` : "",
+      citation.sheet ? `sheet=${citation.sheet}` : "",
+      citation.cellRange ? `cell=${citation.cellRange}` : "",
+    ].filter(Boolean).join("; ");
     return [
       `[${index + 1}] ${hit.documentTitle || hit.docId}${heading}`,
-      `source: baseId=${hit.baseId}; docId=${hit.docId}; chunkId=${hit.chunkId}; chunkIndex=${hit.index}`,
+      `source: baseId=${hit.baseId}; docId=${hit.docId}; chunkId=${hit.chunkId}; chunkIndex=${hit.index}${location ? `; ${location}` : ""}`,
       hit.text,
     ].join("\n");
   }
@@ -1289,6 +1366,14 @@ function renderResults(container, result) {
           ]),
         ]),
       excerpt(hit),
+        hit.citation ? h("div", { class: "muted mono", "data-search-provenance": "true" }, [
+          "provenance: ",
+          hit.citation.section ? `section=${hit.citation.section} · ` : "",
+          hit.citation.page ? `page=${hit.citation.page} · ` : "",
+          hit.citation.slide ? `slide=${hit.citation.slide} · ` : "",
+          hit.citation.sheet ? `sheet=${hit.citation.sheet} · ` : "",
+          hit.citation.cellRange ? `cell=${hit.citation.cellRange}` : "",
+        ]) : null,
         h("div", { class: "muted mono" }, `base ${hit.baseId} · doc ${hit.docId} · chunk ${hit.chunkId}`),
     ])),
     result.rerank ? h("div", { class: "muted mono", style: "margin-bottom:12px" },

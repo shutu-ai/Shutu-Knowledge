@@ -41,4 +41,14 @@ The existing chunker remains the retrieval implementation. It receives an IR
 projection and records the node IDs whose text contributes to each chunk.
 This preserves heading-aware and token-limit behavior while making page,
 slide, sheet, table, and section provenance available to later retrieval and
-citation work.
+citation work. XLSX rows are represented explicitly and table-cell anchors
+win over sheet-root anchors when a search hit contains a row value.
+
+## Diagnostics and UI
+
+Doctor reports `document-parser`, `document-ir`, and `structured-index` as
+critical core checks. Optional LLM enrichment is reported separately as
+degraded (`ENRICHMENT UNAVAILABLE`) while deterministic built-in summaries
+remain available. The Documents view exposes a small Structure inspector with
+node text, parent/child nesting, source anchors, confidence, and derived
+records; search results include section/page/slide/sheet/cell provenance.

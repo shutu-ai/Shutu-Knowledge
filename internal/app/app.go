@@ -452,6 +452,16 @@ func (a *App) registerOptionalHealth() {
 				},
 			})
 		}
+		// LLM enrichment is deliberately optional. The deterministic built-in
+		// summaries remain part of the core path even when no enrichment provider
+		// is configured, so this must report degraded rather than fail readiness.
+		a.Health.Register(health.CheckerFunc{
+			CheckName: "document-enrichment",
+			Level:     health.Optional,
+			Fn: func(context.Context) error {
+				return fmt.Errorf("optional LLM enrichment unavailable; built-in deterministic understanding is active")
+			},
+		})
 	}
 	if strings.TrimSpace(a.Config.Helpers.ContentConverter) == "" {
 		registerUnavailable("helper-content-converter", "PDF content converter is not configured (MANUAL_EXTERNAL_RUNTIME)")
@@ -607,6 +617,26 @@ func (a *App) registerHealth() {
 			return err
 		},
 	})
+	// Document intelligence is a core, local capability. Keep its storage
+	// checks critical so doctor and /api/status distinguish a missing 0.3
+	// foundation from optional model enrichment.
+	for _, checkName := range []string{"document-parser", "document-ir", "structured-index"} {
+		name := checkName
+		a.Health.Register(health.CheckerFunc{
+			CheckName: name,
+			Level:     health.Critical,
+			Fn: func(ctx context.Context) error {
+				version, err := storage.SchemaVersionContext(ctx, a.DB.ReadDB())
+				if err != nil {
+					return err
+				}
+				if version < 18 {
+					return fmt.Errorf("document intelligence migration unavailable (schema version %d)", version)
+				}
+				return nil
+			},
+		})
+	}
 	// Index and model subsystems register in their own phases; optional
 	// checks degrade without flipping readiness.
 }

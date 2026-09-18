@@ -52,8 +52,14 @@ additive `CitationV2` data while preserving the 0.2 fields and ranking lanes.
 
 - `go test ./... -count=1 -timeout=30m`: PASS
 - `go test -race ./... -count=1 -timeout=30m`: PASS; no race reports
+- `go build ./...`: PASS
+- `go vet ./...`: PASS
+- storage writer guard: PASS (`go test ./scripts -run '^TestWriterGuard$' -count=1`)
 - `npm test`: PASS
+- `npm run typecheck`: PASS
 - `npm run build`: PASS; embedded six-file Web bundle rebuilt
+- Chrome/CDP Web E2E: PASS (`web e2e: Chrome/CDP lifecycle passed`)
+- CI benchmark smoke: PASS (`go test ./internal/knowledge -run '^$' -bench Benchmark -benchtime=1x`)
 - Ingestion diagnostics now expose parse, IR-build, structure-aware chunk,
   embedding, peak RSS, and serialized IR-size measurements without recording
   document content or credentials.
@@ -93,8 +99,10 @@ or credentials.
   production-sized Office/PDF files; OCR/rendering remains an optional runtime.
 - Visual figure understanding, entity/ontology extraction, GraphRAG, query
   routing v0, and a richer chunk-link inspector remain deferred to 0.4+.
-- CI push/tag status was not queried because this workspace has no GitHub CLI
-  authentication and no push/tag was performed.
+- Local CI-equivalent build, vet, Web typecheck/test/build/E2E, writer guard, and
+  benchmark smoke all pass. Remote Push CI and Tag CI were not run: the local
+  branch is ahead of `origin/master` and GitHub CLI reports no authenticated
+  account; no push/tag was performed.
 - A real external Agent Host acceptance run remains a release-host gate.
 
 ## Release status

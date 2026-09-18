@@ -16,9 +16,10 @@ const semanticSearchScoringVersion = "lexical-v1"
 
 // SearchOptions controls deterministic semantic-memory retrieval.
 type SearchOptions struct {
-	Query string
-	TopK  int
-	Kinds []UnitKind
+	Query  string
+	TopK   int
+	Kinds  []UnitKind
+	Intent QueryIntent
 }
 
 // SearchHit is one activated semantic unit and its exact evidence closure.
@@ -39,6 +40,7 @@ type SearchResponse struct {
 	RequestedKinds  []UnitKind  `json:"requestedKinds"`
 	Generation      int64       `json:"generation"`
 	ScoringVersion  string      `json:"scoringVersion"`
+	Routing         *QueryPlan  `json:"routing,omitempty"`
 	Hits            []SearchHit `json:"hits,omitempty"`
 }
 
@@ -48,6 +50,11 @@ type SearchResponse struct {
 func SearchCompilation(compilation Compilation, options SearchOptions) (SearchResponse, error) {
 	if strings.TrimSpace(compilation.BaseID) == "" || compilation.Generation <= 0 {
 		return SearchResponse{}, fmt.Errorf("semantic search requires a compilation scope")
+	}
+	routing := RouteQuery(options.Query)
+	intent := options.Intent
+	if intent == "" {
+		intent = routing.Intent
 	}
 	normalized := normalizeSearchText(options.Query)
 	terms := SearchTerms(options.Query)
@@ -76,6 +83,11 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 			continue
 		}
 		score, coverage, matched := scoreSemanticUnit(unit, normalized, terms)
+		if score <= 0 && intent == IntentGlobal && (unit.Type == UnitTopic || unit.Type == UnitSummary) {
+			score = float64(len(unit.DerivedFrom)) * 0.1
+			coverage = 1
+			matched = []string{"global"}
+		}
 		if score <= 0 || len(matched) == 0 {
 			continue
 		}
@@ -113,7 +125,7 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 	return SearchResponse{
 		Query: options.Query, NormalizedQuery: normalized, Terms: terms,
 		RequestedKinds: kinds, Generation: compilation.Generation,
-		ScoringVersion: semanticSearchScoringVersion, Hits: hits,
+		ScoringVersion: semanticSearchScoringVersion, Routing: &routing, Hits: hits,
 	}, nil
 }
 

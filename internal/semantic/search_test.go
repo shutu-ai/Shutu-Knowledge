@@ -71,3 +71,22 @@ func searchCompilationFixture(t *testing.T) Compilation {
 	}
 	return compilation
 }
+
+func TestGlobalSearchReturnsHierarchicalOrientationWithoutLexicalOverlap(t *testing.T) {
+	response, err := SearchCompilation(searchCompilationFixture(t), SearchOptions{Query: "summarize the whole knowledge base", TopK: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Routing == nil || response.Routing.Intent != IntentGlobal {
+		t.Fatalf("global routing = %+v", response.Routing)
+	}
+	topic := false
+	for _, hit := range response.Hits {
+		if hit.Unit.Type == UnitTopic {
+			topic = true
+		}
+	}
+	if !topic {
+		t.Fatalf("global search returned no topic: %+v", response.Hits)
+	}
+}

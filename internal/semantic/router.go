@@ -65,7 +65,7 @@ func RouteQuery(query string) QueryPlan {
 		"overview", "what are the main", "全局", "整体", "总结", "概述", "主要讲", "全部")
 	addSignals(IntentCrossDocument, "across documents", "across the documents", "all documents",
 		"different documents", "multiple documents", "each document", "跨文档", "多个文档", "所有文档", "分别")
-	addSignals(IntentComparison, "compare", "comparison", "difference", "differences", " versus ", " vs ",
+	addSignals(IntentComparison, "compare", "comparison", "difference", "differences", "differ", " versus ", " vs ",
 		"比较", "区别", "对比", "差异")
 	addSignals(IntentMultiHop, "how does", "lead to", "leads to", "because", "cause", "affect",
 		"relationship", "connected", "chain", "影响", "导致", "因为", "关系", "链路", "依赖")

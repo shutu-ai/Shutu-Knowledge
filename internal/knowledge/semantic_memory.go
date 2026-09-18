@@ -296,8 +296,24 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
+	memory, err := s.SearchSemanticMemory(ctx, baseID, semantic.SearchOptions{Query: query, TopK: 8})
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return semantic.ContextPackage{}, err
+	}
+	queries := []string{query}
+	for _, hit := range memory.Hits {
+		if hit.Unit.Type != semantic.UnitConcept && hit.Unit.Type != semantic.UnitTopic {
+			continue
+		}
+		if title := strings.TrimSpace(hit.Unit.Title); title != "" {
+			queries = append(queries, title)
+		}
+		if len(queries) >= 4 {
+			break
+		}
+	}
 	search, err := s.Search(ctx, SearchRequest{
-		BaseID: baseID, Query: query, TopK: 8, Mode: "hybrid",
+		BaseID: baseID, Query: query, Queries: queries, TopK: 8, Mode: "hybrid",
 	})
 	if err != nil {
 		return semantic.ContextPackage{}, err

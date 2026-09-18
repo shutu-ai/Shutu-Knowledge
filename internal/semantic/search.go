@@ -78,8 +78,12 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 	for _, kind := range kinds {
 		kindSet[kind] = true
 	}
+	historical := strings.Contains(normalized, "history") || strings.Contains(normalized, "historical") ||
+		strings.Contains(normalized, "before") || strings.Contains(normalized, "之前") || strings.Contains(normalized, "历史")
 	for _, unit := range compilation.Units {
-		if unit.Status != UnitActive || !kindSet[unit.Type] {
+		statusVisible := unit.Status == UnitActive ||
+			(historical && (unit.Status == UnitSuperseded || unit.Status == UnitConflicted))
+		if !statusVisible || !kindSet[unit.Type] {
 			continue
 		}
 		score, coverage, matched := scoreSemanticUnit(unit, normalized, terms)

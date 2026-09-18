@@ -2,6 +2,9 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,7 +66,11 @@ func TestSemanticBenchmarkCoversReleaseGateQueryFamilies(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			baselineDocs, baselineTokens := benchmarkEvidenceProjection(service, ctx, base.ID, testCase.query)
-			pkg, err := service.CompileKnowledgeContext(ctx, base.ID, testCase.query, 2048)
+			equalBudget := baselineTokens
+			if equalBudget < 64 {
+				equalBudget = 64
+			}
+			pkg, err := service.CompileKnowledgeContext(ctx, base.ID, testCase.query, equalBudget)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -71,6 +78,7 @@ func TestSemanticBenchmarkCoversReleaseGateQueryFamilies(t *testing.T) {
 				t.Fatalf("routing = %+v, want %s", pkg.Routing, testCase.expectedIntent)
 			}
 			contextDocs := contextDocumentSet(pkg)
+			t.Logf("equal-token context: budget=%d diagnostics=%+v", pkg.TokenBudget, pkg.Diagnostics)
 			baselineScore := documentCoverage(baselineDocs, testCase.requiredDocs)
 			semanticScore := documentCoverage(contextDocs, testCase.requiredDocs)
 			if testCase.name == "global" {
@@ -103,8 +111,32 @@ func TestSemanticBenchmarkCoversReleaseGateQueryFamilies(t *testing.T) {
 	if totalSemantic <= totalBaseline {
 		t.Fatalf("benchmark did not improve 0.3: semantic=%.3f baseline=%.3f", totalSemantic, totalBaseline)
 	}
-	t.Logf("benchmark proxy: 0.3=%.3f 0.4=%.3f baseline_tokens=%d semantic_tokens=%d",
-		totalBaseline, totalSemantic, totalBaselineTokens, totalSemanticTokens)
+
+	var legacy struct {
+		ProductVersion  string  `json:"productVersion"`
+		SourceTag       string  `json:"sourceTag"`
+		GitSHA          string  `json:"gitSha"`
+		AggregateScore  float64 `json:"aggregateScore"`
+		AggregateTokens int     `json:"aggregateTokens"`
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "0.4_benchmark_0.2_baseline.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ProductVersion != "0.2.1" || legacy.SourceTag != "v0.2.1" || len(legacy.GitSHA) != 40 {
+		t.Fatalf("invalid immutable 0.2 baseline provenance: %+v", legacy)
+	}
+	if totalSemantic <= legacy.AggregateScore {
+		t.Fatalf("0.4 did not improve immutable 0.2 baseline: semantic=%.3f legacy=%.3f", totalSemantic, legacy.AggregateScore)
+	}
+	if totalSemanticTokens > legacy.AggregateTokens {
+		t.Fatalf("0.4 used more tokens than immutable 0.2 baseline: semantic=%d legacy=%d", totalSemanticTokens, legacy.AggregateTokens)
+	}
+	t.Logf("benchmark proxy: 0.2=%.3f 0.3=%.3f 0.4=%.3f tokens: 0.2=%d 0.3=%d 0.4=%d",
+		legacy.AggregateScore, totalBaseline, totalSemantic, legacy.AggregateTokens, totalBaselineTokens, totalSemanticTokens)
 }
 
 func importSemanticBenchmarkCorpus(t *testing.T, service *semanticMemoryTestService, ctx context.Context) (Base, map[string]string) {

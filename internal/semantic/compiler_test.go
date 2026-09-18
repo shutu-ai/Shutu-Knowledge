@@ -27,9 +27,6 @@ func TestBuiltinCompilerProducesProvenancedHierarchy(t *testing.T) {
 	if !reflect.DeepEqual(counts, map[UnitKind]int{UnitFact: 1, UnitConcept: 1, UnitTopic: 1, UnitSummary: 2}) {
 		t.Fatalf("unit counts = %+v, compilation = %+v", counts, first)
 	}
-	if len(first.Relations) != 0 {
-		t.Fatalf("PH2 unexpectedly emitted semantic relations: %+v", first.Relations)
-	}
 
 	var fact, concept, topic, summary Unit
 	for _, unit := range first.Units {
@@ -156,5 +153,63 @@ func TestCompilerMarksOlderVersionedFactSuperseded(t *testing.T) {
 		if hit.Unit.ID == oldFact.ID {
 			t.Fatalf("superseded fact returned as active: %+v", hit.Unit)
 		}
+	}
+}
+
+func TestCompilerMarksSameVersionContradictionConflicted(t *testing.T) {
+	documents := []SourceDocument{
+		sourceDocumentForCompile("doc-a", "Release", "# Release\n\nVersion 0.3 supports the 1M context window.", 1, 1),
+		sourceDocumentForCompile("doc-b", "Release Copy", "# Release\n\nVersion 0.3 supports the 2M context window.", 2, 2),
+	}
+	compilation, err := Compile("base-conflict", 1, documents, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflicted := 0
+	for _, unit := range compilation.Units {
+		if unit.Type != UnitFact || !strings.Contains(strings.ToLower(unit.Content), "context window") {
+			continue
+		}
+		if unit.Status != UnitConflicted || unit.Metadata["temporal_conflict"] != "same-version" {
+			t.Fatalf("same-version fact not marked conflicted: %+v", unit)
+		}
+		conflicted++
+	}
+	if conflicted != 2 {
+		t.Fatalf("conflicted fact count = %d, want 2", conflicted)
+	}
+	factSearch, err := SearchCompilation(compilation, SearchOptions{Query: "version context window", Kinds: []UnitKind{UnitFact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(factSearch.Hits) != 0 {
+		t.Fatalf("conflicted facts leaked into active fact search: %+v", factSearch.Hits)
+	}
+}
+
+func TestTemporalSearchCanRecallSupersededHistory(t *testing.T) {
+	documents := []SourceDocument{
+		sourceDocumentForCompile("doc-old-history", "Release", "# Release\n\nVersion 0.2 supports the 128k context window.", 1, 1),
+		sourceDocumentForCompile("doc-new-history", "Release", "# Release\n\nVersion 0.3 supports the 1M context window.", 2, 2),
+	}
+	compilation, err := Compile("base-history", 1, documents, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := SearchCompilation(compilation, SearchOptions{Query: "historical Version 0.2 supports the 128k context window", Kinds: []UnitKind{UnitFact}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Hits) == 0 {
+		t.Fatal("historical temporal search returned no superseded fact")
+	}
+	found := false
+	for _, hit := range response.Hits {
+		if strings.Contains(strings.ToLower(hit.Unit.Content), "128k") && hit.Unit.Status == UnitSuperseded {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("historical superseded fact missing: %+v", response.Hits)
 	}
 }

@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "productVersion": "0.2.1",
+  "sourceTag": "v0.2.1",
+  "gitSha": "66d5a4fa9f05945b459235e171e7d43423eb302b",
+  "method": "immutable-tag worktree; hybrid Search TopK=8; evidence windows serialized with the shared token estimator",
+  "queries": [
+    {"name":"fact","score":1,"tokens":135},
+    {"name":"global","score":1,"tokens":135},
+    {"name":"cross-document","score":0.5,"tokens":41},
+    {"name":"multi-hop","score":1,"tokens":102},
+    {"name":"temporal-current","score":1,"tokens":41}
+  ],
+  "aggregateScore": 4.5,
+  "aggregateTokens": 454
+}

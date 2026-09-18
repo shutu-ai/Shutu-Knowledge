@@ -52,7 +52,8 @@ Key documents:
 - [docs/0.4_context_compiler.md](docs/0.4_context_compiler.md) — 0.4 semantic+evidence context package
 - [docs/0.4_query_routing.md](docs/0.4_query_routing.md) — 0.4 AUTO intent and lane routing
 - [docs/0.4_living_wiki.md](docs/0.4_living_wiki.md) — 0.4 regenerable KnowledgeUnit Wiki view
-- [docs/0.4_benchmark.md](docs/0.4_benchmark.md) — preliminary 0.3-vs-0.4 support-quality benchmark
+- [docs/0.4_benchmark.md](docs/0.4_benchmark.md) — preliminary 0.2/0.3-vs-0.4 support-quality benchmark
+- [docs/0.4_lightweight_relations.md](docs/0.4_lightweight_relations.md) — benchmark-justified Fact sequence relations
 - [docs/0.4_api_ui.md](docs/0.4_api_ui.md) — semantic REST API and Web Knowledge Explorer
 - [docs/shutu_agent_0.4_requirements.md](docs/shutu_agent_0.4_requirements.md) — Agent-side 0.4 consumption requirements
 - [docs/0.4_release_gate.md](docs/0.4_release_gate.md) — current 0.4 release-gate evidence and blockers

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,13 +41,14 @@ type SourceDocument struct {
 }
 
 type factCandidate struct {
-	canonicalKey string
-	content      string
-	heading      string
-	nodeType     string
-	confidence   float64
-	sources      []EvidenceSource
-	conceptKeys  map[string]bool
+	canonicalKey   string
+	content        string
+	heading        string
+	nodeType       string
+	confidence     float64
+	sources        []EvidenceSource
+	conceptKeys    map[string]bool
+	predecessorKey string
 }
 
 type conceptCandidate struct {
@@ -117,6 +119,7 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 	}
 
 	unitByFactKey, factUnits := buildFactUnits(baseID, generation, facts, createdAt)
+	sequenceRelations := buildSequenceRelations(baseID, generation, facts, unitByFactKey, createdAt)
 	conceptUnits := buildConceptUnits(baseID, generation, concepts, facts, unitByFactKey, createdAt)
 	topicUnits := buildTopicUnits(baseID, generation, topics, createdAt)
 	summaryUnits := buildSummaryUnits(baseID, generation, documents, concepts, facts, unitByFactKey, createdAt)
@@ -126,6 +129,7 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 	compilation.Units = append(compilation.Units, topicUnits...)
 	compilation.Units = append(compilation.Units, summaryUnits...)
 	compilation.Units = reconcileTemporalUnits(compilation.Units, baseID, generation, createdAt)
+	compilation.Relations = sequenceRelations
 	if err := compilation.Validate(); err != nil {
 		return Compilation{}, err
 	}
@@ -175,6 +179,29 @@ func reconcileTemporalUnits(units []Unit, baseID string, generation int64, now i
 			}
 			return group[i].unit.CanonicalKey < group[j].unit.CanonicalKey
 		})
+		latestVersion := group[len(group)-1].version
+		latestDuplicates := 0
+		for i := len(group) - 1; i >= 0 && group[i].version == latestVersion; i-- {
+			latestDuplicates++
+		}
+		if latestDuplicates > 1 {
+			// Same subject/attribute/version with different normalized values is
+			// a potential contradiction. Keep both units queryable as historical
+			// evidence but exclude them from the active fact lane.
+			for _, conflict := range group[len(group)-latestDuplicates:] {
+				conflict.unit.Status = UnitConflicted
+				conflict.unit.SupersededBy = ""
+				if conflict.unit.Metadata == nil {
+					conflict.unit.Metadata = map[string]string{}
+				}
+				conflict.unit.Metadata["temporal_conflict"] = "same-version"
+				conflict.unit.UpdatedAt = now
+			}
+			group = group[:len(group)-latestDuplicates]
+			if len(group) == 0 {
+				continue
+			}
+		}
 		successor := group[len(group)-1]
 		successor.unit.Status = UnitActive
 		successor.unit.SupersededBy = ""
@@ -233,8 +260,11 @@ func parseVersionNumber(value string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSuffix(value, "x"), 64)
 }
 
+var versionedIdentifierSuffix = regexp.MustCompile(`_[a-z]?[0-9]+`)
+
 func normalizeTemporalAttribute(value string) string {
 	value = strings.ToLower(value)
+	value = versionedIdentifierSuffix.ReplaceAllString(value, " ")
 	replacements := []string{"the ", "a ", "an ", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", ".", ",", "%", "k", "m", "x"}
 	for _, replacement := range replacements {
 		value = strings.ReplaceAll(value, replacement, " ")
@@ -310,6 +340,7 @@ func addConceptCandidate(out map[string]*conceptCandidate, title, key string, do
 
 func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandidate) map[string]*factCandidate {
 	out := map[string]*factCandidate{}
+	lastFactByNode := map[string]string{}
 	for _, doc := range documents {
 		count := 0
 		for _, node := range doc.IR.Nodes {
@@ -344,10 +375,12 @@ func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandid
 						canonicalKey: key, content: content,
 						heading:  strings.Join(node.HeadingPath, " / "),
 						nodeType: string(node.Type), confidence: confidence,
-						conceptKeys: map[string]bool{},
+						conceptKeys:    map[string]bool{},
+						predecessorKey: lastFactByNode[doc.DocumentID+"\x00"+node.ID],
 					}
 					out[key] = candidate
 				}
+				lastFactByNode[doc.DocumentID+"\x00"+node.ID] = key
 				if conceptKey := matchConceptKey(content, node, concepts); conceptKey != "" {
 					candidate.conceptKeys[conceptKey] = true
 					concepts[conceptKey].factKeys[key] = true
@@ -421,6 +454,42 @@ func assignConceptTopics(concepts map[string]*conceptCandidate, topics map[strin
 			topics[bestKey].conceptKeys[concept.canonicalKey] = true
 		}
 	}
+}
+
+func buildSequenceRelations(baseID string, generation int64, facts map[string]*factCandidate, factIDs map[string]string, now int64) []Relation {
+	keys := sortedMapKeys(facts)
+	out := make([]Relation, 0, len(keys))
+	for _, key := range keys {
+		fact := facts[key]
+		if fact.predecessorKey == "" || factIDs[fact.predecessorKey] == "" {
+			continue
+		}
+		predecessor := facts[fact.predecessorKey]
+		if predecessor == nil {
+			continue
+		}
+		subjectID := factIDs[fact.predecessorKey]
+		objectID := factIDs[key]
+		canonicalKey := "sequence:" + fact.predecessorKey + ":" + key
+		sources := append(append([]EvidenceSource(nil), predecessor.sources...), fact.sources...)
+		SortEvidenceSources(sources)
+		for i := range sources {
+			sources[i].SourceOrder = i
+		}
+		confidence := fact.confidence
+		if predecessor.confidence < confidence {
+			confidence = predecessor.confidence
+		}
+		out = append(out, Relation{
+			ID:     RelationID(baseID, generation, RelationRelatedTo, subjectID, objectID, canonicalKey),
+			BaseID: baseID, Generation: generation, Type: RelationRelatedTo,
+			SubjectUnitID: subjectID, ObjectUnitID: objectID,
+			Predicate: "sequence", Statement: predecessor.content + " → " + fact.content,
+			CanonicalKey: canonicalKey, Confidence: confidence, Status: UnitActive,
+			Sources: sources, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	return out
 }
 
 func buildFactUnits(baseID string, generation int64, facts map[string]*factCandidate, now int64) (map[string]string, []Unit) {
@@ -639,13 +708,14 @@ func isExplicitFact(text string) bool {
 	lower := strings.ToLower(text)
 	english := []string{" is ", " are ", " was ", " were ", " uses ", " provides ", " requires ",
 		" contains ", " returns ", " supports ", " enables ", " includes ", " means ",
-		" belongs to ", " consists of ", " must ", " should ", " defaults to ", " can "}
+		" belongs to ", " consists of ", " must ", " should ", " defaults to ", " can ",
+		" affects ", " causes ", " depends on ", " submits ", " serializes ", " owns ", " avoids "}
 	for _, marker := range english {
 		if strings.Contains(lower, marker) {
 			return true
 		}
 	}
-	chinese := []string{"是", "使用", "提供", "必须", "应该", "包括", "包含", "返回", "支持", "表示", "属于", "默认", "需要", "会"}
+	chinese := []string{"是", "使用", "提供", "必须", "应该", "包括", "包含", "返回", "支持", "表示", "属于", "默认", "需要", "会", "影响", "导致", "依赖"}
 	for _, marker := range chinese {
 		if strings.Contains(text, marker) {
 			return true
@@ -665,7 +735,9 @@ func splitSentences(text string) []string {
 	for i, r := range runes {
 		keepDecimal := r == '.' && i > 0 && i+1 < len(runes) &&
 			unicode.IsDigit(runes[i-1]) && unicode.IsDigit(runes[i+1])
-		if keepDecimal {
+		keepIdentifier := r == '.' && i > 0 && i+1 < len(runes) &&
+			unicode.IsLetter(runes[i-1]) && unicode.IsLetter(runes[i+1])
+		if keepDecimal || keepIdentifier {
 			current = append(current, r)
 			continue
 		}

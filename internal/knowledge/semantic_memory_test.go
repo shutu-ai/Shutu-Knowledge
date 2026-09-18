@@ -191,7 +191,11 @@ type semanticMemoryTestService struct {
 
 func newSemanticMemoryTestService(t *testing.T) *semanticMemoryTestService {
 	t.Helper()
-	home := t.TempDir()
+	return newSemanticMemoryTestServiceAt(t, t.TempDir())
+}
+
+func newSemanticMemoryTestServiceAt(t *testing.T, home string) *semanticMemoryTestService {
+	t.Helper()
 	db, err := storage.Open(filepath.Join(home, "knowledge.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -206,4 +210,141 @@ func newSemanticMemoryTestService(t *testing.T) *semanticMemoryTestService {
 		Service: NewService(db, raw, cfg),
 		close:   func() { _ = db.Close() },
 	}
+}
+
+func TestSemanticCompilationRecoversPendingChangeAfterRestart(t *testing.T) {
+	home := t.TempDir()
+	ctx := context.Background()
+
+	first := newSemanticMemoryTestServiceAt(t, home)
+	base, err := first.CreateBase("Semantic Restart", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.AddTextDocument(ctx, base.ID, "Vector Guide",
+		"# Vector Retrieval\n\nThe vector service uses 1024-dimensional vectors."); err != nil {
+		t.Fatal(err)
+	}
+	first.close()
+
+	second := newSemanticMemoryTestServiceAt(t, home)
+	initial, err := second.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.Generation != 1 {
+		t.Fatalf("initial generation = %d, want 1", initial.Generation)
+	}
+	if _, err := second.AddTextDocument(ctx, base.ID, "Vector Update",
+		"# Vector Retrieval\n\nThe vector service uses 1024-dimensional vectors and reranking."); err != nil {
+		t.Fatal(err)
+	}
+	second.close()
+
+	third := newSemanticMemoryTestServiceAt(t, home)
+	recovered, err := third.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("restart compilation: %v", err)
+	}
+	if recovered.Generation != 2 {
+		t.Fatalf("recovered generation = %d, want 2", recovered.Generation)
+	}
+	summaries := 0
+	for _, unit := range recovered.Units {
+		if unit.Type == semantic.UnitSummary {
+			summaries++
+		}
+		sources, err := third.ResolveSemanticUnitEvidence(ctx, unit.ID)
+		if err != nil {
+			t.Fatalf("restart provenance %s: %v", unit.ID, err)
+		}
+		if len(sources) == 0 {
+			t.Fatalf("restart unit lacks evidence: %+v", unit)
+		}
+	}
+	if summaries != 2 {
+		t.Fatalf("restart summaries = %d, want 2", summaries)
+	}
+	third.close()
+}
+
+func TestSemanticMigrationUpgradesActive0_3DatabaseWithoutEvidenceRebuild(t *testing.T) {
+	home := t.TempDir()
+	ctx := context.Background()
+	first := newSemanticMemoryTestServiceAt(t, home)
+	base, err := first.CreateBase("Semantic Upgrade", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := first.AddTextDocument(ctx, base.ID, "Vector Migration",
+		"# Vector Retrieval\n\nThe vector service uses 1024-dimensional vectors.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := first.Search(ctx, SearchRequest{BaseID: base.ID, Query: "1024-dimensional vectors", TopK: 2})
+	if err != nil || len(before.Hits) == 0 {
+		t.Fatalf("0.3 search before downgrade: hits=%d err=%v", len(before.Hits), err)
+	}
+	first.close()
+
+	legacy, err := storage.Open(filepath.Join(home, "knowledge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DROP TABLE knowledge_relation_sources`,
+		`DROP TABLE knowledge_relations`,
+		`DROP TABLE knowledge_unit_derived_from`,
+		`DROP TABLE knowledge_unit_sources`,
+		`DROP TABLE knowledge_units`,
+		`DROP TABLE knowledge_compilations`,
+		`DROP TABLE knowledge_compilation_queue`,
+		`DELETE FROM schema_migrations WHERE version IN (19, 20)`,
+	} {
+		if _, err := legacy.Exec(statement); err != nil {
+			t.Fatalf("simulate 0.3 schema (%s): %v", statement, err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := storage.Open(filepath.Join(home, "knowledge.db"))
+	if err != nil {
+		t.Fatalf("apply semantic migrations: %v", err)
+	}
+	version, err := storage.SchemaVersion(upgraded.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version < 20 {
+		t.Fatalf("upgraded schema version = %d, want at least 20", version)
+	}
+	if err := upgraded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := newSemanticMemoryTestServiceAt(t, home)
+	after, err := second.Search(ctx, SearchRequest{BaseID: base.ID, Query: "1024-dimensional vectors", TopK: 2})
+	if err != nil || len(after.Hits) == 0 {
+		t.Fatalf("0.3 search after upgrade: hits=%d err=%v", len(after.Hits), err)
+	}
+	if after.Hits[0].IndexGeneration != before.Hits[0].IndexGeneration || after.Hits[0].ChunkID != before.Hits[0].ChunkID {
+		t.Fatalf("upgrade rebuilt evidence: before=%+v after=%+v", before.Hits[0], after.Hits[0])
+	}
+	compiled, err := second.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("compile upgraded 0.3 KB: %v", err)
+	}
+	found := false
+	for _, unit := range compiled.Units {
+		for _, source := range unit.Sources {
+			if source.DocumentID == document.ID {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("upgraded compilation omitted legacy document provenance")
+	}
+	second.close()
 }

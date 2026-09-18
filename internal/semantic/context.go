@@ -90,8 +90,8 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 	if budget <= 0 {
 		budget = DefaultContextTokenBudget
 	}
-	if budget < 512 {
-		budget = 512
+	if budget < 64 {
+		budget = 64
 	}
 	if budget > 32768 {
 		budget = 32768
@@ -136,10 +136,91 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 		seenConcept[line] = true
 		pkg.Concepts = append(pkg.Concepts, line)
 	}
-	for _, hit := range facts.Hits {
-		pkg.Facts = append(pkg.Facts, clipContextText(hit.Unit.Content, 320))
+	factContent := func(content string) {
+		clipped := clipContextText(content, 320)
+		for _, existing := range pkg.Facts {
+			if existing == clipped {
+				return
+			}
+		}
+		if len(pkg.Facts) < 12 {
+			pkg.Facts = append(pkg.Facts, clipped)
+		}
 	}
-	pkg.Relations = []string{}
+	for _, hit := range facts.Hits {
+		factContent(hit.Unit.Content)
+	}
+	// Multi-hop orientation follows the activated concept/topic subtree rather
+	// than relying solely on lexical overlap with every distant hop.
+	if routing.Intent == IntentMultiHop {
+		unitsByID := make(map[string]Unit, len(compilation.Units))
+		for _, unit := range compilation.Units {
+			unitsByID[unit.ID] = unit
+		}
+		visited := map[string]bool{}
+		var collect func(unitID string)
+		collect = func(unitID string) {
+			if visited[unitID] {
+				return
+			}
+			visited[unitID] = true
+			unit, ok := unitsByID[unitID]
+			if !ok {
+				return
+			}
+			if unit.Type == UnitFact {
+				factContent(unit.Content)
+			}
+			for _, derived := range unit.DerivedFrom {
+				collect(derived)
+			}
+		}
+		for _, hit := range orientation.Hits {
+			collect(hit.Unit.ID)
+		}
+
+		type relationEdge struct {
+			relation Relation
+			otherID  string
+		}
+		adjacency := map[string][]relationEdge{}
+		for _, relation := range compilation.Relations {
+			if relation.Status != UnitActive {
+				continue
+			}
+			adjacency[relation.SubjectUnitID] = append(adjacency[relation.SubjectUnitID], relationEdge{relation: relation, otherID: relation.ObjectUnitID})
+			adjacency[relation.ObjectUnitID] = append(adjacency[relation.ObjectUnitID], relationEdge{relation: relation, otherID: relation.SubjectUnitID})
+		}
+		queue := make([]string, 0, len(orientation.Hits)+len(facts.Hits))
+		for _, hit := range orientation.Hits {
+			queue = append(queue, hit.Unit.ID)
+		}
+		for _, hit := range facts.Hits {
+			queue = append(queue, hit.Unit.ID)
+		}
+		visitedRelations := map[string]bool{}
+		for depth := 0; depth < 2 && len(queue) > 0; depth++ {
+			next := make([]string, 0)
+			for _, unitID := range queue {
+				for _, edge := range adjacency[unitID] {
+					if !visitedRelations[edge.relation.ID] {
+						visitedRelations[edge.relation.ID] = true
+						if len(pkg.Relations) < 8 {
+							pkg.Relations = append(pkg.Relations, clipContextText(edge.relation.Statement, 320))
+						}
+					}
+					if other, ok := unitsByID[edge.otherID]; ok && other.Type == UnitFact && other.Status == UnitActive {
+						factContent(other.Content)
+						next = append(next, other.ID)
+					}
+				}
+			}
+			queue = next
+		}
+	}
+	if pkg.Relations == nil {
+		pkg.Relations = []string{}
+	}
 
 	deduplicated := deduplicateContextEvidence(evidence)
 	pkg.Diagnostics = ContextDiagnostics{
@@ -153,6 +234,13 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 
 func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	remaining := p.TokenBudget
+	evidenceReserve := p.TokenBudget * 3 / 4
+	if evidenceReserve < 48 {
+		evidenceReserve = 48
+	}
+	if evidenceReserve > 256 {
+		evidenceReserve = 256
+	}
 	writeSection := func(header string, lines []string, allowance int) []string {
 		if len(lines) == 0 || remaining <= chunk.EstimateTokens(header)+2 {
 			return nil
@@ -161,7 +249,7 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 		used := chunk.EstimateTokens(header) + 2
 		for _, line := range lines {
 			cost := chunk.EstimateTokens("- " + line)
-			if used+cost > allowance || remaining-cost < 64 {
+			if used+cost > allowance || remaining-cost <= evidenceReserve {
 				break
 			}
 			out = append(out, line)
@@ -176,10 +264,11 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	}
 
 	var builder strings.Builder
+	displayQuery := clipToContextTokens(p.Query, p.TokenBudget/4)
 	builder.WriteString("# Knowledge Context\nQuery: ")
-	builder.WriteString(p.Query)
+	builder.WriteString(displayQuery)
 	builder.WriteString("\n")
-	remaining -= chunk.EstimateTokens("# Knowledge Context\nQuery: " + p.Query + "\n")
+	remaining -= chunk.EstimateTokens("# Knowledge Context\nQuery: " + displayQuery + "\n")
 
 	orientation := writeSection("## Knowledge orientation", p.KnowledgeSummary, p.TokenBudget/4)
 	concepts := writeSection("## Relevant concepts", p.Concepts, p.TokenBudget/10)
@@ -210,13 +299,13 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 		heading := strings.TrimSpace(item.Heading)
 		text := strings.TrimSpace(item.Text)
 		header := label + " " + title
-		if heading != "" {
+		if heading != "" && !strings.EqualFold(heading, title) {
 			header += " / " + heading
 		}
 		cost := chunk.EstimateTokens(header+"\n") + chunk.EstimateTokens(text)
-		if cost > remaining-32 {
-			available := remaining - 32 - chunk.EstimateTokens(header+"\n")
-			if available < 24 {
+		if cost > remaining-12 {
+			available := remaining - 12 - chunk.EstimateTokens(header+"\n")
+			if available < 12 {
 				break
 			}
 			text = clipToContextTokens(text, available)
@@ -235,7 +324,7 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 		p.Citations = append(p.Citations, fmt.Sprintf("%s %s", label, citationText))
 		citation++
 	}
-	if len(p.Evidence) > 0 {
+	if len(p.Evidence) > 0 && remaining > p.TokenBudget/4 {
 		builder.WriteString("\n## Citations\n")
 		for _, citation := range p.Citations {
 			builder.WriteString(citation + "\n")

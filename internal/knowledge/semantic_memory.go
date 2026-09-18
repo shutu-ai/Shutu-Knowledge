@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
 
@@ -268,4 +269,63 @@ func (s *Service) SearchSemanticMemory(ctx context.Context, baseID string, optio
 		return semantic.SearchResponse{}, err
 	}
 	return semantic.SearchCompilation(compilation, options)
+}
+
+// CompileKnowledgeContext combines active semantic orientation with the
+// existing hybrid evidence search and returns one bounded ContextPackage.
+// The 0.3 search pipeline remains the exact-evidence authority.
+func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query string, tokenBudget int) (semantic.ContextPackage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.ContextPackage{}, ErrConflict
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
+	}
+	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	search, err := s.Search(ctx, SearchRequest{
+		BaseID: baseID, Query: query, TopK: 8, Mode: "hybrid",
+	})
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	evidenceItems := make([]semantic.ContextEvidence, 0, len(search.Hits))
+	for _, hit := range search.Hits {
+		text := hit.Text
+		if hit.ContextWindow != nil {
+			text = evidence.Serialize(*hit.ContextWindow)
+		}
+		citation := ""
+		if hit.Citation != nil {
+			citation = fmt.Sprintf("%s chunk=%s", hit.Citation.DocumentID, hit.Citation.ChunkID)
+			if hit.Citation.Page > 0 {
+				citation += fmt.Sprintf(" page=%d", hit.Citation.Page)
+			}
+			if hit.Citation.Section != "" {
+				citation += " section=" + hit.Citation.Section
+			}
+		}
+		evidenceItems = append(evidenceItems, semantic.ContextEvidence{
+			ChunkID: hit.ChunkID, DocumentID: hit.DocID, DocumentTitle: hit.DocumentTitle,
+			Heading: hit.Heading, Text: text, Citation: citation,
+			IndexGeneration: hit.IndexGeneration, SourceVersion: hit.SourceVersion,
+			Score: hit.Score,
+		})
+	}
+	return semantic.CompileContext(compilation, evidenceItems, semantic.ContextCompileOptions{
+		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
+	})
 }

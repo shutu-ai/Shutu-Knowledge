@@ -80,6 +80,18 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 		t.Fatalf("semantic memory kinds = %+v", memoryKinds)
 	}
 
+	contextPackage, err := service.CompileKnowledgeContext(ctx, base.ID, "vector retrieval", 2048)
+	if err != nil {
+		t.Fatalf("CompileKnowledgeContext: %v", err)
+	}
+	if len(contextPackage.KnowledgeSummary) == 0 || len(contextPackage.Concepts) == 0 ||
+		len(contextPackage.Facts) == 0 || len(contextPackage.Evidence) == 0 || len(contextPackage.Citations) == 0 {
+		t.Fatalf("context package lacks semantic/evidence sections: %+v", contextPackage)
+	}
+	if contextPackage.EstimatedTokens > contextPackage.TokenBudget {
+		t.Fatalf("context package tokens = %d, budget %d", contextPackage.EstimatedTokens, contextPackage.TokenBudget)
+	}
+
 	after, err := service.Search(ctx, SearchRequest{BaseID: base.ID, Query: "1024-dimensional vectors", TopK: 2})
 	if err != nil || len(after.Hits) == 0 {
 		t.Fatalf("0.3 search after compilation: hits=%d err=%v", len(after.Hits), err)

@@ -63,6 +63,9 @@ type queryResult struct {
 	BaselineCitations float64  `json:"baselineCitations"`
 	SemanticCitations float64  `json:"semanticCitations"`
 	UnsupportedClaims int      `json:"unsupportedClaims"`
+	TemporalCorrect   bool     `json:"temporalCorrect"`
+	ConflictDetected  bool     `json:"conflictDetected"`
+	UnknownCorrect    bool     `json:"unknownCorrect"`
 	ForbiddenSelected []string `json:"forbiddenSelected,omitempty"`
 	BaselineDocTitles []string `json:"baselineDocTitles,omitempty"`
 	SemanticDocTitles []string `json:"semanticDocTitles,omitempty"`
@@ -78,6 +81,11 @@ type aggregate struct {
 	P95Tokens            int     `json:"p95Tokens"`
 	AverageLatencyMS     float64 `json:"averageLatencyMs"`
 	AverageCitations     float64 `json:"averageCitations"`
+	P50LatencyMS         int     `json:"p50LatencyMs"`
+	P95LatencyMS         int     `json:"p95LatencyMs"`
+	TemporalAccuracy     float64 `json:"temporalAccuracy"`
+	ConflictAccuracy     float64 `json:"conflictAccuracy"`
+	UnknownAccuracy      float64 `json:"unknownAccuracy"`
 	UnsupportedClaims    int     `json:"unsupportedClaims"`
 }
 
@@ -456,6 +464,27 @@ func evaluateQuery(service *knowledge.Service, ctx context.Context, baseID strin
 			result.ForbiddenSelected = append(result.ForbiddenSelected, forbidden)
 		}
 	}
+	unknownEvidence := len(semanticTitleSet) == 0
+	unknownCorrect := q.Category == "UNKNOWN_VERSION" && len(q.ExpectedDocs) == 0 && unknownEvidence
+	result.UnknownCorrect = unknownCorrect
+	result.ConflictDetected = q.Category == "CONFLICT" &&
+		len(q.ExpectedDocs) > 0 &&
+		titleCoverage(semanticTitleSet, q.ExpectedDocs) == 1 &&
+		len(result.ForbiddenSelected) == 0
+	result.TemporalCorrect = semanticCriteriaCorrect(result.SemanticCriteria, q.ExpectedTerms) &&
+		semanticDocumentsCorrect(result.SemanticDocs, q.ExpectedDocs) &&
+		len(result.ForbiddenSelected) == 0
+	if q.Category == "UNKNOWN_VERSION" && len(q.ExpectedDocs) == 0 {
+		result.UnknownCorrect = unknownEvidence
+		result.TemporalCorrect = unknownEvidence
+		result.BaselineDocs = 0
+		result.SemanticDocs = 0
+		result.BaselineScore = boolScore(len(baselineTitles) == 0)
+		result.SemanticScore = boolScore(unknownEvidence)
+	}
+	if q.Category == "CONFLICT" {
+		result.TemporalCorrect = result.ConflictDetected
+	}
 	return result, nil
 }
 
@@ -518,7 +547,9 @@ func aggregateResults(items []queryResult) aggregate {
 		return aggregate{}
 	}
 	var totalScore, totalCriteria, totalDocs, totalTokens, totalLatency, totalCitations float64
+	var temporalCount, conflictCount, unknownCount int
 	tokens := make([]int, 0, len(items))
+	latencies := make([]int, 0, len(items))
 	unsupported := 0
 	for _, item := range items {
 		totalScore += item.BaselineScore + item.SemanticScore
@@ -528,21 +559,69 @@ func aggregateResults(items []queryResult) aggregate {
 		totalLatency += float64(item.SemanticLatencyMS)
 		totalCitations += item.SemanticCitations
 		tokens = append(tokens, item.SemanticTokens)
+		latencies = append(latencies, int(item.SemanticLatencyMS))
+		if item.TemporalCorrect {
+			temporalCount++
+		}
+		if item.ConflictDetected {
+			conflictCount++
+		}
+		if item.UnknownCorrect {
+			unknownCount++
+		}
 		if item.UnsupportedClaims > 0 {
 			unsupported++
 		}
 	}
 	sort.Ints(tokens)
+	sort.Ints(latencies)
 	count := float64(len(items))
 	p50 := tokens[len(tokens)/2]
 	p95 := tokens[int(float64(len(tokens)-1)*0.95)]
+	l50 := latencies[len(latencies)/2]
+	l95 := latencies[int(float64(len(latencies)-1)*0.95)]
+	temporalAccuracy := 0.0
+	if temporalCount > 0 {
+		temporalAccuracy = float64(temporalCount) / count
+	}
+	conflictAccuracy := 0.0
+	if conflictCount > 0 {
+		conflictAccuracy = float64(conflictCount) / count
+	}
+	unknownAccuracy := 0.0
+	if unknownCount > 0 {
+		unknownAccuracy = float64(unknownCount) / count
+	}
 	return aggregate{
 		Count: len(items), AverageScore: totalScore / (2 * count),
 		AverageCriteria: totalCriteria / count, AverageDocumentCover: totalDocs / count,
 		AverageTokens: totalTokens / count, P50Tokens: p50, P95Tokens: p95,
 		AverageLatencyMS: totalLatency / count, AverageCitations: totalCitations / count,
-		UnsupportedClaims: unsupported,
+		P50LatencyMS: l50, P95LatencyMS: l95,
+		TemporalAccuracy: temporalAccuracy, ConflictAccuracy: conflictAccuracy,
+		UnknownAccuracy: unknownAccuracy, UnsupportedClaims: unsupported,
 	}
+}
+
+func semanticCriteriaCorrect(coverage float64, expected []string) bool {
+	if len(expected) == 0 {
+		return true
+	}
+	return coverage >= 1
+}
+
+func semanticDocumentsCorrect(coverage float64, expected []string) bool {
+	if len(expected) == 0 {
+		return true
+	}
+	return coverage > 0
+}
+
+func boolScore(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func auditKnowledge(service *knowledge.Service, ctx context.Context, compilation semantic.Compilation) knowledgeAudit {

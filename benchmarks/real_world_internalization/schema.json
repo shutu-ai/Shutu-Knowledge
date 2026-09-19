@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shutu real-world internalization validation",
+  "type": "object",
+  "required": ["schema", "queryCount", "corpora", "queries", "incremental", "delete"],
+  "properties": {
+    "schema": { "const": "shutu.real-world-internalization.v1" },
+    "queryCount": { "type": "integer", "minimum": 100 },
+    "corpora": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["corpus", "kind", "documents", "chunks", "knowledgeUnits", "aggregate"],
+        "properties": {
+          "corpus": { "type": "string" },
+          "kind": { "type": "string" },
+          "documents": { "type": "integer", "minimum": 1 },
+          "chunks": { "type": "integer", "minimum": 1 },
+          "knowledgeUnits": { "type": "integer", "minimum": 0 },
+          "relations": { "type": "integer", "minimum": 0 },
+          "aggregate": { "$ref": "#/$defs/aggregate" }
+        }
+      }
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "corpus", "category", "query", "baselineScore", "semanticScore"],
+        "properties": {
+          "id": { "type": "string" },
+          "corpus": { "type": "string" },
+          "category": {
+            "enum": ["FACT", "LOCAL", "GLOBAL", "CROSS_DOCUMENT", "MULTI_HOP", "TEMPORAL", "COMPARISON", "EXPLANATION"]
+          },
+          "baselineScore": { "type": "number", "minimum": 0, "maximum": 1 },
+          "semanticScore": { "type": "number", "minimum": 0, "maximum": 1 },
+          "baselineTokens": { "type": "integer", "minimum": 0 },
+          "semanticTokens": { "type": "integer", "minimum": 0 },
+          "baselineCitations": { "type": "number", "minimum": 0, "maximum": 1 },
+          "semanticCitations": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "incremental": { "$ref": "#/$defs/lifecycle" },
+    "delete": { "$ref": "#/$defs/lifecycle" }
+  },
+  "$defs": {
+    "aggregate": {
+      "type": "object",
+      "required": ["count", "averageScore", "averageTokens", "averageCitations"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "averageScore": { "type": "number" },
+        "averageTokens": { "type": "number" },
+        "averageCitations": { "type": "number" },
+        "unsupportedClaims": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "required": ["operation", "durationMs", "unitsBefore", "unitsAfter"],
+      "properties": {
+        "operation": { "type": "string" },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "unitsBefore": { "type": "integer", "minimum": 0 },
+        "unitsAfter": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

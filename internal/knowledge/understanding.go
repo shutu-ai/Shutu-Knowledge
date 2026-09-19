@@ -115,7 +115,7 @@ func outlineIDs(ir *documentir.Document) []string {
 }
 
 func newDerived(docID string, generation int64, kind, content string, from []string) DerivedKnowledge {
-	seed := docID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + kind + "\x00" + content
+	seed := docID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + kind + "\x00" + strings.Join(from, "\x00") + "\x00" + content
 	sum := sha256.Sum256([]byte(seed))
 	return DerivedKnowledge{ID: "derived_" + hex.EncodeToString(sum[:16]), DocID: docID, IndexGeneration: generation, Kind: kind, Content: content, DerivedFrom: from, Model: "builtin", ModelVersion: "builtin-v1"}
 }

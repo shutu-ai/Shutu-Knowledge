@@ -1,0 +1,74 @@
+{
+  "schema": "shutu.real-world-corpus.v1",
+  "privacy": "documents stay local; repository stores paths and public provenance only",
+  "corpora": [
+    {
+      "id": "A",
+      "name": "Open5GS product documentation",
+      "kind": "Telecom/Product",
+      "source": "https://github.com/open5gs/open5gs",
+      "source_ref": "main",
+      "root": ".local/validation-corpus",
+      "files": [
+        "open5gs/docs/_docs/guide/01-quickstart.md",
+        "open5gs/docs/_docs/guide/02-building-open5gs-from-sources.md",
+        "open5gs/docs/_docs/guide/03-5g-eir.md",
+        "open5gs/docs/_docs/platform/01-debian-ubuntu.md",
+        "open5gs/docs/_docs/tutorial/01-your-first-lte.md",
+        "open5gs/docs/_docs/tutorial/05-roaming.md",
+        "open5gs/docs/_pages/home.md",
+        "open5gs/docs/_pages/features.md",
+        "open5gs/docs/_posts/2026-06-20-release-v2.8.0.md",
+        "open5gs/docs/_posts/2025-07-19-release-v2.7.6.md",
+        "open5gs/docs/_docs/hardware/01-genodebs.md",
+        "open5gs/docs/_docs/platform/02-centos.md",
+        "open5gs/docs/_docs/platform/03-fedora.md",
+        "open5gs/docs/_docs/troubleshoot/01-simple-issues.md",
+        "open5gs/docs/_docs/tutorial/02-VoLTE-setup.md",
+        "open5gs/docs/_docs/tutorial/04-metrics-prometheus.md",
+        "open5gs/docs/_docs/tutorial/06-Open5GS-with-5G-Sharp-Orchestrator.md",
+        "open5gs/docs/_docs/tutorial/07-infoAPI-UE-gNB-session-data.md",
+        "open5gs/docs/_docs/tutorial/08-AMF-API-addAndDelete-new-PLMN.md",
+        "open5gs/docs/_pages/docs.md",
+        "open5gs/docs/_posts/2023-12-04-release-v2.7.0.md",
+        "open5gs/docs/_posts/2025-03-30-release-v2.7.5.md"
+      ]
+    },
+    {
+      "id": "B",
+      "name": "3GPP 5G System specifications",
+      "kind": "3GPP",
+      "source": "https://www.etsi.org/deliver/etsi_ts/",
+      "source_ref": "TS 23.501 and TS 23.502, release 17.7.0",
+      "root": ".local/validation-corpus",
+      "files": [
+        "3gpp/ts_123501v170700p.txt",
+        "3gpp/ts_123502v170700p.txt"
+      ]
+    },
+    {
+      "id": "C",
+      "name": "Shutu-Knowledge code and engineering documentation",
+      "kind": "Code/Engineering",
+      "source": "local repository",
+      "source_ref": "v0.4.0",
+      "root": ".",
+      "files": [
+        "README.md",
+        "Agent.md",
+        "docs/architecture.md",
+        "docs/0.4_api_ui.md",
+        "docs/0.4_context_compiler.md",
+        "docs/0.4_incremental_compilation.md",
+        "docs/0.4_knowledge_compiler.md",
+        "docs/0.4_knowledge_model.md",
+        "docs/0.4_query_routing.md",
+        "docs/0.4_semantic_memory.md",
+        "docs/0.4_lightweight_relations.md",
+        "docs/0.4_living_wiki.md",
+        "docs/document_ir_design.md",
+        "docs/release_report_0.4.0.md"
+      ]
+    }
+  ]
+}

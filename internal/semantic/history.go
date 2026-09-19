@@ -3,6 +3,7 @@ package semantic
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -16,14 +17,16 @@ const (
 	RangeVersion   RangeKind = "VERSION"
 	RangeTime      RangeKind = "TIME"
 	RangeAmbiguous RangeKind = "AMBIGUOUS"
+	RangeEvent     RangeKind = "EVENT"
 )
 
 // RangeBoundary is one endpoint. A nil Value/Time with an inclusive flag is an
 // open boundary, never an inferred epoch or "current" date.
 type RangeBoundary struct {
-	Value     string     `json:"value,omitempty"`
-	Time      *time.Time `json:"time,omitempty"`
-	Inclusive bool       `json:"inclusive"`
+	Value           string     `json:"value,omitempty"`
+	ResolvedVersion string     `json:"resolvedVersion,omitempty"`
+	Time            *time.Time `json:"time,omitempty"`
+	Inclusive       bool       `json:"inclusive"`
 }
 
 // TemporalRange is the minimal 0.6 model for from/to, before/after, until/since,
@@ -124,16 +127,31 @@ func ParseTemporalRange(query string) (TemporalRange, bool) {
 			continue
 		}
 		boundary, kind, ok := parseRangeEndpoint(match[1], marker.inclusive)
-		if !ok {
+		if !ok && (marker.kind == "before" || marker.kind == "after") {
+			event := strings.TrimSpace(strings.Trim(match[1], " ?.,;:!"))
+			if len(event) < 2 || len(event) > 80 || strings.EqualFold(event, "it") || strings.EqualFold(event, "that") {
+				continue
+			}
+			boundary = &RangeBoundary{Value: event, Inclusive: marker.inclusive}
+			kind = RangeEvent
+			out := TemporalRange{Kind: kind, Confidence: 0.93, Diagnostics: []string{marker.kind + "-range"}}
+			if marker.kind == "before" || marker.kind == "until" {
+				out.End = boundary
+			} else {
+				out.Start = boundary
+			}
+			return out, true
+		} else if ok {
+			out := TemporalRange{Kind: kind, Confidence: 0.93, Diagnostics: []string{marker.kind + "-range"}}
+			if marker.kind == "before" || marker.kind == "until" {
+				out.End = boundary
+			} else {
+				out.Start = boundary
+			}
+			return out, true
+		} else {
 			continue
 		}
-		out := TemporalRange{Kind: kind, Confidence: 0.93, Diagnostics: []string{marker.kind + "-range"}}
-		if marker.kind == "before" || marker.kind == "until" {
-			out.End = boundary
-		} else {
-			out.Start = boundary
-		}
-		return out, true
 	}
 	if containsAnyHistoryAmbiguity(normalized) {
 		return TemporalRange{Kind: RangeAmbiguous, Ambiguous: true, Confidence: 0.70,
@@ -201,4 +219,218 @@ func (r TemporalRange) Describe() string {
 		}
 	}
 	return fmt.Sprintf("%s[%s,%s] ambiguous=%v confidence=%.2f", kind, start, end, r.Ambiguous, r.Confidence)
+}
+
+// ResolvedTemporalRange separates the parsed query intent from the actual
+// evidence selected from one immutable compilation. It never promotes an
+// ambiguous range to a concrete version.
+type ResolvedTemporalRange struct {
+	Range       TemporalRange `json:"range"`
+	Versions    []string      `json:"versions,omitempty"`
+	Units       []Unit        `json:"units,omitempty"`
+	UnitCount   int           `json:"unitCount"`
+	Confidence  float64       `json:"confidence"`
+	Diagnostics []string      `json:"diagnostics,omitempty"`
+}
+
+func boundaryVersion(boundary RangeBoundary) string {
+	if boundary.ResolvedVersion != "" {
+		return boundary.ResolvedVersion
+	}
+	return boundary.Value
+}
+
+func versionSatisfiesBoundary(version string, boundary *RangeBoundary, isStart bool) bool {
+	if boundary == nil || boundary.ResolvedVersion == "" && boundary.Value == "" {
+		return true
+	}
+	target := boundaryVersion(*boundary)
+	order, comparable := CompareVersionIdentity(version, target)
+	if !comparable {
+		return false
+	}
+	if isStart {
+		return order > 0 || (order == 0 && boundary.Inclusive)
+	}
+	return order < 0 || (order == 0 && boundary.Inclusive)
+}
+
+func unitTime(unit Unit) int64 {
+	if unit.PublishedAt != 0 {
+		return unit.PublishedAt
+	}
+	return unit.EffectiveAt
+}
+
+func timeSatisfiesBoundary(unit Unit, boundary *RangeBoundary, isStart bool) bool {
+	if boundary == nil || boundary.Time == nil {
+		return true
+	}
+	value := unitTime(unit)
+	if value == 0 {
+		return false
+	}
+	target := boundary.Time.Unix()
+	if isStart {
+		return value > target || (value == target && boundary.Inclusive)
+	}
+	return value < target || (value == target && boundary.Inclusive)
+}
+
+// ResolveTemporalRange selects only units whose existing VersionIdentity or
+// temporal timestamp is proven to belong to the range. Relative event
+// boundaries are resolved from evidence, never from a built-in feature table.
+func ResolveTemporalRange(compilation Compilation, requested TemporalRange) ResolvedTemporalRange {
+	out := ResolvedTemporalRange{Range: requested, Confidence: requested.Confidence}
+	if requested.Kind == RangeAmbiguous || requested.Ambiguous {
+		out.Diagnostics = append(out.Diagnostics, "ambiguous-range-not-materialized")
+		return out
+	}
+	if requested.Kind == RangeEvent {
+		needle := ""
+		if requested.Start != nil {
+			needle = requested.Start.Value
+		} else if requested.End != nil {
+			needle = requested.End.Value
+		}
+		needle = normalizeSearchText(needle)
+		boundaryVersions := make([]string, 0)
+		introductory := make([]string, 0)
+		mentioned := make([]string, 0)
+		for _, unit := range compilation.Units {
+			if unit.Status == UnitDeleted || unit.Version == "" {
+				continue
+			}
+			if _, ordered := parseVersionIdentity(unit.Version); !ordered {
+				continue
+			}
+			haystack := normalizeSearchText(unit.Title + "\n" + unit.Content)
+			if needle == "" || !strings.Contains(haystack, needle) {
+				continue
+			}
+			mentioned = append(mentioned, unit.Version)
+			if strings.Contains(haystack, "introduced") || strings.Contains(haystack, "added") ||
+				strings.Contains(haystack, "shipped") || strings.Contains(haystack, "released") {
+				introductory = append(introductory, unit.Version)
+			}
+		}
+		boundaryVersions = introductory
+		if len(boundaryVersions) == 0 {
+			boundaryVersions = mentioned
+		}
+		orderedBoundary := orderedDistinctVersions(boundaryVersions)
+		if len(orderedBoundary) == 0 {
+			out.Diagnostics = append(out.Diagnostics, "event-boundary=UNKNOWN")
+			out.Confidence = 0
+			return out
+		}
+		eventVersion := orderedBoundary[0]
+		if requested.Start != nil {
+			requested.Start.ResolvedVersion = eventVersion
+		}
+		if requested.End != nil {
+			requested.End.ResolvedVersion = eventVersion
+		}
+		out.Range = requested
+		out.Diagnostics = append(out.Diagnostics, "event-boundary="+eventVersion)
+	}
+
+	type candidate struct {
+		unit    Unit
+		version string
+	}
+	candidates := make([]candidate, 0, len(compilation.Units))
+	for _, unit := range compilation.Units {
+		if unit.Status == UnitDeleted {
+			continue
+		}
+		if requested.Kind == RangeVersion || requested.Kind == RangeEvent {
+			version := unit.Version
+			if version == "" {
+				continue
+			}
+			if _, ordered := parseVersionIdentity(version); !ordered {
+				continue
+			}
+			if !versionSatisfiesBoundary(version, requested.Start, true) ||
+				!versionSatisfiesBoundary(version, requested.End, false) {
+				continue
+			}
+			candidates = append(candidates, candidate{unit: unit, version: version})
+		} else if requested.Kind == RangeTime {
+			if unitTime(unit) == 0 {
+				continue
+			}
+			if !timeSatisfiesBoundary(unit, requested.Start, true) ||
+				!timeSatisfiesBoundary(unit, requested.End, false) {
+				continue
+			}
+			candidates = append(candidates, candidate{unit: unit})
+		}
+	}
+	if requested.Kind == RangeVersion || requested.Kind == RangeEvent {
+		sort.SliceStable(candidates, func(i, j int) bool {
+			left, right := candidates[i].version, candidates[j].version
+			if order, comparable := CompareVersionIdentity(left, right); comparable && order != 0 {
+				return order < 0
+			}
+			return candidates[i].unit.CanonicalKey < candidates[j].unit.CanonicalKey
+		})
+		seenVersion := map[string]bool{}
+		for _, item := range candidates {
+			if !seenVersion[item.version] {
+				seenVersion[item.version] = true
+				out.Versions = append(out.Versions, item.version)
+			}
+		}
+	} else {
+		sort.SliceStable(candidates, func(i, j int) bool {
+			left, right := unitTime(candidates[i].unit), unitTime(candidates[j].unit)
+			if left != right {
+				return left < right
+			}
+			return candidates[i].unit.CanonicalKey < candidates[j].unit.CanonicalKey
+		})
+	}
+	out.Units = make([]Unit, 0, len(candidates))
+	for _, item := range candidates {
+		out.Units = append(out.Units, item.unit)
+	}
+	out.UnitCount = len(out.Units)
+	if out.UnitCount == 0 {
+		out.Confidence = 0
+		out.Diagnostics = append(out.Diagnostics, "range-evidence=EMPTY")
+	} else {
+		out.Confidence = requested.Confidence
+		out.Diagnostics = append(out.Diagnostics, fmt.Sprintf("range-evidence=%d", out.UnitCount))
+	}
+	return out
+}
+
+func orderedDistinctVersions(values []string) []string {
+	type item struct {
+		value string
+		order int
+	}
+	ordered := make([]item, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		order := 0
+		for _, other := range values {
+			if result, comparable := CompareVersionIdentity(value, other); comparable && result > 0 {
+				order++
+			}
+		}
+		ordered = append(ordered, item{value: value, order: order})
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].order < ordered[j].order })
+	out := make([]string, 0, len(ordered))
+	for _, item := range ordered {
+		out = append(out, item.value)
+	}
+	return out
 }

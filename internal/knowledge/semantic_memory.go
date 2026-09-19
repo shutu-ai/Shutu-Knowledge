@@ -385,6 +385,13 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	// Retrieval tokenizers often split versions such as 0.2.0. To guarantee
 	// scope selection without inventing evidence, project the exact provenance
 	// of version-matched Knowledge Units into the evidence candidate set.
+	if plan.Temporal.Intent == semantic.TemporalRangeHistory {
+		historyEvidence, err := s.historyRangeEvidence(ctx, compilation, query, plan.Temporal)
+		if err != nil {
+			return semantic.ContextPackage{}, err
+		}
+		evidenceItems = append(historyEvidence, evidenceItems...)
+	}
 	targetedEvidence, err := s.versionEvidence(ctx, compilation, query, targetVersions)
 	if err != nil {
 		return semantic.ContextPackage{}, err
@@ -393,6 +400,63 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	return semantic.CompileContext(compilation, evidenceItems, semantic.ContextCompileOptions{
 		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
 	})
+}
+
+// historyRangeEvidence projects one provenanced representative for each selected
+// historical range bucket. It reuses exact Knowledge Unit sources and never
+// fabricates timeline content.
+func (s *Service) historyRangeEvidence(ctx context.Context, compilation semantic.Compilation, query string, temporal semantic.TemporalQuery) ([]semantic.ContextEvidence, error) {
+	if temporal.Range == nil {
+		return nil, nil
+	}
+	representatives := semantic.SelectHistoricalRepresentatives(compilation, *temporal.Range, 8, query, semantic.SearchTerms(query))
+	if len(representatives) == 0 {
+		return nil, nil
+	}
+	evidenceItems := make([]semantic.ContextEvidence, 0, len(representatives))
+	seen := map[string]bool{}
+	for rank, unit := range representatives {
+		sources, err := semantic.ResolveEvidence(compilation.Units, unit.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, source := range sources {
+			key := unit.Version + "\x00" + source.DocumentID + "\x00" + source.ChunkID + "\x00" + source.NodeID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			title, chunks, err := s.GetDocumentWithContext(ctx, source.DocumentID, true)
+			if err != nil {
+				continue
+			}
+			text, heading, chunkID := "", "", source.ChunkID
+			if source.ChunkID != "" {
+				for _, chunk := range chunks {
+					if chunk.ID == source.ChunkID {
+						text, heading = chunk.Text, chunk.Heading
+						break
+					}
+				}
+			}
+			if text == "" {
+				text = unit.Content
+			}
+			if chunkID == "" {
+				chunkID = "node:" + source.NodeID
+			}
+			evidenceItems = append(evidenceItems, semantic.ContextEvidence{
+				ChunkID: chunkID, DocumentID: source.DocumentID, DocumentTitle: title.Title,
+				Heading: heading, Text: text,
+				Citation:        fmt.Sprintf("%s chunk=%s", source.DocumentID, chunkID),
+				IndexGeneration: source.IndexGeneration, SourceVersion: source.SourceVersion,
+				Version: unit.Version, TemporalStatus: "history",
+				Score: 1000 - float64(rank),
+			})
+			break
+		}
+	}
+	return evidenceItems, nil
 }
 
 // versionEvidence resolves exact evidence for units whose source version matches

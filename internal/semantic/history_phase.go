@@ -299,3 +299,104 @@ func DeriveHistoricalTimeline(compilation Compilation, maxPhases int) Historical
 	out.Diagnostics = append(out.Diagnostics, fmt.Sprintf("phases=%d", len(out.Phases)))
 	return out
 }
+
+// SelectHistoricalRepresentatives chooses one best unit per selected version.
+// Ambiguous “earlier” history is deliberately limited to the older half of the
+// corpus and sampled across that range instead of selecting one oldest chunk.
+func SelectHistoricalRepresentatives(compilation Compilation, requested TemporalRange, limit int, query string, queryTerms []string) []Unit {
+	groups := orderedVersionGroups(compilation)
+	if len(groups) == 0 || limit <= 0 {
+		return nil
+	}
+	if requested.Kind != RangeAmbiguous && !requested.Ambiguous {
+		resolved := ResolveTemporalRange(compilation, requested)
+		if len(resolved.Units) == 0 {
+			return nil
+		}
+		allowed := map[string]bool{}
+		for _, version := range resolved.Versions {
+			allowed[version] = true
+		}
+		filtered := make([]versionUnitGroup, 0, len(allowed))
+		for _, group := range groups {
+			if allowed[group.version] {
+				filtered = append(filtered, group)
+			}
+		}
+		groups = filtered
+	} else if containsTemporalMarker(normalizeSearchText(query), "earlier") ||
+		containsAnyHistoryAmbiguity(normalizeSearchText(query)) {
+		earlyCount := (len(groups) + 1) / 2
+		if earlyCount < 1 {
+			earlyCount = 1
+		}
+		if earlyCount < len(groups) {
+			groups = groups[:earlyCount]
+		}
+	}
+	if len(groups) == 0 {
+		return nil
+	}
+	if limit > len(groups) {
+		limit = len(groups)
+	}
+
+	selected := make([]Unit, 0, limit)
+	for index := 0; index < limit && len(selected) < limit; index++ {
+		start := index * len(groups) / limit
+		end := (index + 1) * len(groups) / limit
+		if start >= len(groups) {
+			break
+		}
+		if end <= start {
+			end = start + 1
+		}
+		if end > len(groups) {
+			end = len(groups)
+		}
+		bestGroup := groups[start]
+		bestUnit := bestHistoryUnit(bestGroup.units, queryTerms)
+		bestScore := historyUnitScore(bestUnit, queryTerms)
+		for _, group := range groups[start+1 : end] {
+			unit := bestHistoryUnit(group.units, queryTerms)
+			score := historyUnitScore(unit, queryTerms)
+			if score > bestScore || (score == bestScore && unit.CanonicalKey < bestUnit.CanonicalKey) {
+				bestGroup, bestUnit, bestScore = group, unit, score
+			}
+		}
+		selected = append(selected, bestUnit)
+	}
+	return selected
+}
+
+func bestHistoryUnit(units []Unit, queryTerms []string) Unit {
+	if len(units) == 0 {
+		return Unit{}
+	}
+	best := units[0]
+	bestScore := historyUnitScore(best, queryTerms)
+	for _, unit := range units[1:] {
+		score := historyUnitScore(unit, queryTerms)
+		if score > bestScore || (score == bestScore && unitRankForHistory(unit) < unitRankForHistory(best)) {
+			best, bestScore = unit, score
+		}
+	}
+	return best
+}
+
+func historyUnitScore(unit Unit, queryTerms []string) float64 {
+	if len(queryTerms) == 0 {
+		return float64(10 - unitRankForHistory(unit))
+	}
+	haystack := normalizeSearchText(unit.Title + "\n" + unit.Content)
+	score := float64(0)
+	for _, term := range queryTerms {
+		if strings.Contains(haystack, strings.ToLower(term)) {
+			score++
+		}
+	}
+	if score == 0 {
+		return -1
+	}
+	return score*10 + float64(4-unitRankForHistory(unit))
+}

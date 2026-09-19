@@ -348,3 +348,45 @@ func TestSemanticMigrationUpgradesActive0_3DatabaseWithoutEvidenceRebuild(t *tes
 	}
 	second.close()
 }
+func TestCompileKnowledgeContextBuildsAmbiguousHistoryRange(t *testing.T) {
+	service := newSemanticMemoryTestService(t)
+	defer service.close()
+	ctx := context.Background()
+	base, err := service.CreateBase("History Range", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 12; index++ {
+		version := fmt.Sprintf("0.%d", index)
+		title := fmt.Sprintf("docs/release-v%s.md", version)
+		content := fmt.Sprintf("# Release %s\n\nRelease %s added Open5GS feature %d.", version, version, index)
+		if _, err := service.AddTextDocument(ctx, base.ID, title, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := service.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := service.CompileKnowledgeContext(ctx, base.ID, "What happened in earlier Open5GS release stages?", 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkg.TemporalIntent != string(semantic.TemporalRangeHistory) {
+		t.Fatalf("temporal intent=%q", pkg.TemporalIntent)
+	}
+	if len(pkg.Evidence) < 6 {
+		t.Fatalf("history evidence=%d: %+v", len(pkg.Evidence), pkg.Evidence)
+	}
+	seen := map[string]bool{}
+	for _, evidence := range pkg.Evidence {
+		if evidence.TemporalStatus != "history" && evidence.TemporalStatus != "" {
+			continue
+		}
+		if evidence.Version != "" {
+			seen[evidence.Version] = true
+		}
+	}
+	if len(seen) < 6 {
+		t.Fatalf("history versions=%v evidence=%+v", seen, pkg.Evidence)
+	}
+}

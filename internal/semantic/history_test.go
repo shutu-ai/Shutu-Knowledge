@@ -1,6 +1,7 @@
 package semantic
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -222,5 +223,33 @@ func TestRangeHistoryIntentUsesRelativeEvent(t *testing.T) {
 	}
 	if plan.Temporal.Range.End == nil || plan.Temporal.Range.End.Value != "semantic memory" {
 		t.Fatalf("range=%+v", plan.Temporal.Range)
+	}
+}
+func TestSelectHistoricalRepresentativesSamplesEarlierHalf(t *testing.T) {
+	compilation := Compilation{Units: make([]Unit, 0, 20)}
+	for index := 0; index < 20; index++ {
+		version := "0." + fmt.Sprint(index)
+		compilation.Units = append(compilation.Units, Unit{
+			ID: "unit-" + version, Type: UnitFact, Title: "release-" + version,
+			Content: "release Open5GS stage " + version, Version: version, Status: UnitActive,
+		})
+	}
+	rangeResult, ok := ParseTemporalRange("What happened in earlier release stages?")
+	if !ok || rangeResult.Kind != RangeAmbiguous {
+		t.Fatalf("range=%+v ok=%v", rangeResult, ok)
+	}
+	selected := SelectHistoricalRepresentatives(compilation, rangeResult, 8, "What happened in earlier release stages?", []string{"release", "Open5GS"})
+	if len(selected) != 8 {
+		t.Fatalf("selected=%d want bounded sample of older half", len(selected))
+	}
+	if selected[0].Version != "0.0" || selected[len(selected)-1].Version != "0.8" {
+		t.Fatalf("range endpoints=%+v", selected)
+	}
+	seen := map[string]bool{}
+	for _, unit := range selected {
+		if seen[unit.Version] {
+			t.Fatalf("duplicate representative version %s", unit.Version)
+		}
+		seen[unit.Version] = true
 	}
 }

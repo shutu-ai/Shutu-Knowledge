@@ -19,9 +19,8 @@ jobs:
         with:
           go-version: "1.25"
           cache: false
-      - name: Install dependencies
-        working-directory: web
-        run: npm ci
+      # Web tooling uses Node standard library only; package.json declares no
+      # dependencies, so npm ci is unnecessary and adds no supply-chain value.
       - name: Download Go modules
         run: go mod download
       - name: "Architecture gate: no shutu-agent internal imports"

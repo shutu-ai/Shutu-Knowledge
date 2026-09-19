@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 	"time"
+	"unicode"
 )
 
 // TemporalIntent refines the broad 0.4 temporal route into the six query
@@ -27,12 +27,12 @@ const (
 // TemporalQuery is the bounded result of lexical temporal parsing. Unknown
 // chronology is represented by an empty version, never inferred from mtime.
 type TemporalQuery struct {
-	Intent     TemporalIntent `json:"intent"`
-	Versions   []string       `json:"versions,omitempty"`
+	Intent      TemporalIntent `json:"intent"`
+	Versions    []string       `json:"versions,omitempty"`
 	FromVersion string         `json:"fromVersion,omitempty"`
 	ToVersion   string         `json:"toVersion,omitempty"`
-	Confidence float64        `json:"confidence"`
-	Signals    []string       `json:"signals,omitempty"`
+	Confidence  float64        `json:"confidence"`
+	Signals     []string       `json:"signals,omitempty"`
 }
 
 type versionIdentity struct {
@@ -47,6 +47,7 @@ var (
 	semanticVersionPattern = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])v?([0-9]+(?:\.[0-9]+){1,3})(?:([._-])([0-9a-z][0-9a-z._-]*))?(?:(?:[^0-9]|$))`)
 	releaseVersionPattern  = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])(?:rel[._-]?|release[ _-]?)(?:v[ _-]?)?([0-9]{1,3})(?:(?:[^0-9.]|$))`)
 	threeGPPVersionPattern = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])v([0-9]{2})([0-9]{2})([0-9]{2})(?:[a-z])?(?:(?:[^0-9]|$))`)
+	compact3GPPPattern     = regexp.MustCompile(`(?i)v([0-9]{2})([0-9]{2})([0-9]{2})(?:[a-z])?(?:[._]|$)`)
 	titleDatePattern       = regexp.MustCompile(`\b(20[0-9]{2})-([0-9]{2})-([0-9]{2})\b`)
 	explicitVersionMarker  = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])(?:v|version|ver|release|rel)[ ._=-]?[0-9]`)
 )
@@ -68,16 +69,24 @@ func NormalizeVersionIdentity(value string) (string, bool) {
 		major := strings.TrimLeft(match[1], "0")
 		minor := strings.TrimLeft(match[2], "0")
 		patch := strings.TrimLeft(match[3], "0")
-		if major == "" { major = "0" }
-		if minor == "" { minor = "0" }
-		if patch == "" { patch = "0" }
+		if major == "" {
+			major = "0"
+		}
+		if minor == "" {
+			minor = "0"
+		}
+		if patch == "" {
+			patch = "0"
+		}
 		return major + "." + minor + "." + patch, true
 	}
 	if match := semanticVersionPattern.FindStringSubmatch(lower); match != nil {
 		out := strings.TrimPrefix(match[1], "v")
 		if match[3] != "" {
 			separator := match[2]
-			if separator == "_" { separator = "-" }
+			if separator == "_" {
+				separator = "-"
+			}
 			out += separator + strings.ToLower(match[3])
 		}
 		return out, true
@@ -144,13 +153,23 @@ func CompareVersionIdentity(left, right string) (int, bool) {
 		return 0, false
 	}
 	width := len(a.parts)
-	if len(b.parts) > width { width = len(b.parts) }
+	if len(b.parts) > width {
+		width = len(b.parts)
+	}
 	for i := 0; i < width; i++ {
 		av, bv := 0, 0
-		if i < len(a.parts) { av = a.parts[i] }
-		if i < len(b.parts) { bv = b.parts[i] }
-		if av < bv { return -1, true }
-		if av > bv { return 1, true }
+		if i < len(a.parts) {
+			av = a.parts[i]
+		}
+		if i < len(b.parts) {
+			bv = b.parts[i]
+		}
+		if av < bv {
+			return -1, true
+		}
+		if av > bv {
+			return 1, true
+		}
 	}
 	return 0, true
 }
@@ -161,18 +180,29 @@ func LatestComparableVersion(values []string) (string, bool) {
 	candidates := make([]string, 0, len(values))
 	seen := map[string]bool{}
 	for _, value := range values {
-		normalized, ok := NormalizeVersionIdentity(value)
-		if !ok || seen[normalized] { continue }
-		seen[normalized] = true
-		candidates = append(candidates, normalized)
+		identity, ok := parseVersionIdentity(value)
+		if !ok || !identity.knownOrder {
+			continue
+		}
+		if seen[identity.normalized] {
+			continue
+		}
+		seen[identity.normalized] = true
+		candidates = append(candidates, identity.normalized)
 	}
-	if len(candidates) == 0 { return "", false }
+	if len(candidates) == 0 {
+		return "", false
+	}
 	sort.Strings(candidates)
 	latest := candidates[0]
 	for _, candidate := range candidates[1:] {
 		order, ok := CompareVersionIdentity(latest, candidate)
-		if !ok { return "", false }
-		if order < 0 { latest = candidate }
+		if !ok {
+			return "", false
+		}
+		if order < 0 {
+			latest = candidate
+		}
 	}
 	return latest, true
 }
@@ -182,14 +212,18 @@ func LatestComparableVersion(values []string) (string, bool) {
 func ParseTemporalQuery(query string) TemporalQuery {
 	normalized := normalizeSearchText(query)
 	out := TemporalQuery{Intent: TemporalNone, Confidence: 0}
-	if normalized == "" { return out }
+	if normalized == "" {
+		return out
+	}
 	addSignal := func(signal string) { out.Signals = append(out.Signals, signal) }
 
 	for _, match := range semanticVersionPattern.FindAllStringSubmatch(normalized, 4) {
 		value := match[1]
 		if match[3] != "" {
 			separator := match[2]
-			if separator == "_" { separator = "-" }
+			if separator == "_" {
+				separator = "-"
+			}
 			value += separator + match[3]
 		}
 		if version, ok := NormalizeVersionIdentity(value); ok {
@@ -204,7 +238,9 @@ func ParseTemporalQuery(query string) TemporalQuery {
 	seenVersions := map[string]bool{}
 	deduplicated := make([]string, 0, len(out.Versions))
 	for _, version := range out.Versions {
-		if seenVersions[version] { continue }
+		if seenVersions[version] {
+			continue
+		}
 		seenVersions[version] = true
 		deduplicated = append(deduplicated, version)
 	}
@@ -212,7 +248,9 @@ func ParseTemporalQuery(query string) TemporalQuery {
 
 	containsAny := func(markers ...string) bool {
 		for _, marker := range markers {
-			if !containsTemporalMarker(normalized, marker) { continue }
+			if !containsTemporalMarker(normalized, marker) {
+				continue
+			}
 			return true
 		}
 		return false
@@ -239,7 +277,9 @@ func ParseTemporalQuery(query string) TemporalQuery {
 		"when was", "when were", "when did", "introduced", "added in", "removed in", "deprecated",
 		"什么时候", "何时引入", "何时删除", "如何演进", "有什么变化") && len(out.Versions) > 0 {
 		out.Intent = TemporalEvolution
-		if len(out.Versions) == 2 { out.FromVersion, out.ToVersion = orderedTemporalVersions(out.Versions) }
+		if len(out.Versions) == 2 {
+			out.FromVersion, out.ToVersion = orderedTemporalVersions(out.Versions)
+		}
 		out.Confidence = 0.88
 		addSignal("evolution")
 	} else if len(out.Versions) > 0 {
@@ -263,7 +303,9 @@ func ParseTemporalQuery(query string) TemporalQuery {
 		out.Confidence = 0.88
 		addSignal("current")
 	}
-	if out.Intent != TemporalNone { return out }
+	if out.Intent != TemporalNone {
+		return out
+	}
 	if containsAny("what changed", "changed in", "evolution", "introduced", "removed", "什么时候", "如何演进") {
 		out.Intent = TemporalEvolution
 		out.Confidence = 0.62
@@ -276,20 +318,32 @@ func ParseTemporalQuery(query string) TemporalQuery {
 // “knowledge” matching “now”, while CJK markers remain substring-safe.
 func containsTemporalMarker(normalized, marker string) bool {
 	index := strings.Index(normalized, marker)
-	if index < 0 { return false }
-	if containsHan(marker) { return true }
+	if index < 0 {
+		return false
+	}
+	if containsHan(marker) {
+		return true
+	}
 	if index > 0 {
 		before := []rune(normalized[index-1 : index])
-		if !unicode.IsSpace(before[0]) && !isASCIIPunctuation(before[0]) { return false }
+		if !unicode.IsSpace(before[0]) && !isASCIIPunctuation(before[0]) {
+			return false
+		}
 	}
 	end := index + len(marker)
-	if end >= len(normalized) { return true }
+	if end >= len(normalized) {
+		return true
+	}
 	after := []rune(normalized[end : end+1])
 	return unicode.IsSpace(after[0]) || isASCIIPunctuation(after[0])
 }
 
 func containsHan(value string) bool {
-	for _, r := range value { if unicode.Is(unicode.Han,r) { return true } }
+	for _, r := range value {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -299,7 +353,9 @@ func isASCIIPunctuation(value rune) bool {
 }
 
 func orderedTemporalVersions(values []string) (string, string) {
-	if len(values) == 0 { return "", "" }
+	if len(values) == 0 {
+		return "", ""
+	}
 	left, right := values[0], values[len(values)-1]
 	if len(values) == 2 {
 		left, right = values[0], values[1]
@@ -316,7 +372,9 @@ func orderedTemporalVersions(values []string) (string, string) {
 func ExtractTemporalSource(title string, metadata map[string]string) (string, int64, int64, int, bool) {
 	lookup := func(keys ...string) string {
 		for _, key := range keys {
-			if value := strings.TrimSpace(metadata[key]); value != "" { return value }
+			if value := strings.TrimSpace(metadata[key]); value != "" {
+				return value
+			}
 		}
 		return ""
 	}
@@ -352,42 +410,61 @@ func firstTemporalVersionInText(value string) string {
 	}
 	normalized := strings.Join(strings.Fields(strings.ToLower(value)), " ")
 	if match := releaseVersionPattern.FindStringSubmatch(normalized); match != nil {
-		if version, ok := NormalizeVersionIdentity("rel-" + match[1]); ok { return version }
+		if version, ok := NormalizeVersionIdentity("rel-" + match[1]); ok {
+			return version
+		}
 	}
 	if match := threeGPPVersionPattern.FindStringSubmatch(normalized); match != nil {
-		if version, ok := NormalizeVersionIdentity("v" + match[1] + match[2] + match[3]); ok { return version }
+		if version, ok := NormalizeVersionIdentity("v" + match[1] + match[2] + match[3]); ok {
+			return version
+		}
+	}
+	if match := compact3GPPPattern.FindStringSubmatch(normalized); match != nil {
+		if version, ok := NormalizeVersionIdentity("v" + match[1] + match[2] + match[3]); ok {
+			return version
+		}
 	}
 	if match := semanticVersionPattern.FindStringSubmatch(normalized); match != nil {
 		version := match[1]
 		if match[3] != "" {
 			separator := match[2]
-			if separator == "_" { separator = "-" }
+			if separator == "_" {
+				separator = "-"
+			}
 			version += separator + match[3]
 		}
-		if result, ok := NormalizeVersionIdentity(version); ok { return result }
+		if result, ok := NormalizeVersionIdentity(version); ok {
+			return result
+		}
 	}
 	return ""
 }
 
 func parseTemporalTimestamp(value string) int64 {
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" { return 0 }
-	if number, err := strconv.ParseInt(trimmed, 10, 64); err == nil { return number }
+	if trimmed == "" {
+		return 0
+	}
+	if number, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return number
+	}
 	layouts := []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"}
 	for _, layout := range layouts {
-		if parsed, err := time.Parse(layout, trimmed); err == nil { return parsed.Unix() }
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed.Unix()
+		}
 	}
 	return 0
 }
 
 const (
-	SourceAuthorityReleaseNotes = 1
-	SourceAuthorityProduct      = 2
-	SourceAuthoritySpecification= 2
-	SourceAuthorityCode         = 3
-	SourceAuthorityREADME       = 4
-	SourceAuthorityDesign       = 5
-	SourceAuthorityDefault      = 8
+	SourceAuthorityReleaseNotes  = 1
+	SourceAuthorityProduct       = 2
+	SourceAuthoritySpecification = 2
+	SourceAuthorityCode          = 3
+	SourceAuthorityREADME        = 4
+	SourceAuthorityDesign        = 5
+	SourceAuthorityDefault       = 8
 )
 
 // NormalizeSourceAuthority maps a small explicit vocabulary to priority.
@@ -415,10 +492,14 @@ func NormalizeSourceAuthority(value string) int {
 }
 
 func unitVersion(unit Unit) string { return strings.TrimSpace(unit.Metadata["temporal_version"]) }
-func unitPublishedAt(unit Unit) int64 { return parseTemporalTimestamp(unit.Metadata["temporal_published_at"]) }
+func unitPublishedAt(unit Unit) int64 {
+	return parseTemporalTimestamp(unit.Metadata["temporal_published_at"])
+}
 func unitSourceAuthority(unit Unit) int {
 	if raw := strings.TrimSpace(unit.Metadata["temporal_source_authority"]); raw != "" {
-		if number, err := strconv.Atoi(raw); err == nil { return number }
+		if number, err := strconv.Atoi(raw); err == nil {
+			return number
+		}
 	}
 	return SourceAuthorityDefault
 }
@@ -429,7 +510,9 @@ func unitSourceAuthority(unit Unit) int {
 func ResolveCurrentVersion(compilation Compilation) (string, bool) {
 	versions := make([]string, 0, len(compilation.Units))
 	for _, unit := range compilation.Units {
-		if unit.Status == UnitDeleted || unit.Version == "" { continue }
+		if unit.Status == UnitDeleted || unit.Version == "" {
+			continue
+		}
 		versions = append(versions, unit.Version)
 	}
 	return LatestComparableVersion(versions)
@@ -440,16 +523,24 @@ func temporalMetadataFromSource(source SourceDocument) map[string]string {
 	metadata := map[string]string{
 		"temporal_source_authority": strconv.Itoa(authority),
 	}
-	if version != "" { metadata["temporal_version"] = version }
-	if published > 0 { metadata["temporal_published_at"] = strconv.FormatInt(published, 10) }
-	if effective > 0 { metadata["temporal_effective_at"] = strconv.FormatInt(effective, 10) }
+	if version != "" {
+		metadata["temporal_version"] = version
+	}
+	if published > 0 {
+		metadata["temporal_published_at"] = strconv.FormatInt(published, 10)
+	}
+	if effective > 0 {
+		metadata["temporal_effective_at"] = strconv.FormatInt(effective, 10)
+	}
 	return metadata
 }
 
 func applyTemporalMetadata(unit *Unit, source SourceDocument) {
 	metadata := temporalMetadataFromSource(source)
 	for key, value := range metadata {
-		if unit.Metadata == nil { unit.Metadata = map[string]string{} }
+		if unit.Metadata == nil {
+			unit.Metadata = map[string]string{}
+		}
 		unit.Metadata[key] = value
 	}
 }
@@ -478,9 +569,15 @@ func temporalVersionVisible(unit Unit, temporal TemporalQuery, resolved string) 
 		}
 		return unit.Status == UnitActive
 	case TemporalEvolution, TemporalCompareVersions:
-		if unit.Status == UnitDeleted { return false }
-		if len(temporal.Versions) == 0 { return statusOK || unit.Status == UnitSuperseded }
-		if version != "" { return containsIdentity(temporal.Versions, version) }
+		if unit.Status == UnitDeleted {
+			return false
+		}
+		if len(temporal.Versions) == 0 {
+			return statusOK || unit.Status == UnitSuperseded
+		}
+		if version != "" {
+			return containsIdentity(temporal.Versions, version)
+		}
 		return statusOK
 	default:
 		return unit.Status == UnitActive
@@ -489,8 +586,12 @@ func temporalVersionVisible(unit Unit, temporal TemporalQuery, resolved string) 
 
 func containsIdentity(values []string, target string) bool {
 	for _, value := range values {
-		if strings.EqualFold(value, target) { return true }
-		if order, ok := CompareVersionIdentity(value, target); ok && order == 0 { return true }
+		if strings.EqualFold(value, target) {
+			return true
+		}
+		if order, ok := CompareVersionIdentity(value, target); ok && order == 0 {
+			return true
+		}
 	}
 	return false
 }
@@ -500,16 +601,26 @@ func temporalVersionBoost(unit Unit, temporal TemporalQuery, resolved string) fl
 	switch temporal.Intent {
 	case TemporalCurrent, TemporalValidity:
 		if resolved != "" && version != "" {
-			if order, ok := CompareVersionIdentity(version, resolved); ok && order == 0 { return 6 }
+			if order, ok := CompareVersionIdentity(version, resolved); ok && order == 0 {
+				return 6
+			}
 			return -2
 		}
-		if version != "" { return 0.5 }
+		if version != "" {
+			return 0.5
+		}
 		return -0.25
 	case TemporalExplicitVersion, TemporalHistorical:
-		if version != "" && containsIdentity(temporal.Versions, version) { return 8 }
-		if version == "" { return -0.5 }
+		if version != "" && containsIdentity(temporal.Versions, version) {
+			return 8
+		}
+		if version == "" {
+			return -0.5
+		}
 	case TemporalEvolution, TemporalCompareVersions:
-		if version != "" && containsIdentity(temporal.Versions, version) { return 3.5 }
+		if version != "" && containsIdentity(temporal.Versions, version) {
+			return 3.5
+		}
 	}
 	return 0
 }

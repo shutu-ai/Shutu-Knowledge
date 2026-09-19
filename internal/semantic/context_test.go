@@ -19,7 +19,7 @@ func TestCompileContextCombinesOrientationFactsEvidenceAndCitations(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pkg.CompilerVersion != "semantic-evidence-v1" || pkg.Generation != compilation.Generation {
+	if pkg.CompilerVersion != "semantic-temporal-v1" || pkg.Generation != compilation.Generation {
 		t.Fatalf("context scope = %+v", pkg)
 	}
 	if pkg.Routing == nil || pkg.Routing.Intent != IntentFact || pkg.Intent != string(IntentFact) {

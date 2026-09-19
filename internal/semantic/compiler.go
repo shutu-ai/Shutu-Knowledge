@@ -16,7 +16,7 @@ import (
 
 const (
 	BuiltinCompiler           = "shutu-builtin"
-	BuiltinCompilerVersion    = "0.4.0-ph2"
+	BuiltinCompilerVersion    = "0.5.0-ph6"
 	BuiltinModel              = "deterministic"
 	BuiltinModelVersion       = "v1"
 	BuiltinPromptVersion      = "none"
@@ -36,8 +36,11 @@ type SourceDocument struct {
 	IndexGeneration int64
 	SourceVersion   int64
 	UpdatedAt       int64
-	IR              *documentir.Document
-	ChunkIDsByNode  map[string][]string
+	// TemporalMetadata is the explicit user/source metadata surface. Parser
+	// architecture is unchanged; extraction also falls back only to title.
+	TemporalMetadata map[string]string
+	IR               *documentir.Document
+	ChunkIDsByNode   map[string][]string
 }
 
 type factCandidate struct {
@@ -49,6 +52,7 @@ type factCandidate struct {
 	sources        []EvidenceSource
 	conceptKeys    map[string]bool
 	predecessorKey string
+	source         SourceDocument
 }
 
 type conceptCandidate struct {
@@ -128,8 +132,9 @@ func Compile(baseID string, generation int64, documents []SourceDocument, create
 	compilation.Units = append(compilation.Units, conceptUnits...)
 	compilation.Units = append(compilation.Units, topicUnits...)
 	compilation.Units = append(compilation.Units, summaryUnits...)
-	compilation.Units = reconcileTemporalUnits(compilation.Units, baseID, generation, createdAt)
-	compilation.Relations = sequenceRelations
+	var temporalRelations []Relation
+	compilation.Units, temporalRelations = reconcileTemporalUnits(compilation.Units, baseID, generation, createdAt)
+	compilation.Relations = append(sequenceRelations, temporalRelations...)
 	if err := compilation.Validate(); err != nil {
 		return Compilation{}, err
 	}
@@ -143,11 +148,11 @@ func SourceFingerprint(doc SourceDocument) string {
 		return fmt.Sprintf("%d:%d:%s", doc.IndexGeneration, doc.SourceVersion, stableKey(doc.Title))
 	}
 	return fmt.Sprintf("%d:%d:%s", doc.IndexGeneration, doc.SourceVersion,
-		stableKey(doc.Title+"\x00"+doc.IR.Text()))
+		stableKey(doc.Title+"\x00"+doc.IR.Text()+"\x00"+stableKey(joinSortedMetadata(doc.TemporalMetadata))))
 }
 
 type temporalFact struct {
-	version float64
+	version string
 	unit    *Unit
 }
 
@@ -155,67 +160,140 @@ type temporalFact struct {
 // groups explicit “Version X <predicate> <attribute>” facts after stripping
 // numeric values/units from the attribute, so ordinary different facts are not
 // mistaken for conflicts.
-func reconcileTemporalUnits(units []Unit, baseID string, generation int64, now int64) []Unit {
+// reconcileTemporalUnits applies conservative same-scope supersession. Facts
+// without a parseable version scope are never superseded automatically.
+func reconcileTemporalUnits(units []Unit, baseID string, generation int64, now int64) ([]Unit, []Relation) {
 	groups := map[string][]temporalFact{}
 	for i := range units {
 		if units[i].Type != UnitFact {
 			continue
 		}
-		version, predicate, attribute, ok := parseVersionedFact(units[i].Content)
+		scope, version, ok := temporalFactScope(units[i].Content)
 		if !ok {
 			continue
 		}
-		key := predicate + "\x00" + attribute
-		unit := &units[i]
-		groups[key] = append(groups[key], temporalFact{version: version, unit: unit})
-	}
-	for _, group := range groups {
-		if len(group) < 2 {
-			continue
+		if metadataVersion := units[i].Version; metadataVersion != "" {
+			if _, comparable := CompareVersionIdentity(metadataVersion, version); comparable {
+				version = metadataVersion
+			}
 		}
+		units[i].Metadata["temporal_version"] = version
+		syncTemporalFields(&units[i])
+		groups[scope] = append(groups[scope], temporalFact{version: version, unit: &units[i]})
+	}
+	relations := make([]Relation, 0)
+	for _, group := range groups {
 		sort.Slice(group, func(i, j int) bool {
-			if group[i].version != group[j].version {
-				return group[i].version < group[j].version
+			if order, comparable := CompareVersionIdentity(group[i].version, group[j].version); comparable && order != 0 {
+				return order < 0
 			}
 			return group[i].unit.CanonicalKey < group[j].unit.CanonicalKey
 		})
-		latestVersion := group[len(group)-1].version
+		// Find the comparable chain ending at the newest identity. Unknown
+		// ordering is never allowed to cross a supersession boundary.
+		last := len(group) - 1
+		start := last
+		for start > 0 {
+			order, comparable := CompareVersionIdentity(group[start-1].version, group[last].version)
+			if !comparable || order >= 0 {
+				break
+			}
+			start--
+		}
 		latestDuplicates := 0
-		for i := len(group) - 1; i >= 0 && group[i].version == latestVersion; i-- {
+		for i := last; i >= 0 && CompareEqual(group[i].version, group[last].version); i-- {
 			latestDuplicates++
 		}
 		if latestDuplicates > 1 {
-			// Same subject/attribute/version with different normalized values is
-			// a potential contradiction. Keep both units queryable as historical
-			// evidence but exclude them from the active fact lane.
-			for _, conflict := range group[len(group)-latestDuplicates:] {
+			for _, conflict := range group[last-latestDuplicates+1 : last+1] {
 				conflict.unit.Status = UnitConflicted
 				conflict.unit.SupersededBy = ""
-				if conflict.unit.Metadata == nil {
-					conflict.unit.Metadata = map[string]string{}
-				}
 				conflict.unit.Metadata["temporal_conflict"] = "same-version"
+				setTemporalStatus(conflict.unit, "conflicted")
 				conflict.unit.UpdatedAt = now
 			}
-			group = group[:len(group)-latestDuplicates]
+			group = group[:last-latestDuplicates+1]
 			if len(group) == 0 {
 				continue
 			}
+			last = len(group) - 1
+			start = last
+			for start > 0 {
+				order, comparable := CompareVersionIdentity(group[start-1].version, group[last].version)
+				if !comparable || order >= 0 {
+					break
+				}
+				start--
+			}
 		}
-		successor := group[len(group)-1]
+		successor := group[last]
 		successor.unit.Status = UnitActive
 		successor.unit.SupersededBy = ""
+		setTemporalStatus(successor.unit, "current")
 		successor.unit.UpdatedAt = now
-		for _, superseded := range group[:len(group)-1] {
-			superseded.unit.Status = UnitSuperseded
-			superseded.unit.SupersededBy = UnitID(baseID, generation, UnitFact, successor.unit.CanonicalKey)
-			superseded.unit.UpdatedAt = now
+		for i := start; i < last; i++ {
+			old := group[i]
+			order, comparable := CompareVersionIdentity(old.version, successor.version)
+			if !comparable || order >= 0 {
+				old.unit.Status = UnitConflicted
+				old.unit.SupersededBy = ""
+				old.unit.Metadata["temporal_conflict"] = "unknown-version-order"
+				setTemporalStatus(old.unit, "unknown")
+				old.unit.UpdatedAt = now
+				continue
+			}
+			old.unit.Status = UnitSuperseded
+			old.unit.SupersededBy = successor.unit.ID
+			setTemporalStatus(old.unit, "superseded")
+			old.unit.UpdatedAt = now
+			relations = append(relations, newTemporalRelation(
+				baseID, generation, RelationSupersedes, old.unit, successor.unit,
+				"supersedes:"+old.unit.CanonicalKey+":"+successor.unit.CanonicalKey,
+				old.unit.Content+" is superseded by "+successor.unit.Content, now,
+			))
 		}
 	}
-	return units
+	sort.Slice(relations, func(i, j int) bool { return relations[i].ID < relations[j].ID })
+	return units, relations
 }
 
-func parseVersionedFact(content string) (float64, string, string, bool) {
+func newTemporalRelation(baseID string, generation int64, relationType RelationType,
+	subject, object *Unit, canonicalKey, statement string, now int64) Relation {
+	relation := Relation{
+		ID: RelationID(baseID, generation, relationType, subject.ID, object.ID, canonicalKey),
+		BaseID: baseID, Generation: generation, Type: relationType,
+		SubjectUnitID: subject.ID, ObjectUnitID: object.ID,
+		Predicate: string(relationType), Statement: statement,
+		CanonicalKey: canonicalKey, Confidence: 0.82, Status: UnitActive,
+		ValidFrom: now, Sources: append(append([]EvidenceSource(nil), subject.Sources...), object.Sources...),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	SortEvidenceSources(relation.Sources)
+	return relation
+}
+
+func setTemporalStatus(unit *Unit, status string) {
+	if unit.Metadata == nil {
+		unit.Metadata = map[string]string{}
+	}
+	unit.Metadata["temporal_status"] = status
+}
+
+func syncTemporalFields(unit *Unit) {
+	if unit.Metadata == nil {
+		unit.Metadata = map[string]string{}
+	}
+	unit.Version = unit.Metadata["temporal_version"]
+	unit.PublishedAt = parseTemporalTimestamp(unit.Metadata["temporal_published_at"])
+	unit.EffectiveAt = parseTemporalTimestamp(unit.Metadata["temporal_effective_at"])
+	if value := unit.Metadata["temporal_source_authority"]; value != "" {
+		if number, err := strconv.Atoi(value); err == nil {
+			unit.SourceAuthority = number
+		}
+	}
+}
+
+func parseVersionedFact(content string) (string, string, string, bool) {
 	normalized := strings.Join(strings.Fields(strings.TrimSpace(content)), " ")
 	lower := strings.ToLower(normalized)
 	version := lower
@@ -227,16 +305,21 @@ func parseVersionedFact(content string) (float64, string, string, bool) {
 		}
 	}
 	if version == lower {
-		return 0, "", "", false
+		return "", "", "", false
 	}
 	fields := strings.SplitN(version, " ", 2)
 	if len(fields) != 2 {
-		return 0, "", "", false
+		return "", "", "", false
 	}
 	number, err := parseVersionNumber(fields[0])
 	if err != nil {
-		return 0, "", "", false
+		return "", "", "", false
 	}
+	version, versionOK := NormalizeVersionIdentity(fields[0])
+	if !versionOK {
+		return "", "", "", false
+	}
+	_ = number
 	rest = fields[1]
 	predicate := ""
 	for _, candidate := range []string{"supports ", "uses ", "requires ", "provides ", "支持 ", "使用 ", "需要 ", "提供 "} {
@@ -247,13 +330,13 @@ func parseVersionedFact(content string) (float64, string, string, bool) {
 		}
 	}
 	if predicate == "" {
-		return 0, "", "", false
+		return "", "", "", false
 	}
 	attribute := normalizeTemporalAttribute(rest)
 	if attribute == "" {
-		return 0, "", "", false
+		return "", "", "", false
 	}
-	return number, predicate, attribute, true
+	return version, predicate, attribute, true
 }
 
 func parseVersionNumber(value string) (float64, error) {
@@ -368,7 +451,12 @@ func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandid
 				if !isExplicitFact(content) {
 					continue
 				}
-				key := "fact:" + stableKey(normalizeFactKey(content))
+				// 0.5 temporal dedup scope: identical text in different
+				// source versions remains separate until supersession runs.
+				temporal := temporalMetadataFromSource(doc)
+				version := temporal["temporal_version"]
+				scope := version
+				key := "fact:" + stableKey(scope+"\x00"+normalizeFactKey(content))
 				candidate, ok := out[key]
 				if !ok {
 					candidate = &factCandidate{
@@ -377,6 +465,7 @@ func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandid
 						nodeType: string(node.Type), confidence: confidence,
 						conceptKeys:    map[string]bool{},
 						predecessorKey: lastFactByNode[doc.DocumentID+"\x00"+node.ID],
+						source:         doc,
 					}
 					out[key] = candidate
 				}
@@ -503,13 +592,16 @@ func buildFactUnits(baseID string, generation int64, facts map[string]*factCandi
 		}
 		id := UnitID(baseID, generation, UnitFact, fact.canonicalKey)
 		byKey[key] = id
-		out = append(out, Unit{
+		unit := Unit{
 			ID: id, BaseID: baseID, Generation: generation, Type: UnitFact,
 			Title: clip(fact.content, 96), CanonicalKey: fact.canonicalKey, Content: fact.content,
 			Confidence: fact.confidence, Status: UnitActive,
 			Metadata: map[string]string{"nodeType": fact.nodeType, "heading": fact.heading},
 			Sources:  fact.sources, CreatedAt: now, UpdatedAt: now,
-		})
+		}
+		applyTemporalMetadata(&unit, fact.source)
+		syncTemporalFields(&unit)
+		out = append(out, unit)
 	}
 	return byKey, out
 }
@@ -604,6 +696,8 @@ func buildSummaryUnits(baseID string, generation int64, documents []SourceDocume
 				SourceAnchor: anchorMap(doc.IR), SourceOrder: 0,
 			}}
 		}
+		applyTemporalMetadata(&unit, doc)
+		syncTemporalFields(&unit)
 		out = append(out, unit)
 	}
 	return out

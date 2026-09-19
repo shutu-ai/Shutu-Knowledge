@@ -11,7 +11,7 @@ func TestSearchCompilationActivatesConceptTopicSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Generation != compilation.Generation || response.ScoringVersion != "lexical-v1" {
+	if response.Generation != compilation.Generation || response.ScoringVersion != "temporal-lexical-v1" {
 		t.Fatalf("search diagnostics = %+v", response)
 	}
 	kinds := map[UnitKind]bool{}

@@ -237,6 +237,7 @@ func (s *Store) listUnits(ctx context.Context, baseID string, generation int64) 
 		if err := decodeStringMap(metadata, &unit.Metadata); err != nil {
 			return nil, err
 		}
+		syncTemporalFields(&unit)
 		out = append(out, unit)
 	}
 	if err := rows.Err(); err != nil {

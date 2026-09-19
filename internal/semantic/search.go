@@ -12,7 +12,7 @@ import (
 // context assembly, but are not returned by the concept/topic/summary default.
 var DefaultSearchKinds = []UnitKind{UnitConcept, UnitTopic, UnitSummary}
 
-const semanticSearchScoringVersion = "lexical-v1"
+const semanticSearchScoringVersion = "temporal-lexical-v1"
 
 // SearchOptions controls deterministic semantic-memory retrieval.
 type SearchOptions struct {
@@ -78,11 +78,21 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 	for _, kind := range kinds {
 		kindSet[kind] = true
 	}
-	historical := strings.Contains(normalized, "history") || strings.Contains(normalized, "historical") ||
-		strings.Contains(normalized, "before") || strings.Contains(normalized, "之前") || strings.Contains(normalized, "历史")
+	temporal := routing.Temporal
+	resolved, resolvable := "", false
+	if temporal.Intent == TemporalCurrent || temporal.Intent == TemporalValidity {
+		resolved, resolvable = ResolveCurrentVersion(compilation)
+		routing.CurrentVersion = resolved
+		if resolvable {
+			routing.TemporalDiagnostics = append(routing.TemporalDiagnostics,
+				"resolved current_version="+resolved+" from compiled source validity")
+		} else {
+			routing.TemporalDiagnostics = append(routing.TemporalDiagnostics,
+				"current_version=UNKNOWN: no authoritative comparable version order")
+		}
+	}
 	for _, unit := range compilation.Units {
-		statusVisible := unit.Status == UnitActive ||
-			(historical && (unit.Status == UnitSuperseded || unit.Status == UnitConflicted))
+		statusVisible := temporalVersionVisible(unit, temporal, resolved)
 		if !statusVisible || !kindSet[unit.Type] {
 			continue
 		}
@@ -94,6 +104,10 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 		}
 		if score <= 0 || len(matched) == 0 {
 			continue
+		}
+		if temporal.Intent != TemporalNone {
+			score += temporalVersionBoost(unit, temporal, resolved)
+			if score <= 0 { continue }
 		}
 		candidates = append(candidates, candidate{hit: SearchHit{
 			Unit: unit, Score: score, Coverage: coverage, MatchedTerms: matched,

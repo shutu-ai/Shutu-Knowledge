@@ -28,7 +28,7 @@ const (
 	RetrievalHybridLane = "hybrid"
 )
 
-const QueryRouterVersion = "lexical-rules-v1"
+const QueryRouterVersion = "temporal-lexical-v1"
 
 // QueryPlan is deterministic diagnostics plus lane selection. It is not an
 // agent planner and never mutates the query.
@@ -44,6 +44,9 @@ type QueryPlan struct {
 	UseEvidence            bool           `json:"useEvidence"`
 	UseRelations           bool           `json:"useRelations"`
 	UseHierarchicalSummary bool           `json:"useHierarchicalSummary"`
+	Temporal               TemporalQuery  `json:"temporal,omitempty"`
+	CurrentVersion         string         `json:"currentVersion,omitempty"`
+	TemporalDiagnostics    []string       `json:"temporalDiagnostics,omitempty"`
 	RouterVersion          string         `json:"routerVersion"`
 }
 
@@ -109,9 +112,38 @@ func RouteQuery(query string) QueryPlan {
 	if confidence > 1 {
 		confidence = 1
 	}
+	temporal := ParseTemporalQuery(query)
+	// An explicit version is scope metadata, not automatic proof that the
+	// question stops being comparison/global/multi-hop/cross-document.
+	preserveIntent := temporal.Intent == TemporalExplicitVersion &&
+		(signals[string(IntentComparison)] > signals[string(IntentFact)] ||
+			signals[string(IntentCrossDocument)] > signals[string(IntentFact)] ||
+			signals[string(IntentGlobal)] > signals[string(IntentFact)] ||
+			signals[string(IntentMultiHop)] > signals[string(IntentFact)])
+	if temporal.Intent != TemporalNone && !preserveIntent {
+		signals[string(IntentTemporal)] += 4
+		if signals[string(IntentTemporal)] > best {
+			intent = IntentTemporal
+			best = signals[string(IntentTemporal)]
+		}
+		confidence = float64(best) / float64(total+4)
+		if confidence < 0.35 { confidence = 0.35 }
+		if confidence > 1 { confidence = 1 }
+	}
+	diagnostics := make([]string, 0, 3)
+	if temporal.Intent == TemporalCurrent {
+		diagnostics = append(diagnostics, "current resolution deferred to compiled knowledge validity")
+	}
 	plan := QueryPlan{
 		Query: strings.TrimSpace(query), NormalizedQuery: normalized, Intent: intent,
-		Confidence: confidence, Signals: signals, RouterVersion: QueryRouterVersion,
+		Confidence: confidence, Signals: signals, Temporal: temporal,
+		CurrentVersion: temporal.FromVersion, TemporalDiagnostics: diagnostics,
+		RouterVersion: QueryRouterVersion,
+	}
+	if intent == IntentTemporal && temporal.Intent == TemporalNone {
+		// Broad lexical temporal language without a bounded behavior degrades
+		// to the 0.4 evidence path while remaining observable.
+		plan.Temporal = TemporalQuery{Intent: TemporalNone, Confidence: 0.35}
 	}
 	applyRouting(&plan)
 	return plan

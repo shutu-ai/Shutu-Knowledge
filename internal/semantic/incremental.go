@@ -51,7 +51,7 @@ func MergeIncremental(previous, delta Compilation, dirtyDocuments, deletedDocume
 	for _, unit := range merged {
 		unitOrder = append(unitOrder, unit)
 	}
-	unitOrder = reconcileTemporalUnits(unitOrder, delta.BaseID, delta.Generation, now)
+	unitOrder, temporalRelations := reconcileTemporalUnits(unitOrder, delta.BaseID, delta.Generation, now)
 	sort.Slice(unitOrder, func(i, j int) bool {
 		if unitOrder[i].Type != unitOrder[j].Type {
 			return unitOrder[i].Type < unitOrder[j].Type
@@ -59,7 +59,7 @@ func MergeIncremental(previous, delta Compilation, dirtyDocuments, deletedDocume
 		return unitOrder[i].CanonicalKey < unitOrder[j].CanonicalKey
 	})
 
-	relations := make([]Relation, 0, len(retainedRelations)+len(delta.Relations))
+	relations := make([]Relation, 0, len(retainedRelations)+len(delta.Relations)+len(temporalRelations))
 	mergedRelations := map[string]Relation{}
 	for _, relation := range retainedRelations {
 		next := remapRelation(relation, delta.BaseID, delta.Generation, oldToNew, now)
@@ -74,6 +74,9 @@ func MergeIncremental(previous, delta Compilation, dirtyDocuments, deletedDocume
 		if _, ok := mergedRelations[key]; !ok {
 			mergedRelations[key] = relation
 		}
+	}
+	for _, relation := range temporalRelations {
+		mergedRelations[relationKey(relation)] = relation
 	}
 	relationOrder := make([]Relation, 0, len(mergedRelations))
 	for _, relation := range mergedRelations {

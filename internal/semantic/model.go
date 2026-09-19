@@ -89,11 +89,17 @@ type Unit struct {
 	ValidFrom    int64             `json:"validFrom,omitempty"`
 	ValidTo      int64             `json:"validTo,omitempty"`
 	SupersededBy string            `json:"supersededBy,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
-	Sources      []EvidenceSource  `json:"sources,omitempty"`
-	DerivedFrom  []string          `json:"derivedFrom,omitempty"`
-	CreatedAt    int64             `json:"createdAt"`
-	UpdatedAt    int64             `json:"updatedAt"`
+	// Version-aware fields are optional and normalize to UNKNOWN/null. They
+	// are persisted with the existing metadata envelope for 0.4 migration.
+	Version         string            `json:"version,omitempty"`
+	PublishedAt     int64             `json:"publishedAt,omitempty"`
+	EffectiveAt     int64             `json:"effectiveAt,omitempty"`
+	SourceAuthority int               `json:"sourceAuthority,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	Sources         []EvidenceSource  `json:"sources,omitempty"`
+	DerivedFrom     []string          `json:"derivedFrom,omitempty"`
+	CreatedAt       int64             `json:"createdAt"`
+	UpdatedAt       int64             `json:"updatedAt"`
 }
 
 // Relation connects two units. It is not a general property-graph schema.

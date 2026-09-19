@@ -1258,8 +1258,10 @@ async function renderKnowledge() {
   if (!compilation) return;
   screen.append(h("section", { class: "section" }, [
     h("div", { class: "section-head" }, h("h2", {}, "Knowledge explorer")),
-    table(["Type", "Title", "Confidence", "Evidence", "Derived from"], (compilation.units ?? []).slice(0, 100).map((unit) => h("tr", {},
+    table(["Type", "Title", "Version", "Status", "Confidence", "Evidence", "Derived from"], (compilation.units ?? []).slice(0, 100).map((unit) => h("tr", {},
       h("td", {}, chip(unit.type)), h("td", { class: "truncate" }, unit.title),
+      h("td", { class: "mono" }, unit.version || "unknown"),
+      h("td", {}, chip(unit.metadata?.temporal_status || unit.status || "unknown")),
       h("td", {}, Number(unit.confidence ?? 0).toFixed(2)),
       h("td", {}, number(unit.sources?.length ?? 0)), h("td", {}, number(unit.derivedFrom?.length ?? 0)),
     ))),
@@ -1276,8 +1278,10 @@ async function renderKnowledge() {
         api.compileKnowledgeContext(state.selectedBaseId, { query, tokenBudget: 2048 }),
       ]);
       semanticResults.replaceChildren(h("div", { class: "section-head" }, h("h2", {}, "Semantic activation")),
-        table(["Type", "Unit", "Score", "Terms", "Evidence"], semantic.hits.map((hit) => h("tr", {},
+        table(["Type", "Unit", "Version", "Temporal status", "Score", "Terms", "Evidence"], semantic.hits.map((hit) => h("tr", {},
           h("td", {}, chip(hit.unit.type)), h("td", { class: "truncate" }, hit.unit.title),
+          h("td", { class: "mono" }, hit.unit.version || "unknown"),
+          h("td", {}, chip(hit.unit.metadata?.temporal_status || hit.unit.status || "unknown")),
           h("td", {}, Number(hit.score ?? 0).toFixed(2)), h("td", { class: "truncate mono" }, (hit.matchedTerms ?? []).join(", ")),
           h("td", {}, number(hit.evidence?.length ?? 0)),
         ))));
@@ -1285,6 +1289,8 @@ async function renderKnowledge() {
         h("div", { class: "panel panel-body" }, [
           h("div", { class: "toolbar" }, [
             chip(context.routing?.intent ?? "fact"),
+            chip(context.temporalIntent || "NONE"),
+            context.resolvedVersion ? chip(`version ${context.resolvedVersion}`) : "",
             h("span", { class: "muted" }, `${context.estimatedTokens ?? 0}/${context.tokenBudget ?? 0} tokens`),
             h("span", { class: "muted" }, `${context.evidence?.length ?? 0} evidence · ${context.citations?.length ?? 0} citations`),
           ]),

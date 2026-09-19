@@ -1,10 +1,17 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 
 const source = new URL("../src/", import.meta.url);
 const target = new URL("../../internal/web/dist/", import.meta.url);
 
-await rm(target, { recursive: true, force: true });
+// Windows file watchers can briefly hold the directory itself. Clear its
+// entries instead of removing the directory, then recreate the known layout.
+if (existsSync(target)) {
+  for (const entry of await readdir(target)) {
+    await rm(new URL(`${entry}/`, target), { recursive: true, force: true });
+  }
+}
 await mkdir(target, { recursive: true });
 await cp(source, target, { recursive: true });
 

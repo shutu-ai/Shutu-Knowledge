@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
@@ -156,7 +157,8 @@ func (s *Service) loadSemanticSourceState(ctx context.Context, baseID string) (*
 		source := semantic.SourceDocument{
 			BaseID: baseID, DocumentID: document.ID, Title: document.Title,
 			IndexGeneration: document.ActiveIndexGen, SourceVersion: document.SourceVersion,
-			UpdatedAt: document.UpdatedAt, IR: &ir, ChunkIDsByNode: chunks,
+			UpdatedAt: document.UpdatedAt, TemporalMetadata: sourceTemporalMetadata(&ir),
+			IR: &ir, ChunkIDsByNode: chunks,
 		}
 		state.documents = append(state.documents, source)
 		state.byID[source.DocumentID] = source
@@ -301,6 +303,27 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 		return semantic.ContextPackage{}, err
 	}
 	queries := []string{query}
+	// Temporal evidence tokens can be absent from the natural-language query
+	// (especially “current”). Add the resolved scope as an additional bounded
+	// retrieval query, then let semantic.CompileContext re-rank and filter.
+	plan := semantic.RouteQuery(query)
+	resolvedVersion := plan.Temporal.FromVersion
+	if plan.Temporal.Intent == semantic.TemporalCurrent || plan.Temporal.Intent == semantic.TemporalValidity {
+		if version, resolvable := semantic.ResolveCurrentVersion(compilation); resolvable {
+			resolvedVersion = version
+		}
+	}
+	switch plan.Temporal.Intent {
+	case semantic.TemporalEvolution, semantic.TemporalCompareVersions:
+		for _, version := range plan.Temporal.Versions {
+			if len(queries) >= 6 { break }
+			queries = append(queries, version+" release")
+		}
+	default:
+		if resolvedVersion != "" {
+			queries = append(queries, resolvedVersion+" release")
+		}
+	}
 	for _, hit := range memory.Hits {
 		if hit.Unit.Type != semantic.UnitConcept && hit.Unit.Type != semantic.UnitTopic {
 			continue
@@ -308,7 +331,7 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 		if title := strings.TrimSpace(hit.Unit.Title); title != "" {
 			queries = append(queries, title)
 		}
-		if len(queries) >= 4 {
+		if len(queries) >= 6 {
 			break
 		}
 	}
@@ -374,4 +397,25 @@ func (s *Service) GetSemanticWiki(ctx context.Context, baseID string) (semantic.
 		return semantic.WikiView{}, err
 	}
 	return semantic.RenderWiki(compilation)
+}
+
+// sourceTemporalMetadata projects only the existing parser-supplied IR parse
+// configuration into the temporal compiler input. It does not invent metadata.
+func sourceTemporalMetadata(ir *documentir.Document) map[string]string {
+	if ir == nil {
+		return nil
+	}
+	keys := []string{"knowledge_version", "document_version", "release", "version", "temporal_version",
+		"published_at", "published", "date", "revision_date", "effective_at", "effective",
+		"valid_from", "source_authority", "source_priority"}
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
+		if value := strings.TrimSpace(ir.ParseConfig[key]); value != "" {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

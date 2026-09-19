@@ -10,7 +10,7 @@ import (
 
 const (
 	DefaultContextTokenBudget = 4096
-	contextCompilerVersion    = "semantic-evidence-v1"
+	contextCompilerVersion    = "semantic-temporal-v1"
 )
 
 // ContextCompileOptions controls one dynamic semantic+evidence package.
@@ -34,6 +34,10 @@ type ContextEvidence struct {
 	Citation        string
 	IndexGeneration int64
 	SourceVersion   int64
+	Version         string `json:"version,omitempty"`
+	TemporalStatus  string `json:"temporalStatus,omitempty"`
+	ValidFrom       int64  `json:"validFrom,omitempty"`
+	ValidTo         int64  `json:"validTo,omitempty"`
 	Score           float64
 }
 
@@ -48,6 +52,9 @@ type ContextPackage struct {
 	Concepts         []string           `json:"concepts,omitempty"`
 	Relations        []string           `json:"relations,omitempty"`
 	Facts            []string           `json:"facts,omitempty"`
+	TemporalIntent   string             `json:"temporalIntent,omitempty"`
+	ResolvedVersion  string             `json:"resolvedVersion,omitempty"`
+	TemporalReason   string             `json:"temporalReason,omitempty"`
 	Evidence         []ContextEvidence  `json:"evidence,omitempty"`
 	Citations        []string           `json:"citations,omitempty"`
 	TokenBudget      int                `json:"tokenBudget"`
@@ -147,8 +154,24 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 			pkg.Facts = append(pkg.Facts, clipped)
 		}
 	}
+	pkg.TemporalIntent = string(routing.Temporal.Intent)
+	resolvedVersion := ""
+	if routing.Temporal.Intent == TemporalCurrent || routing.Temporal.Intent == TemporalValidity {
+		resolved, resolvable := ResolveCurrentVersion(compilation)
+		resolvedVersion = resolved
+		if resolvable {
+			pkg.ResolvedVersion = resolved
+			pkg.TemporalReason = "latest comparable compiled source version; not file mtime"
+		} else {
+			pkg.TemporalReason = "Unable to determine authoritative latest version"
+		}
+	} else if len(routing.Temporal.Versions) > 0 {
+		resolvedVersion = routing.Temporal.FromVersion
+		pkg.ResolvedVersion = resolvedVersion
+		pkg.TemporalReason = "explicit query version has selection precedence"
+	}
 	for _, hit := range facts.Hits {
-		factContent(hit.Unit.Content)
+		factContent(temporalFactLine(hit.Unit))
 	}
 	// Multi-hop orientation follows the activated concept/topic subtree rather
 	// than relying solely on lexical overlap with every distant hop.
@@ -223,6 +246,7 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 	}
 
 	deduplicated := deduplicateContextEvidence(evidence)
+	deduplicated = selectTemporalEvidence(deduplicated, routing.Temporal, resolvedVersion)
 	pkg.Diagnostics = ContextDiagnostics{
 		SemanticHits: len(orientation.Hits), FactHits: len(facts.Hits),
 		EvidenceCandidates: len(evidence), EvidenceSelected: 0,
@@ -271,6 +295,7 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	remaining -= chunk.EstimateTokens("# Knowledge Context\nQuery: " + displayQuery + "\n")
 
 	orientation := writeSection("## Knowledge orientation", p.KnowledgeSummary, p.TokenBudget/4)
+	temporal := writeSection("## Temporal selection", p.temporalLines(), p.TokenBudget/20)
 	concepts := writeSection("## Relevant concepts", p.Concepts, p.TokenBudget/10)
 	relationLines := writeSection("## Relevant relations", p.Relations, p.TokenBudget/20)
 	facts := writeSection("## Critical facts", p.Facts, p.TokenBudget/8)
@@ -279,7 +304,7 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	for _, section := range []struct {
 		header string
 		lines  []string
-	}{{"## Knowledge orientation", orientation}, {"## Relevant concepts", concepts},
+	}{{"## Knowledge orientation", orientation}, {"## Temporal selection", temporal}, {"## Relevant concepts", concepts},
 		{"## Relevant relations", relationLines}, {"## Critical facts", facts}} {
 		if len(section.lines) == 0 {
 			continue
@@ -342,6 +367,80 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	}
 }
 
+// selectTemporalEvidence re-ranks, and narrowly filters, exact evidence after
+// the ordinary retrieval stage. History is only excluded when a requested or
+// resolved replacement scope is present.
+func selectTemporalEvidence(items []ContextEvidence, temporal TemporalQuery, resolved string) []ContextEvidence {
+	if temporal.Intent == TemporalNone { return items }
+	for i := range items {
+		if items[i].Version == "" {
+			items[i].Version, _, _, _, _ = ExtractTemporalSource(items[i].DocumentTitle, nil)
+		}
+	}
+	targets := append([]string(nil), temporal.Versions...)
+	if resolved != "" && (temporal.Intent == TemporalCurrent || temporal.Intent == TemporalValidity) {
+		targets = []string{resolved}
+	}
+	anyTarget := false
+	for _, item := range items {
+		if item.Version != "" && containsIdentity(targets, item.Version) { anyTarget = true; break }
+	}
+	if anyTarget {
+		narrow := temporal.Intent == TemporalCurrent || temporal.Intent == TemporalValidity ||
+			temporal.Intent == TemporalExplicitVersion || temporal.Intent == TemporalHistorical
+		out := make([]ContextEvidence, 0, len(items))
+		for i := range items {
+			if items[i].Version != "" && containsIdentity(targets, items[i].Version) {
+				items[i].Score += 8
+				items[i].TemporalStatus = "selected"
+				out = append(out, items[i])
+				continue
+			}
+			// Scope narrowing is context selection, not physical deletion:
+			// superseded/source-version units remain in semantic memory and can
+			// be recalled by historical/evolution queries.
+			if narrow && items[i].Version != "" { continue }
+			items[i].Score *= 0.7
+			out = append(out, items[i])
+		}
+		sort.SliceStable(out, func(i,j int) bool {
+			if out[i].Score != out[j].Score { return out[i].Score > out[j].Score }
+			if out[i].DocumentID != out[j].DocumentID { return out[i].DocumentID < out[j].DocumentID }
+			return out[i].ChunkID < out[j].ChunkID
+		})
+		return out
+	} else if resolved != "" {
+		for i := range items {
+			if items[i].Version == resolved { items[i].Score += 6; items[i].TemporalStatus="selected" }
+		}
+	}
+	sort.SliceStable(items, func(i,j int) bool {
+		if items[i].Score != items[j].Score { return items[i].Score > items[j].Score }
+		if items[i].DocumentID != items[j].DocumentID { return items[i].DocumentID < items[j].DocumentID }
+		return items[i].ChunkID < items[j].ChunkID
+	})
+	return items
+}
+
+func temporalFactLine(unit Unit) string {
+	prefix := ""
+	if unit.Version != "" { prefix += "version=" + unit.Version }
+	if status := unit.Metadata["temporal_status"]; status != "" {
+		if prefix != "" { prefix += "," }
+		prefix += "status=" + status
+	}
+	if prefix == "" { return unit.Content }
+	return "[" + prefix + "] " + unit.Content
+}
+
+func (p *ContextPackage) temporalLines() []string {
+	if p.TemporalIntent == "" || p.TemporalIntent == string(TemporalNone) { return nil }
+	lines := []string{"intent=" + p.TemporalIntent}
+	if p.ResolvedVersion != "" { lines = append(lines, "resolved_version="+p.ResolvedVersion) }
+	if p.TemporalReason != "" { lines = append(lines, "reason="+p.TemporalReason) }
+	return lines
+}
+
 func contextCountsForPlan(plan QueryPlan) (int, int) {
 	switch plan.Intent {
 	case IntentGlobal:
@@ -358,6 +457,12 @@ func contextCountsForPlan(plan QueryPlan) (int, int) {
 }
 
 func deduplicateContextEvidence(items []ContextEvidence) []ContextEvidence {
+	for i := range items {
+		if items[i].Version == "" {
+			items[i].Version, _, _, _, _ = ExtractTemporalSource(items[i].DocumentTitle, nil)
+		}
+		if items[i].Version != "" && items[i].TemporalStatus == "" { items[i].TemporalStatus = "source-scoped" }
+	}
 	seen := map[string]bool{}
 	out := make([]ContextEvidence, 0, len(items))
 	for _, item := range items {

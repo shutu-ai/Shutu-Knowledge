@@ -99,6 +99,16 @@ type knowledgeAudit struct {
 	CheckedSummaries    int    `json:"checkedSummaries"`
 	CheckedRelations    int    `json:"checkedRelations"`
 	InvalidRelationProv int    `json:"invalidRelationProvenance"`
+	TemporalUnits       int    `json:"temporalUnits"`
+	VersionedUnits      int    `json:"versionedUnits"`
+	SupersededUnits     int    `json:"supersededUnits"`
+	ConflictedUnits     int    `json:"conflictedUnits"`
+	TemporalChecked     int    `json:"temporalChecked"`
+	TemporalValidProv   int    `json:"temporalValidProvenance"`
+	SupersessionRels    int    `json:"supersessionRelations"`
+	SupersessionChecked int    `json:"supersessionChecked"`
+	SupersessionValid   int    `json:"supersessionValid"`
+	FalseSupersession   int    `json:"falseSupersessionRisk"`
 }
 
 type corpusResult struct {
@@ -588,8 +598,21 @@ func auditKnowledge(service *knowledge.Service, ctx context.Context, compilation
 	}
 	audit.Relations = len(compilation.Relations)
 	for _, relation := range compilation.Relations {
+		if relation.Type == semantic.RelationSupersedes {
+			audit.SupersessionRels++
+			if audit.SupersessionChecked < 30 {
+				audit.SupersessionChecked++
+				subject, object := findUnitByID(compilation.Units, relation.SubjectUnitID), findUnitByID(compilation.Units, relation.ObjectUnitID)
+				order, comparable := semantic.CompareVersionIdentity(subject.Version, object.Version)
+				if subject.ID == "" || object.ID == "" || !comparable || order >= 0 || len(relation.Sources) == 0 {
+					audit.FalseSupersession++
+				} else {
+					audit.SupersessionValid++
+				}
+			}
+		}
 		if audit.CheckedRelations >= 50 {
-			break
+			continue
 		}
 		valid := len(relation.Sources) > 0
 		for _, source := range relation.Sources {
@@ -602,12 +625,38 @@ func auditKnowledge(service *knowledge.Service, ctx context.Context, compilation
 		}
 		audit.CheckedRelations++
 	}
+	for _, unit := range compilation.Units {
+		versioned, temporal := unit.Version != "", unit.Version != "" || unit.Status == semantic.UnitSuperseded || unit.Status == semantic.UnitConflicted
+		if versioned { audit.VersionedUnits++ }
+		if temporal { audit.TemporalUnits++ }
+		switch unit.Status {
+		case semantic.UnitSuperseded: audit.SupersededUnits++
+		case semantic.UnitConflicted: audit.ConflictedUnits++
+		}
+		if !temporal || audit.TemporalChecked >= 50 { continue }
+		sources, err := service.ResolveSemanticUnitEvidence(ctx, unit.ID)
+		valid := err == nil && len(sources) > 0
+		if valid {
+			for _, source := range sources {
+				if source.DocumentID == "" || (source.NodeID == "" && source.ChunkID == "") { valid = false }
+			}
+		}
+		audit.TemporalChecked++
+		if valid { audit.TemporalValidProv++ }
+	}
 	for _, count := range seen {
 		if count > 1 {
 			audit.DuplicateCanonKeys += count - 1
 		}
 	}
 	return audit
+}
+
+func findUnitByID(units []semantic.Unit, id string) semantic.Unit {
+	for _, unit := range units {
+		if unit.ID == id { return unit }
+	}
+	return semantic.Unit{}
 }
 
 func runLifecycleTests(service *knowledge.Service, ctx context.Context, baseID string, docs map[string]docInfo, before semantic.Compilation) (lifecycleResult, lifecycleResult, error) {

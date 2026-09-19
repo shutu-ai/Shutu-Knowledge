@@ -8,8 +8,9 @@ const target = new URL("../../internal/web/dist/", import.meta.url);
 // Windows file watchers can briefly hold the directory itself. Clear its
 // entries instead of removing the directory, then recreate the known layout.
 if (existsSync(target)) {
-  for (const entry of await readdir(target)) {
-    await rm(new URL(`${entry}/`, target), { recursive: true, force: true });
+  for (const entry of await readdir(target, { withFileTypes: true })) {
+    const path = new URL(entry.isDirectory() ? `${entry.name}/` : entry.name, target);
+    await rm(path, { recursive: true, force: true });
   }
 }
 await mkdir(target, { recursive: true });

@@ -67,8 +67,9 @@ temporal term criteria is 0.994.
 | Agent Integration | PASS | context/evidence contract tests; backward-compatible JSON |
 | Windows Package Smoke | PASS | formal package online + offline restart smoke |
 | Push CI | PASS | [GitHub Actions run 35450225989](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35450225989), commit `9bdf28993dd15effceaf04b3eed73d46df93e695` |
-| Tag CI | NOT RUN | tag promotion requires explicit owner approval |
+| Tag CI | PASS | [GitHub Actions run 35453835673](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35453835673) at `9bdf28993dd15effceaf04b3eed73d46df93e695` |
 | No P0 | PASS | no forbidden selection or false supersession observed |
+| GitHub Release | PASS | [Shutu Knowledge v0.5.0](https://github.com/shutu-ai/Shutu-Knowledge/releases/tag/v0.5.0) with hash-verified artifact |
 
 ## Candidate artifact
 
@@ -82,14 +83,42 @@ SHA-256: 813e8c88aa3bff125d07adfa0a6c9c69fddc86491c84dc418c2a27d9c563b90c
 ```
 
 The same artifact passed online retrieval, runtime status, OCR ingestion, and
-offline restart smoke.
+offline restart smoke. Tag CI rebuilt and packaged the tagged source successfully.
+The published asset was downloaded after upload and re-hashed to the exact SHA-256
+above.
+
+## Tag CI evidence
+
+The immutable annotated tag `v0.5.0` points to
+`9bdf28993dd15effceaf04b3eed73d46df93e695`.
+
+[Tag CI run 35453835673](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35453835673)
+completed successfully:
+
+| Job | Result |
+|---|---|
+| build | PASS |
+| release-package | PASS |
+| runtime-release | PASS |
+| release-host (windows-latest) | PASS |
+| release-host (macos-latest) | PASS |
+| release-host (ubuntu-latest) | PASS |
+
+## GitHub Release evidence
+
+* Release: [Shutu Knowledge v0.5.0](https://github.com/shutu-ai/Shutu-Knowledge/releases/tag/v0.5.0)
+* Tag: `v0.5.0`
+* Draft: false
+* Prerelease: false
+* Asset: `shutu-knowledge-0.5.0-windows-amd64.zip`
+* Asset size: `12621004` bytes
+* Asset state: uploaded
+* Verified SHA-256: `813e8c88aa3bff125d07adfa0a6c9c69fddc86491c84dc418c2a27d9c563b90c`
 
 ## Release status
 
 ```text
-NOT READY
+READY
 ```
 
-Product gates and push CI pass. Release promotion remains intentionally blocked
-pending explicit owner approval to create the versioned `v0.5.0` tag and run
-tag CI.
+All product, Tag CI, artifact-integrity, and GitHub Release gates pass.

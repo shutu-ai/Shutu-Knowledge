@@ -371,10 +371,13 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 // the ordinary retrieval stage. History is only excluded when a requested or
 // resolved replacement scope is present.
 func selectTemporalEvidence(items []ContextEvidence, temporal TemporalQuery, resolved string) []ContextEvidence {
-	if temporal.Intent == TemporalNone { return items }
+	if temporal.Intent == TemporalNone {
+		return items
+	}
 	for i := range items {
 		if items[i].Version == "" {
-			items[i].Version, _, _, _, _ = ExtractTemporalSource(items[i].DocumentTitle, nil)
+			sourceText := items[i].DocumentTitle + "\n" + items[i].Text
+			items[i].Version, _, _, _, _ = ExtractTemporalSource(sourceText, nil)
 		}
 	}
 	targets := append([]string(nil), temporal.Versions...)
@@ -383,7 +386,16 @@ func selectTemporalEvidence(items []ContextEvidence, temporal TemporalQuery, res
 	}
 	anyTarget := false
 	for _, item := range items {
-		if item.Version != "" && containsIdentity(targets, item.Version) { anyTarget = true; break }
+		if item.Version != "" && containsIdentity(targets, item.Version) {
+			anyTarget = true
+			break
+		}
+	}
+	// Explicit and historical requests must not silently fall back to another
+	// version when the requested scope has no retrieved evidence.
+	if len(targets) > 0 && !anyTarget &&
+		(temporal.Intent == TemporalExplicitVersion || temporal.Intent == TemporalHistorical) {
+		return []ContextEvidence{}
 	}
 	if anyTarget {
 		narrow := temporal.Intent == TemporalCurrent || temporal.Intent == TemporalValidity ||
@@ -399,24 +411,37 @@ func selectTemporalEvidence(items []ContextEvidence, temporal TemporalQuery, res
 			// Scope narrowing is context selection, not physical deletion:
 			// superseded/source-version units remain in semantic memory and can
 			// be recalled by historical/evolution queries.
-			if narrow && items[i].Version != "" { continue }
+			if narrow && items[i].Version != "" {
+				continue
+			}
 			items[i].Score *= 0.7
 			out = append(out, items[i])
 		}
-		sort.SliceStable(out, func(i,j int) bool {
-			if out[i].Score != out[j].Score { return out[i].Score > out[j].Score }
-			if out[i].DocumentID != out[j].DocumentID { return out[i].DocumentID < out[j].DocumentID }
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].Score != out[j].Score {
+				return out[i].Score > out[j].Score
+			}
+			if out[i].DocumentID != out[j].DocumentID {
+				return out[i].DocumentID < out[j].DocumentID
+			}
 			return out[i].ChunkID < out[j].ChunkID
 		})
 		return out
 	} else if resolved != "" {
 		for i := range items {
-			if items[i].Version == resolved { items[i].Score += 6; items[i].TemporalStatus="selected" }
+			if items[i].Version == resolved {
+				items[i].Score += 6
+				items[i].TemporalStatus = "selected"
+			}
 		}
 	}
-	sort.SliceStable(items, func(i,j int) bool {
-		if items[i].Score != items[j].Score { return items[i].Score > items[j].Score }
-		if items[i].DocumentID != items[j].DocumentID { return items[i].DocumentID < items[j].DocumentID }
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Score != items[j].Score {
+			return items[i].Score > items[j].Score
+		}
+		if items[i].DocumentID != items[j].DocumentID {
+			return items[i].DocumentID < items[j].DocumentID
+		}
 		return items[i].ChunkID < items[j].ChunkID
 	})
 	return items
@@ -424,20 +449,32 @@ func selectTemporalEvidence(items []ContextEvidence, temporal TemporalQuery, res
 
 func temporalFactLine(unit Unit) string {
 	prefix := ""
-	if unit.Version != "" { prefix += "version=" + unit.Version }
+	if unit.Version != "" {
+		prefix += "version=" + unit.Version
+	}
 	if status := unit.Metadata["temporal_status"]; status != "" {
-		if prefix != "" { prefix += "," }
+		if prefix != "" {
+			prefix += ","
+		}
 		prefix += "status=" + status
 	}
-	if prefix == "" { return unit.Content }
+	if prefix == "" {
+		return unit.Content
+	}
 	return "[" + prefix + "] " + unit.Content
 }
 
 func (p *ContextPackage) temporalLines() []string {
-	if p.TemporalIntent == "" || p.TemporalIntent == string(TemporalNone) { return nil }
+	if p.TemporalIntent == "" || p.TemporalIntent == string(TemporalNone) {
+		return nil
+	}
 	lines := []string{"intent=" + p.TemporalIntent}
-	if p.ResolvedVersion != "" { lines = append(lines, "resolved_version="+p.ResolvedVersion) }
-	if p.TemporalReason != "" { lines = append(lines, "reason="+p.TemporalReason) }
+	if p.ResolvedVersion != "" {
+		lines = append(lines, "resolved_version="+p.ResolvedVersion)
+	}
+	if p.TemporalReason != "" {
+		lines = append(lines, "reason="+p.TemporalReason)
+	}
 	return lines
 }
 
@@ -461,7 +498,9 @@ func deduplicateContextEvidence(items []ContextEvidence) []ContextEvidence {
 		if items[i].Version == "" {
 			items[i].Version, _, _, _, _ = ExtractTemporalSource(items[i].DocumentTitle, nil)
 		}
-		if items[i].Version != "" && items[i].TemporalStatus == "" { items[i].TemporalStatus = "source-scoped" }
+		if items[i].Version != "" && items[i].TemporalStatus == "" {
+			items[i].TemporalStatus = "source-scoped"
+		}
 	}
 	seen := map[string]bool{}
 	out := make([]ContextEvidence, 0, len(items))

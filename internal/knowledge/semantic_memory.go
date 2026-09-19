@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
@@ -313,14 +314,19 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 			resolvedVersion = version
 		}
 	}
+	targetVersions := make([]string, 0, 2)
 	switch plan.Temporal.Intent {
 	case semantic.TemporalEvolution, semantic.TemporalCompareVersions:
+		targetVersions = append(targetVersions, plan.Temporal.Versions...)
 		for _, version := range plan.Temporal.Versions {
-			if len(queries) >= 6 { break }
+			if len(queries) >= 6 {
+				break
+			}
 			queries = append(queries, version+" release")
 		}
 	default:
 		if resolvedVersion != "" {
+			targetVersions = append(targetVersions, resolvedVersion)
 			queries = append(queries, resolvedVersion+" release")
 		}
 	}
@@ -340,6 +346,18 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	})
 	if err != nil {
 		return semantic.ContextPackage{}, err
+	}
+	// Multi-query retrieval can dilute an exact version token. Run a small
+	// targeted query for each requested scope and place those hits first so
+	// semantic.CompileContext can enforce version scope without falling back.
+	for _, version := range targetVersions {
+		targeted, err := s.Search(ctx, SearchRequest{
+			BaseID: baseID, Query: version + " release", TopK: 4, Mode: "hybrid",
+		})
+		if err != nil {
+			return semantic.ContextPackage{}, err
+		}
+		search.Hits = append(targeted.Hits, search.Hits...)
 	}
 	evidenceItems := make([]semantic.ContextEvidence, 0, len(search.Hits))
 	for _, hit := range search.Hits {
@@ -364,9 +382,134 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 			Score: hit.Score,
 		})
 	}
+	// Retrieval tokenizers often split versions such as 0.2.0. To guarantee
+	// scope selection without inventing evidence, project the exact provenance
+	// of version-matched Knowledge Units into the evidence candidate set.
+	targetedEvidence, err := s.versionEvidence(ctx, compilation, query, targetVersions)
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	evidenceItems = append(targetedEvidence, evidenceItems...)
 	return semantic.CompileContext(compilation, evidenceItems, semantic.ContextCompileOptions{
 		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
 	})
+}
+
+// versionEvidence resolves exact evidence for units whose source version matches
+// a requested temporal scope. It never fabricates content: text comes from the
+// active chunk when available, otherwise from the provenanced Knowledge Unit.
+func (s *Service) versionEvidence(ctx context.Context, compilation semantic.Compilation, query string, versions []string) ([]semantic.ContextEvidence, error) {
+	if len(versions) == 0 {
+		return nil, nil
+	}
+	wanted := make(map[string]bool, len(versions))
+	for _, version := range versions {
+		if version != "" {
+			wanted[version] = true
+		}
+	}
+	evidenceItems := make([]semantic.ContextEvidence, 0, len(versions))
+	seen := make(map[string]bool)
+	queryTerms := semantic.SearchTerms(query)
+	for _, version := range versions {
+		if !wanted[version] {
+			continue
+		}
+		type candidate struct {
+			index int
+			score int
+		}
+		var candidates []candidate
+		for i := range compilation.Units {
+			unitVersion := compilation.Units[i].Version
+			if order, comparable := semantic.CompareVersionIdentity(unitVersion, version); !comparable || order != 0 || compilation.Units[i].Status == semantic.UnitDeleted {
+				continue
+			}
+			unit := compilation.Units[i]
+			score := 0
+			if len(queryTerms) > 0 {
+				haystack := strings.ToLower(strings.Join(strings.Fields(unit.Title+"\n"+unit.Content), " "))
+				for _, term := range queryTerms {
+					if strings.Contains(haystack, term) {
+						score++
+					}
+				}
+				if score == 0 {
+					continue
+				}
+			}
+			candidates = append(candidates, candidate{index: i, score: score})
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			if candidates[i].score != candidates[j].score {
+				return candidates[i].score > candidates[j].score
+			}
+			return compilation.Units[candidates[i].index].CanonicalKey < compilation.Units[candidates[j].index].CanonicalKey
+		})
+		added := 0
+		for _, candidate := range candidates {
+			if added >= 4 {
+				break
+			}
+			unit := compilation.Units[candidate.index]
+			sources, err := semantic.ResolveEvidence(compilation.Units, unit.ID)
+			if err != nil {
+				return nil, err
+			}
+			for _, source := range sources {
+				key := version + "\x00" + source.DocumentID + "\x00" + source.ChunkID + "\x00" + source.NodeID
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				title, chunks, err := s.GetDocumentWithContext(ctx, source.DocumentID, true)
+				if err != nil {
+					continue
+				}
+				text, heading, chunkID := "", "", source.ChunkID
+				if source.ChunkID != "" {
+					for _, chunk := range chunks {
+						if chunk.ID == source.ChunkID {
+							text, heading = chunk.Text, chunk.Heading
+							break
+						}
+					}
+				}
+				if text == "" && source.NodeID != "" {
+					for _, chunk := range chunks {
+						for _, nodeID := range chunk.NodeIDs {
+							if nodeID == source.NodeID {
+								text, heading, chunkID = chunk.Text, chunk.Heading, chunk.ID
+								break
+							}
+						}
+						if text != "" {
+							break
+						}
+					}
+				}
+				if text == "" {
+					text = unit.Content
+				}
+				if chunkID == "" {
+					chunkID = "node:" + source.NodeID
+				}
+				evidenceItems = append(evidenceItems, semantic.ContextEvidence{
+					ChunkID: chunkID, DocumentID: source.DocumentID, DocumentTitle: title.Title,
+					Heading: heading, Text: text,
+					Citation:        fmt.Sprintf("%s chunk=%s", source.DocumentID, chunkID),
+					IndexGeneration: source.IndexGeneration, SourceVersion: source.SourceVersion,
+					Version: version, TemporalStatus: "targeted",
+					Score: 1000 - float64(added),
+				})
+				added++
+				if added >= 4 {
+					break
+				}
+			}
+		}
+	}
+	return evidenceItems, nil
 }
 
 // PlanKnowledgeQuery returns deterministic AUTO-mode diagnostics. It does not

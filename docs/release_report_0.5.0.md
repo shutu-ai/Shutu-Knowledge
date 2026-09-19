@@ -66,24 +66,23 @@ temporal term criteria is 0.994.
 | Performance Regression | PASS | support criteria improves; temporal context/latency remains bounded |
 | Agent Integration | PASS | context/evidence contract tests; backward-compatible JSON |
 | Windows Package Smoke | PASS | formal package online + offline restart smoke |
-| Push CI | PENDING | required before release promotion |
-| Tag CI | PENDING | required before release promotion |
+| Push CI | PASS | [GitHub Actions run 35450225989](https://github.com/shutu-ai/Shutu-Knowledge/actions/runs/35450225989), commit `9bdf28993dd15effceaf04b3eed73d46df93e695` |
+| Tag CI | NOT RUN | tag promotion requires explicit owner approval |
 | No P0 | PASS | no forbidden selection or false supersession observed |
 
 ## Candidate artifact
 
-Initial verified Windows package produced from temporal implementation commit
-`6be7affeb86ebfa44f31e899bf8a14b6c6331c23`:
+Verified Windows package produced from release-branch commit
+`9bdf28993dd15effceaf04b3eed73d46df93e695`:
 
 ```text
 filename: shutu-knowledge-0.5.0-windows-amd64.zip
-size: 12620990 bytes
-SHA-256: 791f11242da870b5126fd35824b6ce12f2f52a91a3f2b4d7edc6c96c01eda2fc
+size: 12621004 bytes
+SHA-256: 813e8c88aa3bff125d07adfa0a6c9c69fddc86491c84dc418c2a27d9c563b90c
 ```
 
-A final artifact is rebuilt from the promoted documentation-only commit after
-CI/tag evidence; product code is unchanged. This section records the actual
-verified package used for Windows smoke.
+The same artifact passed online retrieval, runtime status, OCR ingestion, and
+offline restart smoke.
 
 ## Release status
 
@@ -91,5 +90,6 @@ verified package used for Windows smoke.
 NOT READY
 ```
 
-The product gates pass, but release promotion remains blocked on observed push
-and tag CI.
+Product gates and push CI pass. Release promotion remains intentionally blocked
+pending explicit owner approval to create the versioned `v0.5.0` tag and run
+tag CI.

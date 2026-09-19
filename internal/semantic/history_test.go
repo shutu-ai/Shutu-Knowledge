@@ -185,3 +185,42 @@ func TestDeriveHistoricalTimelineRequiresEvidence(t *testing.T) {
 		t.Fatalf("empty timeline=%+v", timeline)
 	}
 }
+
+func TestRangeHistoryIntentPreservesAmbiguity(t *testing.T) {
+	for _, query := range []string{
+		"What happened in earlier release stages?",
+		"Describe the early history of the project.",
+		"以前是什么样？",
+	} {
+		plan := RouteQuery(query)
+		if plan.Temporal.Intent != TemporalRangeHistory {
+			t.Fatalf("query %q intent=%s", query, plan.Temporal.Intent)
+		}
+		if plan.Temporal.Range == nil || plan.Temporal.Range.Kind != RangeAmbiguous || !plan.Temporal.Range.Ambiguous {
+			t.Fatalf("query %q range=%+v", query, plan.Temporal.Range)
+		}
+		if plan.Intent != IntentTemporal || !plan.UseSemanticMemory {
+			t.Fatalf("query %q plan=%+v", query, plan)
+		}
+	}
+}
+
+func TestRangeHistoryIntentPreservesExistingExplicitVersion(t *testing.T) {
+	plan := RouteQuery("historical Version 0.2 supports the 128k context window")
+	if plan.Temporal.Intent != TemporalExplicitVersion || plan.Temporal.FromVersion != "0.2" {
+		t.Fatalf("plan=%+v", plan.Temporal)
+	}
+	if plan.Temporal.Range != nil && plan.Temporal.Range.Ambiguous {
+		t.Fatalf("ambiguous range attached to explicit version: %+v", plan.Temporal.Range)
+	}
+}
+
+func TestRangeHistoryIntentUsesRelativeEvent(t *testing.T) {
+	plan := RouteQuery("How did knowledge work before semantic memory?")
+	if plan.Temporal.Intent != TemporalRangeHistory || plan.Temporal.Range == nil || plan.Temporal.Range.Kind != RangeEvent {
+		t.Fatalf("plan=%+v", plan.Temporal)
+	}
+	if plan.Temporal.Range.End == nil || plan.Temporal.Range.End.Value != "semantic memory" {
+		t.Fatalf("range=%+v", plan.Temporal.Range)
+	}
+}

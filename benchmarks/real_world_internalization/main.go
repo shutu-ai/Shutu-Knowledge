@@ -82,17 +82,23 @@ type aggregate struct {
 }
 
 type knowledgeAudit struct {
-	Corpus             string `json:"corpus"`
-	Facts              int    `json:"facts"`
-	Concepts           int    `json:"concepts"`
-	Topics             int    `json:"topics"`
-	Summaries          int    `json:"summaries"`
-	Relations          int    `json:"relations"`
-	DuplicateCanonKeys int    `json:"duplicateCanonicalKeys"`
-	UnsupportedFacts   int    `json:"unsupportedFacts"`
-	InvalidProvenance  int    `json:"invalidProvenance"`
-	EmptySummaries     int    `json:"emptySummaries"`
-	Checked            int    `json:"checked"`
+	Corpus              string `json:"corpus"`
+	Facts               int    `json:"facts"`
+	Concepts            int    `json:"concepts"`
+	Topics              int    `json:"topics"`
+	Summaries           int    `json:"summaries"`
+	Relations           int    `json:"relations"`
+	DuplicateCanonKeys  int    `json:"duplicateCanonicalKeys"`
+	UnsupportedFacts    int    `json:"unsupportedFacts"`
+	InvalidProvenance   int    `json:"invalidProvenance"`
+	EmptySummaries      int    `json:"emptySummaries"`
+	Checked             int    `json:"checked"`
+	CheckedFacts        int    `json:"checkedFacts"`
+	CheckedConcepts     int    `json:"checkedConcepts"`
+	CheckedTopics       int    `json:"checkedTopics"`
+	CheckedSummaries    int    `json:"checkedSummaries"`
+	CheckedRelations    int    `json:"checkedRelations"`
+	InvalidRelationProv int    `json:"invalidRelationProvenance"`
 }
 
 type corpusResult struct {
@@ -532,7 +538,7 @@ func aggregateResults(items []queryResult) aggregate {
 func auditKnowledge(service *knowledge.Service, ctx context.Context, compilation semantic.Compilation) knowledgeAudit {
 	audit := knowledgeAudit{}
 	seen := map[string]int{}
-	checked := 0
+	checkedByType := map[semantic.UnitKind]int{}
 	for _, unit := range compilation.Units {
 		switch unit.Type {
 		case semantic.UnitFact:
@@ -565,17 +571,42 @@ func auditKnowledge(service *knowledge.Service, ctx context.Context, compilation
 		if unit.Type == semantic.UnitSummary && strings.TrimSpace(unit.Content) == "" {
 			audit.EmptySummaries++
 		}
-		if checked < 50 {
-			checked++
+		if checkedByType[unit.Type] < 50 {
+			checkedByType[unit.Type]++
+			audit.Checked++
+			switch unit.Type {
+			case semantic.UnitFact:
+				audit.CheckedFacts++
+			case semantic.UnitConcept:
+				audit.CheckedConcepts++
+			case semantic.UnitTopic:
+				audit.CheckedTopics++
+			case semantic.UnitSummary:
+				audit.CheckedSummaries++
+			}
 		}
 	}
 	audit.Relations = len(compilation.Relations)
+	for _, relation := range compilation.Relations {
+		if audit.CheckedRelations >= 50 {
+			break
+		}
+		valid := len(relation.Sources) > 0
+		for _, source := range relation.Sources {
+			if source.DocumentID == "" || (source.NodeID == "" && source.ChunkID == "") {
+				valid = false
+			}
+		}
+		if !valid {
+			audit.InvalidRelationProv++
+		}
+		audit.CheckedRelations++
+	}
 	for _, count := range seen {
 		if count > 1 {
 			audit.DuplicateCanonKeys += count - 1
 		}
 	}
-	audit.Checked = checked
 	return audit
 }
 

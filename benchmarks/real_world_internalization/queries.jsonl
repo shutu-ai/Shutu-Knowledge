@@ -117,3 +117,4 @@
 {"id":"C-EXPL-002","corpus":"C","category":"EXPLANATION","query":"Why is semantic compilation optional?","expectedDocs":["docs/0.4_semantic_memory.md"],"expectedTerms":["optional"]}
 {"id":"C-EXPL-003","corpus":"C","category":"EXPLANATION","query":"Why is Living Wiki not source of truth?","expectedDocs":["docs/0.4_living_wiki.md"],"expectedTerms":["view"]}
 {"id":"C-EXPL-004","corpus":"C","category":"EXPLANATION","query":"Why is incremental compilation needed?","expectedDocs":["docs/0.4_incremental_compilation.md"],"expectedTerms":["incremental"]}
+{"id":"A-TEMP-005","corpus":"A","category":"TEMPORAL","query":"What is the current Open5GS release?","expectedDocs":["open5gs/docs/_posts/2026-06-20-release-v2.8.0.md"],"expectedTerms":["2.8.0"],"forbiddenDocs":["open5gs/docs/_posts/2025-07-19-release-v2.7.6.md","open5gs/docs/_posts/2025-03-30-release-v2.7.5.md","open5gs/docs/_posts/2023-12-04-release-v2.7.0.md"]}

@@ -1,6 +1,9 @@
 package semantic
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseTemporalRangeExplicitVersionRange(t *testing.T) {
 	tests := []struct{ query, from, to string }{
@@ -119,5 +122,66 @@ func TestResolveTemporalRangeKeepsAmbiguousUnmaterialized(t *testing.T) {
 	resolved := ResolveTemporalRange(Compilation{Units: []Unit{{ID: "unit", Version: "0.1", Status: UnitActive}}}, r)
 	if resolved.UnitCount != 0 || len(resolved.Versions) != 0 || !resolved.Range.Ambiguous {
 		t.Fatalf("ambiguous materialized=%+v", resolved)
+	}
+}
+
+func historyTestCompilation() Compilation {
+	return Compilation{Units: []Unit{
+		{ID: "v02", Version: "0.2", Type: UnitFact, Content: "RAG foundation indexed documents", Status: UnitActive, Sources: []EvidenceSource{{DocumentID: "doc-0.2", ChunkID: "chunk-0.2", IndexGeneration: 1, SourceVersion: 1}}},
+		{ID: "v03", Version: "0.3", Type: UnitFact, Content: "Document IR introduced structured parsing", Status: UnitActive, Sources: []EvidenceSource{{DocumentID: "doc-0.3", ChunkID: "chunk-0.3", IndexGeneration: 1, SourceVersion: 1}}},
+		{ID: "v04", Version: "0.4", Type: UnitFact, Content: "Semantic memory added activated units", Status: UnitActive, Sources: []EvidenceSource{{DocumentID: "doc-0.4", ChunkID: "chunk-0.4", IndexGeneration: 1, SourceVersion: 1}}},
+		{ID: "v05", Version: "0.5", Type: UnitFact, Content: "Temporal knowledge preserved version scope", Status: UnitActive, Sources: []EvidenceSource{{DocumentID: "doc-0.5", ChunkID: "chunk-0.5", IndexGeneration: 1, SourceVersion: 1}}},
+	}}
+}
+
+func TestDeriveHistoricalTimelineUsesMinorVersionPhases(t *testing.T) {
+	timeline := DeriveHistoricalTimeline(historyTestCompilation(), 4)
+	if len(timeline.Phases) != 4 {
+		t.Fatalf("phases=%d want 4: %+v", len(timeline.Phases), timeline)
+	}
+	if timeline.Phases[0].StartVersion != "0.2" || timeline.Phases[3].EndVersion != "0.5" {
+		t.Fatalf("boundaries=%+v", timeline.Phases)
+	}
+	for index, phase := range timeline.Phases {
+		if len(phase.SourceUnitIDs) == 0 || len(phase.Evidence) == 0 || len(phase.KeyChanges) == 0 {
+			t.Fatalf("phase %d lacks provenance/evidence: %+v", index, phase)
+		}
+		if !strings.HasPrefix(phase.ID, "phase-") || phase.Metadata["basis"] != "ordered-source-version" {
+			t.Fatalf("phase %d metadata=%+v", index, phase)
+		}
+	}
+	if len(timeline.Transitions) != 3 {
+		t.Fatalf("transitions=%d want 3", len(timeline.Transitions))
+	}
+	for _, transition := range timeline.Transitions {
+		if transition.Statement == "" || len(transition.SourceUnitIDs) == 0 || len(transition.Evidence) == 0 {
+			t.Fatalf("unevidenced transition=%+v", transition)
+		}
+	}
+}
+
+func TestDeriveHistoricalTimelineUsesMajorPhases(t *testing.T) {
+	compilation := Compilation{Units: []Unit{
+		{ID: "a", Version: "0.1", Type: UnitFact, Content: "early foundation", Status: UnitActive},
+		{ID: "b", Version: "0.9", Type: UnitFact, Content: "late foundation", Status: UnitActive},
+		{ID: "c", Version: "1.0", Type: UnitFact, Content: "first stable release", Status: UnitActive},
+		{ID: "d", Version: "2.0", Type: UnitFact, Content: "second architecture era", Status: UnitActive},
+	}}
+	timeline := DeriveHistoricalTimeline(compilation, 4)
+	if len(timeline.Phases) != 3 {
+		t.Fatalf("phases=%d want 3: %+v", len(timeline.Phases), timeline)
+	}
+	if timeline.Phases[0].StartVersion != "0.1" || timeline.Phases[0].EndVersion != "0.9" {
+		t.Fatalf("foundation phase=%+v", timeline.Phases[0])
+	}
+	if timeline.Phases[1].StartVersion != "1.0" || timeline.Phases[2].StartVersion != "2.0" {
+		t.Fatalf("major phases=%+v", timeline.Phases)
+	}
+}
+
+func TestDeriveHistoricalTimelineRequiresEvidence(t *testing.T) {
+	timeline := DeriveHistoricalTimeline(Compilation{}, 4)
+	if len(timeline.Phases) != 0 || timeline.Confidence != 0 {
+		t.Fatalf("empty timeline=%+v", timeline)
 	}
 }

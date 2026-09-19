@@ -46,8 +46,8 @@ func TestGitCommitIsInjectable(t *testing.T) {
 func TestExtensionVersionIsProtocolCompatible(t *testing.T) {
 	version := ExtensionVersion()
 
-	if version != "0.5.0" {
-		t.Fatalf("extension version = %q, want %q", version, "0.5.0")
+	if version != "0.5.1" {
+		t.Fatalf("extension version = %q, want %q", version, "0.5.1")
 	}
 	for _, part := range strings.Split(version, ".") {
 		if part == "" {

@@ -273,7 +273,7 @@ function updateDocumentJobCard(id, job, label) {
 
 function documentJobSection() {
   const entries = Object.entries(state.documentJobs);
-  const activeCount = entries.filter(([, job]) => !["done", "failed", "cancelled", "succeeded"].includes(job.status)).length;
+  const activeCount = entries.filter(([, job]) => !["done", "failed", "cancelled", "succeeded", "interrupted"].includes(job.status)).length;
   return h("section", { class: "section", "data-document-jobs-section": "", hidden: !entries.length }, [
     h("div", { class: "section-head" }, [
       h("h2", {}, localized("Document tasks")),
@@ -305,7 +305,7 @@ function rememberOperation(operation, label = "") {
     stateRevision: Math.max(Number(previous.stateRevision || 0), Number(operation.stateRevision || 0)),
   };
   operationStore.set(operation.operationId, entry);
-  const terminal = ["succeeded", "failed", "cancelled"].includes(operation.state);
+  const terminal = ["succeeded", "failed", "cancelled", "interrupted"].includes(operation.state);
   if (!terminal) {
     state.documentJobs[operation.operationId] = {
       label: entry.label, kind: operation.type, status: operation.state,
@@ -313,7 +313,7 @@ function rememberOperation(operation, label = "") {
       phase: operation.phase || operationPhaseText(operation),
       file: "",
     };
-  } else if (["failed", "cancelled"].includes(operation.state)) {
+  } else if (["failed", "cancelled", "interrupted"].includes(operation.state)) {
     state.documentJobs[operation.operationId] = {
       label: entry.label, kind: operation.type, status: operation.state,
       progress: operation.completedUnits || 0, total: operation.totalUnits || 0,
@@ -341,7 +341,7 @@ async function trackOperation(operation, label) {
         remembered = rememberOperation(current, label);
         updateDocumentJobCard(current.operationId, operationJobView(current), label);
       }
-      if (["succeeded", "failed", "cancelled"].includes(current.state)) {
+      if (["succeeded", "failed", "cancelled", "interrupted"].includes(current.state)) {
         refreshDocumentViewInBackground();
         if (current.state === "succeeded") {
           delete state.documentJobs[current.operationId];
@@ -383,7 +383,7 @@ function syncDocumentJobSection() {
   const section = document.querySelector("[data-document-jobs-section]");
   if (!section) return;
   const count = Object.values(state.documentJobs)
-    .filter((job) => !["done", "failed", "cancelled", "succeeded"].includes(job.status)).length;
+    .filter((job) => !["done", "failed", "cancelled", "succeeded", "interrupted"].includes(job.status)).length;
   section.hidden = Object.keys(state.documentJobs).length === 0;
   const summary = section.querySelector("[data-document-job-summary]");
   if (summary) summary.textContent = `${count} ${localized("active tasks")}`;

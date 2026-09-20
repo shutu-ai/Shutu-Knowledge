@@ -1676,6 +1676,11 @@ func (s *Service) finishContext(parent context.Context, id string, attempt int, 
 			resultText = string(encoded)
 		}
 	}
+	// A worker interrupted without a durable cancel intent is a lost worker,
+	// not a business failure. Replay-safe commands return to the queue inside
+	// the same control transaction so shutdown or a lost write does not leave
+	// accepted work behind a manual retry.
+	autoRetry := state == StateInterrupted && retryable == 1 && attempt < DefaultMaxAttempts
 	finished := now()
 	var idempotencyExpiry any
 	if terminal(state) && s.idempotencyMS > 0 {
@@ -1707,7 +1712,20 @@ func (s *Service) finishContext(parent context.Context, id string, attempt int, 
 		}); err != nil {
 			return err
 		}
-		return nil
+		if !autoRetry {
+			return nil
+		}
+		if _, err := tx.Exec(`UPDATE operations SET state = ?, state_revision = ?,
+		error_code = NULL, error_message = NULL, result = NULL, finished_at = NULL,
+		next_attempt_at = ?, updated_at = ?
+		WHERE id = ? AND state = ? AND attempt = ?`,
+			StateQueued, revision+2, finished, finished,
+			id, StateInterrupted, attempt); err != nil {
+			return err
+		}
+		return insertEvent(finalCtx, tx, id, revision+2, "retry_queued", map[string]any{
+			"attempt": attempt, "reason": "interrupted",
+		})
 	})
 }
 

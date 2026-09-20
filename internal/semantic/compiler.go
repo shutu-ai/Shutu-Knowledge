@@ -16,7 +16,7 @@ import (
 
 const (
 	BuiltinCompiler           = "shutu-builtin"
-	BuiltinCompilerVersion    = "0.5.0-ph6"
+	BuiltinCompilerVersion    = "0.6.0-range-history"
 	BuiltinModel              = "deterministic"
 	BuiltinModelVersion       = "v1"
 	BuiltinPromptVersion      = "none"

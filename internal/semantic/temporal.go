@@ -22,6 +22,7 @@ const (
 	TemporalEvolution       TemporalIntent = "EVOLUTION"
 	TemporalCompareVersions TemporalIntent = "COMPARE_VERSIONS"
 	TemporalValidity        TemporalIntent = "VALIDITY"
+	TemporalRangeHistory    TemporalIntent = "RANGE_HISTORY"
 )
 
 // TemporalQuery is the bounded result of lexical temporal parsing. Unknown
@@ -33,6 +34,7 @@ type TemporalQuery struct {
 	ToVersion   string         `json:"toVersion,omitempty"`
 	Confidence  float64        `json:"confidence"`
 	Signals     []string       `json:"signals,omitempty"`
+	Range       *TemporalRange `json:"range,omitempty"`
 }
 
 type versionIdentity struct {
@@ -302,6 +304,21 @@ func ParseTemporalQuery(query string) TemporalQuery {
 		out.Intent = TemporalCurrent
 		out.Confidence = 0.88
 		addSignal("current")
+	}
+	temporalRange, rangeOK := ParseTemporalRange(query)
+	if rangeOK && !(temporalRange.Ambiguous && len(out.Versions) > 0) {
+		rangeCopy := temporalRange
+		out.Range = &rangeCopy
+		relative := temporalRange.Kind == RangeVersion && ((temporalRange.Start != nil && temporalRange.End == nil) || (temporalRange.Start == nil && temporalRange.End != nil))
+		if temporalRange.Kind == RangeAmbiguous || temporalRange.Ambiguous || temporalRange.Kind == RangeEvent || relative {
+			out.Intent = TemporalRangeHistory
+			out.Confidence = temporalRange.Confidence
+			addSignal("range-history")
+		} else if out.Intent == TemporalNone {
+			out.Intent = TemporalRangeHistory
+			out.Confidence = temporalRange.Confidence
+			addSignal("explicit-range-history")
+		}
 	}
 	if out.Intent != TemporalNone {
 		return out

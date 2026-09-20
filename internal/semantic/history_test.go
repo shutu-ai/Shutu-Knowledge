@@ -242,7 +242,7 @@ func TestSelectHistoricalRepresentativesSamplesEarlierHalf(t *testing.T) {
 	if len(selected) != 8 {
 		t.Fatalf("selected=%d want bounded sample of older half", len(selected))
 	}
-	if selected[0].Version != "0.0" || selected[len(selected)-1].Version != "0.8" {
+	if selected[0].Version != "0.0" || selected[len(selected)-1].Version != "0.7" {
 		t.Fatalf("range endpoints=%+v", selected)
 	}
 	seen := map[string]bool{}

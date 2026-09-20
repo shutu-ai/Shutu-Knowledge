@@ -36,6 +36,7 @@ type TemporalRange struct {
 	Start       *RangeBoundary `json:"start,omitempty"`
 	End         *RangeBoundary `json:"end,omitempty"`
 	Ambiguous   bool           `json:"ambiguous,omitempty"`
+	Scope       string         `json:"scope,omitempty"`
 	Confidence  float64        `json:"confidence"`
 	Diagnostics []string       `json:"diagnostics,omitempty"`
 }
@@ -57,9 +58,20 @@ var (
 )
 
 func versionBoundary(value string, inclusive bool) (*RangeBoundary, bool) {
-	normalized, ok := NormalizeVersionIdentity(value)
-	if !ok {
+	match := semanticVersionPattern.FindStringSubmatch(strings.ToLower(strings.TrimSpace(value)))
+	if match == nil {
 		return nil, false
+	}
+	normalized := match[1]
+	if match[3] != "" {
+		return nil, false
+	}
+	if normalized == "" {
+		var ok bool
+		normalized, ok = NormalizeVersionIdentity(value)
+		if !ok {
+			return nil, false
+		}
 	}
 	if identity, parseOK := parseVersionIdentity(normalized); !parseOK || !identity.knownOrder {
 		return nil, false
@@ -153,8 +165,12 @@ func ParseTemporalRange(query string) (TemporalRange, bool) {
 			continue
 		}
 	}
+	if containsTemporalMarker(normalized, "recent") || containsTemporalMarker(normalized, "latest history") {
+		return TemporalRange{Kind: RangeAmbiguous, Ambiguous: true, Scope: "recent", Confidence: 0.76,
+			Diagnostics: []string{"recent-history"}}, true
+	}
 	if containsAnyHistoryAmbiguity(normalized) {
-		return TemporalRange{Kind: RangeAmbiguous, Ambiguous: true, Confidence: 0.70,
+		return TemporalRange{Kind: RangeAmbiguous, Ambiguous: true, Scope: "earlier", Confidence: 0.70,
 			Diagnostics: []string{"ambiguous-history"}}, true
 	}
 	return TemporalRange{}, false

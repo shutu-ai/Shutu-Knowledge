@@ -262,6 +262,9 @@ func (p *ContextPackage) renderAndSelect(evidence []ContextEvidence) {
 	if evidenceReserve < 48 {
 		evidenceReserve = 48
 	}
+	if p.TemporalIntent == string(TemporalRangeHistory) {
+		evidenceReserve = 32
+	}
 	if evidenceReserve > 256 {
 		evidenceReserve = 256
 	}

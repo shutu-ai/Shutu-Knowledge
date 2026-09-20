@@ -324,21 +324,38 @@ func SelectHistoricalRepresentatives(compilation Compilation, requested Temporal
 			}
 		}
 		groups = filtered
-	} else if containsTemporalMarker(normalizeSearchText(query), "earlier") ||
-		containsAnyHistoryAmbiguity(normalizeSearchText(query)) {
-		earlyCount := (len(groups) + 1) / 2
-		if earlyCount < 1 {
-			earlyCount = 1
+	} else if requested.Scope == "recent" {
+		if limit < len(groups) {
+			groups = groups[len(groups)-limit:]
 		}
-		if earlyCount < len(groups) {
-			groups = groups[:earlyCount]
+	} else if requested.Scope != "full" {
+		earlyCount := (len(groups) / 2 / limit) * limit
+		if earlyCount < limit {
+			earlyCount = limit
 		}
+		if earlyCount > len(groups) {
+			earlyCount = len(groups)
+		}
+		groups = groups[:earlyCount]
 	}
 	if len(groups) == 0 {
 		return nil
 	}
 	if limit > len(groups) {
 		limit = len(groups)
+	}
+
+	// Relative ranges prefer adjacency: “before X” needs the latest prior
+	// evidence, while “after X” needs the earliest following evidence. Bounded
+	// and full ranges continue sampling across the whole span.
+	relativeBefore := requested.Start == nil && requested.End != nil
+	relativeAfter := requested.Start != nil && requested.End == nil
+	if (relativeBefore || relativeAfter) && len(groups) > limit {
+		if relativeBefore {
+			groups = groups[len(groups)-limit:]
+			sort.Slice(groups, func(i, j int) bool { return groups[i].version > groups[j].version })
+			groups = groups[:limit]
+		}
 	}
 
 	selected := make([]Unit, 0, limit)
@@ -399,4 +416,10 @@ func historyUnitScore(unit Unit, queryTerms []string) float64 {
 		return -1
 	}
 	return score*10 + float64(4-unitRankForHistory(unit))
+}
+
+// ClipHistoryEvidenceText bounds one representative history source so multiple
+// phases fit inside the existing context budget.
+func ClipHistoryEvidenceText(value string, limit int) string {
+	return clipHistoryText(value, limit)
 }

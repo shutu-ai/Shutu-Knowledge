@@ -390,7 +390,9 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 		if err != nil {
 			return semantic.ContextPackage{}, err
 		}
-		evidenceItems = append(historyEvidence, evidenceItems...)
+		return semantic.CompileContext(compilation, historyEvidence, semantic.ContextCompileOptions{
+			Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
+		})
 	}
 	targetedEvidence, err := s.versionEvidence(ctx, compilation, query, targetVersions)
 	if err != nil {
@@ -439,6 +441,7 @@ func (s *Service) historyRangeEvidence(ctx context.Context, compilation semantic
 					}
 				}
 			}
+			text = semantic.ClipHistoryEvidenceText(text, 120)
 			if text == "" {
 				text = unit.Content
 			}
@@ -552,6 +555,7 @@ func (s *Service) versionEvidence(ctx context.Context, compilation semantic.Comp
 						}
 					}
 				}
+				text = semantic.ClipHistoryEvidenceText(text, 120)
 				if text == "" {
 					text = unit.Content
 				}

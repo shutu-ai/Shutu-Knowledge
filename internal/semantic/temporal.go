@@ -309,7 +309,8 @@ func ParseTemporalQuery(query string) TemporalQuery {
 	if rangeOK && !(temporalRange.Ambiguous && len(out.Versions) > 0) {
 		rangeCopy := temporalRange
 		out.Range = &rangeCopy
-		if temporalRange.Kind == RangeAmbiguous || temporalRange.Ambiguous || temporalRange.Kind == RangeEvent {
+		relative := temporalRange.Kind == RangeVersion && ((temporalRange.Start != nil && temporalRange.End == nil) || (temporalRange.Start == nil && temporalRange.End != nil))
+		if temporalRange.Kind == RangeAmbiguous || temporalRange.Ambiguous || temporalRange.Kind == RangeEvent || relative {
 			out.Intent = TemporalRangeHistory
 			out.Confidence = temporalRange.Confidence
 			addSignal("range-history")

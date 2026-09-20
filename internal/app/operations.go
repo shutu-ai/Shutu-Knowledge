@@ -115,11 +115,40 @@ type restoreBaseCommand struct {
 var testImportPublished func(op operations.Operation, document knowledge.Document)
 
 type documentOperationResult struct {
-	Documents []knowledge.Document `json:"documents,omitempty"`
-	Succeeded int                  `json:"succeeded"`
-	Failed    int                  `json:"failed"`
-	Skipped   int                  `json:"skipped"`
-	Partial   bool                 `json:"partial"`
+	Documents []knowledge.Document      `json:"documents,omitempty"`
+	Succeeded int                       `json:"succeeded"`
+	Failed    int                       `json:"failed"`
+	Skipped   int                       `json:"skipped"`
+	Partial   bool                      `json:"partial"`
+	Quality   *knowledge.QualitySummary `json:"quality,omitempty"`
+}
+
+// directoryQualitySummary aggregates extraction quality over the imported
+// directory children. Aggregation failures degrade to a missing summary
+// instead of failing the completed import operation.
+func (a *App) directoryQualitySummary(ctx context.Context, baseID, directoryID string) *knowledge.QualitySummary {
+	if directoryID == "" {
+		return nil
+	}
+	summary := &knowledge.QualitySummary{}
+	offset := 0
+	for {
+		page, err := a.Knowledge.ListDocumentChildrenContext(ctx, baseID, directoryID, 200, offset)
+		if err != nil {
+			return nil
+		}
+		for _, d := range page.Documents {
+			summary.Observe(d.QualityStatus)
+		}
+		if !page.HasMore {
+			break
+		}
+		offset += len(page.Documents)
+	}
+	if summary.Total == 0 {
+		return nil
+	}
+	return summary
 }
 
 func (a *App) withOperationItemCommit(ctx context.Context, operationID string, attempt int, itemKey string) context.Context {
@@ -801,7 +830,13 @@ func (a *App) newOperationService() (*operations.Service, error) {
 				return nil, markerErr
 			}
 		}
-		return documentResult(document), nil
+		result := documentResult(document)
+		// v0.6.2: the operation result carries the extraction quality summary
+		// so "9/9 completed" is never the only completion signal.
+		if summary := a.directoryQualitySummary(ctx, op.BaseID, document.ID); summary != nil {
+			result.Quality = summary
+		}
+		return result, nil
 	})
 	service.Register("rescan_directory", func(ctx context.Context, op operations.Operation, payload json.RawMessage, report func(operations.Progress)) (any, error) {
 		var command documentCommand

@@ -27,9 +27,15 @@ type Result struct {
 	IR            *documentir.Document
 	Parser        string
 	ParserVersion string
-	// NeedsOCR marks a technically readable but fragmented/corrupt text
-	// layer. Callers should try OCR while retaining Text as a last resort.
+	// NeedsOCR marks a genuinely unusable text layer after candidate
+	// selection. Callers should try OCR while retaining Text as a last
+	// resort; OCR may only replace Text when it measurably improves quality.
 	NeedsOCR bool
+	// PDFQuality carries native PDF extraction diagnostics. It is nil for
+	// non-PDF formats and feeds the persisted document quality model.
+	PDFQuality *PDFTextQuality
+	// Warnings lists non-fatal extraction findings (e.g. damaged glyphs).
+	Warnings []string
 }
 
 // Parser extracts text from one format family.

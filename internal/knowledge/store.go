@@ -185,11 +185,13 @@ func (s *store) deleteBase(id string) error {
 const documentColumns = `id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
 	source_path, content_hash, raw_file_path, raw_text, char_count, token_count, chunk_count,
 	embedding_model, embedding_ready, status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked,
+	quality_status, quality_score, quality_warnings, quality_partial, extraction_method, pages_total, pages_ocr,
 	lifecycle_state, mutation_epoch, source_version, active_index_generation, desired_index_generation, index_state`
 
 const documentMetadataColumns = `id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
 	source_path, content_hash, raw_file_path, char_count, token_count, chunk_count,
 	embedding_model, embedding_ready, status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked,
+	quality_status, quality_score, quality_warnings, quality_partial, extraction_method, pages_total, pages_ocr,
 	lifecycle_state, mutation_epoch, source_version, active_index_generation, desired_index_generation, index_state`
 
 func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
@@ -199,10 +201,14 @@ func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	var phase, errorCode, errorMessage sql.NullString
 	var desiredGeneration sql.NullInt64
 	var incomplete, embeddingReady, titleLocked int
+	var qualityStatus, qualityWarnings, extractionMethod sql.NullString
+	var qualityScore, pagesTotal, pagesOCR sql.NullFloat64
+	var qualityPartial sql.NullInt64
 	err := row.Scan(&d.ID, &d.BaseID, &d.Title, &d.SourceType, &fileName, &mimeType, &url, &parentDir,
 		&sourcePath, &contentHash, &rawFilePath, &rawText, &d.CharCount, &tokenCount, &d.ChunkCount,
 		&embeddingModel, &embeddingReady, &d.Status, &phase, &d.Progress, &incomplete, &errorCode, &errorMessage, &d.CreatedAt, &updatedAt,
-		&titleLocked, &d.LifecycleState, &d.MutationEpoch, &d.SourceVersion, &d.ActiveIndexGen,
+		&titleLocked, &qualityStatus, &qualityScore, &qualityWarnings, &qualityPartial, &extractionMethod, &pagesTotal, &pagesOCR,
+		&d.LifecycleState, &d.MutationEpoch, &d.SourceVersion, &d.ActiveIndexGen,
 		&desiredGeneration, &d.IndexState)
 	if err != nil {
 		return Document{}, err
@@ -226,6 +232,7 @@ func scanDocument(row interface{ Scan(...any) error }) (Document, error) {
 	d.ErrorMessage = errorMessage.String
 	d.DesiredIndexGen = desiredGeneration.Int64
 	d.HasDesiredIndexGen = desiredGeneration.Valid
+	scanQualityColumns(&d, qualityStatus, qualityWarnings, qualityPartial, extractionMethod, pagesTotal, pagesOCR, qualityScore)
 	return d, nil
 }
 
@@ -236,10 +243,14 @@ func scanDocumentMetadata(row interface{ Scan(...any) error }) (Document, error)
 	var phase, errorCode, errorMessage sql.NullString
 	var desiredGeneration sql.NullInt64
 	var incomplete, embeddingReady, titleLocked int
+	var qualityStatus, qualityWarnings, extractionMethod sql.NullString
+	var qualityScore, pagesTotal, pagesOCR sql.NullFloat64
+	var qualityPartial sql.NullInt64
 	err := row.Scan(&d.ID, &d.BaseID, &d.Title, &d.SourceType, &fileName, &mimeType, &url, &parentDir,
 		&sourcePath, &contentHash, &rawFilePath, &d.CharCount, &tokenCount, &d.ChunkCount,
 		&embeddingModel, &embeddingReady, &d.Status, &phase, &d.Progress, &incomplete, &errorCode, &errorMessage, &d.CreatedAt, &updatedAt,
-		&titleLocked, &d.LifecycleState, &d.MutationEpoch, &d.SourceVersion, &d.ActiveIndexGen,
+		&titleLocked, &qualityStatus, &qualityScore, &qualityWarnings, &qualityPartial, &extractionMethod, &pagesTotal, &pagesOCR,
+		&d.LifecycleState, &d.MutationEpoch, &d.SourceVersion, &d.ActiveIndexGen,
 		&desiredGeneration, &d.IndexState)
 	if err != nil {
 		return Document{}, err
@@ -262,7 +273,24 @@ func scanDocumentMetadata(row interface{ Scan(...any) error }) (Document, error)
 	d.ErrorMessage = errorMessage.String
 	d.DesiredIndexGen = desiredGeneration.Int64
 	d.HasDesiredIndexGen = desiredGeneration.Valid
+	scanQualityColumns(&d, qualityStatus, qualityWarnings, qualityPartial, extractionMethod, pagesTotal, pagesOCR, qualityScore)
 	return d, nil
+}
+
+// scanQualityColumns attaches the v0.6.2 quality columns to a document.
+func scanQualityColumns(d *Document, status, warnings sql.NullString, partial sql.NullInt64, method sql.NullString, pagesTotal, pagesOCR, score sql.NullFloat64) {
+	// Legacy rows migrated without quality metadata surface explicitly as
+	// UNKNOWN instead of being mistaken for GOOD.
+	d.QualityStatus = status.String
+	if d.QualityStatus == "" {
+		d.QualityStatus = QualityUnknown
+	}
+	d.QualityWarnings = parseQualityWarnings(warnings.String)
+	d.QualityPartial = partial.Int64 != 0
+	d.ExtractionMethod = method.String
+	d.PagesTotal = int(pagesTotal.Float64)
+	d.PagesOCR = int(pagesOCR.Float64)
+	d.QualityScore = score.Float64
 }
 
 func (s *store) putDocument(d Document) error {
@@ -399,9 +427,14 @@ func upsertDocument(ctx context.Context, runner documentExecer, d Document) erro
 		`INSERT INTO documents (id, base_id, title, source_type, file_name, mime_type, url, parent_directory_id,
 		   source_path, content_hash, raw_file_path, raw_text, char_count, token_count, chunk_count,
 		   embedding_model, embedding_ready, status, phase, progress, incomplete, error_code, error_message, created_at, updated_at, title_locked,
+		   quality_status, quality_score, quality_warnings, quality_partial, extraction_method, pages_total, pages_ocr,
 		   lifecycle_state, mutation_epoch, source_version, active_index_generation, desired_index_generation, index_state)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET title = excluded.title, file_name = excluded.file_name,
+		   quality_status = excluded.quality_status, quality_score = excluded.quality_score,
+		   quality_warnings = excluded.quality_warnings, quality_partial = excluded.quality_partial,
+		   extraction_method = excluded.extraction_method, pages_total = excluded.pages_total,
+		   pages_ocr = excluded.pages_ocr,
 		   mime_type = excluded.mime_type, url = excluded.url, parent_directory_id = excluded.parent_directory_id,
 		   source_path = excluded.source_path, content_hash = excluded.content_hash,
 		   raw_file_path = excluded.raw_file_path, raw_text = excluded.raw_text,
@@ -421,6 +454,7 @@ func upsertDocument(ctx context.Context, runner documentExecer, d Document) erro
 		d.ID, d.BaseID, d.Title, d.SourceType, d.FileName, d.MimeType, d.URL, d.ParentDirectoryID,
 		d.SourcePath, d.ContentHash, d.RawFilePath, rawText, d.CharCount, tokenCount, d.ChunkCount,
 		embeddingModel, embeddingReady, d.Status, phase, d.Progress, incomplete, errorCode, errorMessage, d.CreatedAt, updatedAt, titleLocked,
+		d.QualityStatus, d.QualityScore, formatQualityWarnings(d.QualityWarnings), qualityPartialInt(d.QualityPartial), d.ExtractionMethod, d.PagesTotal, d.PagesOCR,
 		d.LifecycleState, d.MutationEpoch, d.SourceVersion, d.ActiveIndexGen, desiredGeneration, d.IndexState,
 	)
 	if err != nil {

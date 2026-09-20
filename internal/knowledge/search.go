@@ -538,6 +538,10 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	for _, id := range globalOrder {
 		ordered = append(ordered, chunkIDs[id])
 	}
+	// Retrieval quality guard (v0.6.2): chunks from INCOMPLETE extractions
+	// never enter the final ranking, and LOW_QUALITY chunks are demoted
+	// below healthy evidence. Bad evidence is often worse than none.
+	ordered = s.applyRetrievalQualityGuard(ctx, snapshot, ordered)
 
 	result := SearchResult{Query: query, Mode: mode}
 	var rerankStage []Chunk
@@ -1084,6 +1088,54 @@ func (s *Service) resolveDocFilter(ctx context.Context, filter *SearchFilter) ([
 		}
 	}
 	return out, nil
+}
+
+// applyRetrievalQualityGuard reorders candidates so healthy extraction
+// evidence outranks known-poor extraction and drops INCOMPLETE candidates
+// entirely. Queries that only match low-quality documents legitimately
+// return fewer or zero hits instead of garbage.
+func (s *Service) applyRetrievalQualityGuard(ctx context.Context, q queryRunner, ordered []Chunk) []Chunk {
+	if len(ordered) == 0 {
+		return ordered
+	}
+	docIDs := make(map[string]bool, len(ordered))
+	for _, c := range ordered {
+		docIDs[c.DocID] = true
+	}
+	statuses := make(map[string]string, len(docIDs))
+	for id := range docIDs {
+		var status string
+		if err := q.QueryRowContext(ctx, `SELECT COALESCE(quality_status, '') FROM documents WHERE id = ?`, id).Scan(&status); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			// On query failure keep the original order: the guard must never
+			// break search availability.
+			return ordered
+		}
+		statuses[id] = status
+	}
+	if len(statuses) == 0 {
+		return ordered
+	}
+	healthy := make([]Chunk, 0, len(ordered))
+	demoted := make([]Chunk, 0)
+	guarded := false
+	for _, c := range ordered {
+		switch statuses[c.DocID] {
+		case QualityIncomplete:
+			guarded = true // dropped
+		case QualityLow:
+			demoted = append(demoted, c)
+			guarded = true
+		default:
+			healthy = append(healthy, c)
+		}
+	}
+	if !guarded {
+		return ordered
+	}
+	return append(healthy, demoted...)
 }
 
 func (s *Service) documentTitles(ctx context.Context, q queryRunner, chunks []Chunk) (map[string]string, error) {

@@ -142,8 +142,19 @@ type Document struct {
 	Incomplete     bool   `json:"incomplete,omitempty"`
 	ErrorCode      string `json:"errorCode,omitempty"`
 	ErrorMessage   string `json:"errorMessage,omitempty"`
-	CreatedAt      int64  `json:"createdAt"`
-	UpdatedAt      int64  `json:"updatedAt,omitempty"`
+	// Extraction quality visibility (v0.6.2). QualityStatus is '' for legacy
+	// rows and is surfaced as UNKNOWN by the API layer.
+	QualityStatus   string   `json:"qualityStatus,omitempty"`
+	QualityScore    float64  `json:"qualityScore,omitempty"`
+	QualityWarnings []string `json:"qualityWarnings,omitempty"`
+	QualityPartial  bool     `json:"qualityPartial,omitempty"`
+	// ExtractionMethod records the winning candidate: native, reassembled,
+	// fallback, ocr, or mixed.
+	ExtractionMethod string `json:"extractionMethod,omitempty"`
+	PagesTotal       int    `json:"pagesTotal,omitempty"`
+	PagesOCR         int    `json:"pagesOcr,omitempty"`
+	CreatedAt        int64  `json:"createdAt"`
+	UpdatedAt        int64  `json:"updatedAt,omitempty"`
 	// Version/fence state retained on every document. Generation zero is the
 	// compatibility identity assigned to all pre-migration rows.
 	LifecycleState     string `json:"-"`
@@ -202,25 +213,30 @@ type CitationV2 struct {
 
 // DocumentSummary is the list view of a document.
 type DocumentSummary struct {
-	ID             string `json:"id"`
-	BaseID         string `json:"baseId"`
-	Title          string `json:"title"`
-	SourceType     string `json:"sourceType"`
-	FileName       string `json:"fileName,omitempty"`
-	URL            string `json:"url,omitempty"`
-	ParentDirID    string `json:"parentDirectoryId,omitempty"`
-	SourcePath     string `json:"sourcePath,omitempty"`
-	CharCount      int    `json:"charCount"`
-	TokenCount     int    `json:"tokenCount,omitempty"`
-	ChunkCount     int    `json:"chunkCount"`
-	EmbeddingReady bool   `json:"embeddingReady"`
-	Status         string `json:"status"`
-	Phase          string `json:"phase,omitempty"`
-	Progress       int    `json:"progress"`
-	ErrorCode      string `json:"errorCode,omitempty"`
-	ErrorMessage   string `json:"errorMessage,omitempty"`
-	CreatedAt      int64  `json:"createdAt"`
-	UpdatedAt      int64  `json:"updatedAt,omitempty"`
+	ID               string `json:"id"`
+	BaseID           string `json:"baseId"`
+	Title            string `json:"title"`
+	SourceType       string `json:"sourceType"`
+	FileName         string `json:"fileName,omitempty"`
+	URL              string `json:"url,omitempty"`
+	ParentDirID      string `json:"parentDirectoryId,omitempty"`
+	SourcePath       string `json:"sourcePath,omitempty"`
+	CharCount        int    `json:"charCount"`
+	TokenCount       int    `json:"tokenCount,omitempty"`
+	ChunkCount       int    `json:"chunkCount"`
+	EmbeddingReady   bool   `json:"embeddingReady"`
+	Status           string `json:"status"`
+	Phase            string `json:"phase,omitempty"`
+	Progress         int    `json:"progress"`
+	ErrorCode        string `json:"errorCode,omitempty"`
+	ErrorMessage     string `json:"errorMessage,omitempty"`
+	QualityStatus    string `json:"qualityStatus,omitempty"`
+	QualityPartial   bool   `json:"qualityPartial,omitempty"`
+	ExtractionMethod string `json:"extractionMethod,omitempty"`
+	PagesTotal       int    `json:"pagesTotal,omitempty"`
+	PagesOCR         int    `json:"pagesOcr,omitempty"`
+	CreatedAt        int64  `json:"createdAt"`
+	UpdatedAt        int64  `json:"updatedAt,omitempty"`
 	// These fields participate in equivalent-operation keys but are never
 	// serialized in list responses.
 	SourceVersion  int64  `json:"-"`

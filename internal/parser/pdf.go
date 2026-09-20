@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -13,51 +14,102 @@ import (
 )
 
 // pdfParser extracts a PDF text layer with a pure-Go reader. Poorly shaped
-// glyph streams are first rebuilt from coordinates; if OCR remains advisable
-// the result is returned with NeedsOCR so the caller can try its configured
-// OCR runtime without discarding the native text.
+// glyph streams are first rebuilt from coordinates; extraction candidates are
+// compared with the shared PDFTextQuality evaluator and only a genuinely
+// unusable native layer escalates to OCR. A small damaged-glyph share no
+// longer discards an otherwise healthy extraction.
 type pdfParser struct{}
 
 func (pdfParser) Extensions() []string { return []string{"pdf"} }
 
 func (pdfParser) Parse(_ string, data []byte) (Result, error) {
+	return pdfParser{}.parse(data)
+}
+
+// ParseContext implements contextParser so the registry keeps a cancellation
+// boundary; the built-in reader performs no blocking external work.
+func (p pdfParser) ParseContext(ctx context.Context, _ string, data []byte) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	return p.parse(data)
+}
+
+// pdfLowDensityCharsPerPage marks the catastrophic-loss zone: a multi-page
+// text PDF whose extraction yields almost nothing per page needs escalation,
+// while single-page or image-heavy documents stay out of scope.
+const pdfLowDensityCharsPerPage = 40
+
+func (pdfParser) parse(data []byte) (Result, error) {
+	pages := countPDFPages(data)
+
+	// Candidate A: native plain text walk.
 	plain, plainErr := extractPDFPlainText(data)
-	if plainErr == nil && strings.TrimSpace(plain) == "" {
-		plainErr = fmt.Errorf("PDF contains no extractable text (it may be scanned)")
+	plainQuality := EvaluatePDFTextQuality(plain, pages)
+
+	// Candidate B: coordinate reassembled layout (per page).
+	pageTexts, layoutErr := reassemblePDFPages(data)
+	var reassembled string
+	reassembledQuality := PDFTextQuality{}
+	if layoutErr == nil {
+		reassembled = strings.Join(pageTexts, "\n\n")
+		reassembledQuality = EvaluatePDFTextQualityPerPage(pageTexts)
 	}
 
-	// A malformed/fragmented layer can still be coordinate-reassembled even
-	// when the simple plain-text walk returned no usable content.
-	if plainErr != nil {
-		reassembled, layoutErr := reassemblePDFLayout(data)
-		if layoutErr == nil && AverageLineLength(reassembled) >= 12 {
-			return pdfResult(reassembled, data), nil
-		}
+	// Candidate selection follows the priority chain: healthy native beats
+	// reassembly; a tiny U+FFFD share no longer vetoes a healthy candidate.
+	selected := ""
+	selectedQuality := PDFTextQuality{}
+	method := "native"
+	switch {
+	case plainQuality.Healthy():
+		selected, selectedQuality = plain, plainQuality
+	case layoutErr == nil && reassembledQuality.Healthy():
+		selected, selectedQuality, method = reassembled, reassembledQuality, "reassembled"
+	case layoutErr == nil && reassembledQuality.BetterThan(plainQuality):
+		// Neither candidate is healthy; still prefer the less fragmented
+		// evidence and let the caller decide on OCR escalation.
+		selected, selectedQuality, method = reassembled, reassembledQuality, "reassembled"
+	case plain != "":
+		selected, selectedQuality = plain, plainQuality
+	case plainErr != nil:
 		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
+	default:
+		return Result{}, fmt.Errorf("PDF contains no healthy extractable text")
 	}
 
-	// U+FFFD is produced by the PDF library when a font's ToUnicode map is
-	// missing or broken. It is valid UTF-8, so a byte-validity check alone
-	// cannot detect it. Keep the native text as a fallback, but mark it
-	// unhealthy so the ingestion chain can try OCR/reconstruction.
-	if AverageLineLength(plain) >= 5 && !hasReplacementRune(plain) {
-		return pdfResult(plain, data), nil
+	// Isolated U+FFFD characters are noise, not content: strip them so a
+	// small damaged glyph share cannot enter chunks and the FTS index.
+	selected = stripReplacementRunes(selected)
+
+	result := pdfResult(selected, data)
+	if method == "reassembled" {
+		// Keep the parser label honest: the text came from the same native
+		// reader but required coordinate reconstruction.
+		result.ParserVersion = "builtin-reassemble-v1"
 	}
-	reassembled, layoutErr := reassemblePDFLayout(data)
-	if layoutErr == nil && strings.TrimSpace(reassembled) != "" &&
-		AverageLineLength(reassembled) >= 12 && !hasReplacementRune(reassembled) {
-		return pdfResult(reassembled, data), nil
+	quality := selectedQuality
+	if quality.ReplacementRuneCount > 0 {
+		quality.addWarning("PDF_REPLACEMENT_GLYPHS")
 	}
-	// Preserve the native text for the caller's OCR/fallback chain.
-	if strings.TrimSpace(plain) != "" {
-		result := pdfResult(plain, data)
+	if !quality.Healthy() {
 		result.NeedsOCR = true
-		return result, nil
 	}
-	if plainErr != nil {
-		return Result{}, fmt.Errorf("PDF parsing failed: %w", plainErr)
+	if pages > 3 && quality.Chars > 0 && quality.CharsPerPage < pdfLowDensityCharsPerPage && quality.EmptyPageRatio > 0.9 {
+		quality.addWarning("PDF_LOW_TEXT_DENSITY")
+		result.NeedsOCR = true
 	}
-	return Result{}, fmt.Errorf("PDF contains no healthy extractable text")
+	result.PDFQuality = &quality
+	result.Warnings = quality.Warnings()
+	return result, nil
+}
+
+func countPDFPages(data []byte) int {
+	reader, err := pdftext.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return 0
+	}
+	return reader.NumPage()
 }
 
 func pdfResult(text string, data []byte) Result {
@@ -99,7 +151,7 @@ func pdfIR(text string, data []byte) *documentir.Document {
 				}
 				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID, Type: documentir.TypeFigure, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: metadata, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
 				captionMetadata := map[string]string{"figure_id": logical, "role": "caption"}
-				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID + "/caption", Type: documentir.TypeCaption, ParentID: figureID, Order: 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: captionMetadata, SourceAnchor: documentir.SourceAnchor{Kind: "pdf", Page: pageNumber, Block: blockIndex + 1, LogicalPath: logical + "/caption", BBox: block.bbox}, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
+				d.Nodes = append(d.Nodes, documentir.Node{ID: figureID + "/caption", Type: documentir.TypeCaption, ParentID: figureID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, Metadata: captionMetadata, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
 				continue
 			}
 			if cells := splitPDFTableRow(block.text); len(cells) >= 2 {
@@ -119,10 +171,6 @@ func pdfIR(text string, data []byte) *documentir.Document {
 			}
 			d.Nodes = append(d.Nodes, documentir.Node{ID: "tmp:" + logical, Type: typ, ParentID: pageID, Order: blockIndex + 1, Text: block.text, PageNumber: pageNumber, BBox: block.bbox, SourceAnchor: blockAnchor, Parser: "pdf", ParserVersion: "builtin-v1", Confidence: block.confidence})
 		}
-	}
-	if len(d.Nodes) == 1 && strings.TrimSpace(text) != "" {
-		fallback := documentir.FromText("", text, "pdf", "builtin-v1")
-		return fallback
 	}
 	return d
 }
@@ -375,15 +423,24 @@ func AverageLineLength(text string) float64 {
 	return float64(total) / float64(count)
 }
 
-// reassemblePDFLayout rebuilds visual lines from text-item coordinates.
-// The upstream algorithm clusters by y bands derived from the median glyph
-// height, then sorts items in each band by x and joins pages with a blank
-// line. Keeping the same behavior makes the output deterministic across
-// different local OCR/runtime availability.
+// reassemblePDFLayout rebuilds visual lines from text-item coordinates and
+// returns page-joined text (pages separated by a blank line).
 func reassemblePDFLayout(data []byte) (string, error) {
+	pageTexts, err := reassemblePDFPages(data)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(pageTexts, "\n\n"), nil
+}
+
+// reassemblePDFPages rebuilds visual lines per page from text-item
+// coordinates. The upstream algorithm clusters by y bands derived from the
+// median glyph height, then sorts items in each band by x. Per-page output
+// lets the quality evaluator compute real page coverage.
+func reassemblePDFPages(data []byte) ([]string, error) {
 	reader, err := pdftext.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return "", fmt.Errorf("open PDF: %w", err)
+		return nil, fmt.Errorf("open PDF: %w", err)
 	}
 	pageTexts := make([]string, 0, reader.NumPage())
 	for pageNumber := 1; pageNumber <= reader.NumPage(); pageNumber++ {
@@ -402,6 +459,7 @@ func reassemblePDFLayout(data []byte) (string, error) {
 			heights = append(heights, height)
 		}
 		if len(usable) == 0 {
+			pageTexts = append(pageTexts, "")
 			continue
 		}
 		sort.Float64s(heights)
@@ -433,9 +491,7 @@ func reassemblePDFLayout(data []byte) (string, error) {
 				lines = append(lines, strings.Join(line, ""))
 			}
 		}
-		if len(lines) > 0 {
-			pageTexts = append(pageTexts, strings.Join(lines, "\n"))
-		}
+		pageTexts = append(pageTexts, strings.Join(lines, "\n"))
 	}
-	return strings.Join(pageTexts, "\n\n"), nil
+	return pageTexts, nil
 }

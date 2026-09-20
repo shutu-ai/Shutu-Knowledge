@@ -344,6 +344,9 @@ func summarize(d Document) DocumentSummary {
 		CharCount:  d.CharCount, TokenCount: d.TokenCount, ChunkCount: d.ChunkCount,
 		Status: d.Status, Phase: d.Phase, Progress: d.Progress,
 		ErrorCode: d.ErrorCode, ErrorMessage: d.ErrorMessage,
+		QualityStatus: d.QualityStatus, QualityPartial: d.QualityPartial,
+		ExtractionMethod: d.ExtractionMethod,
+		PagesTotal:       d.PagesTotal, PagesOCR: d.PagesOCR,
 		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
 		SourceVersion: d.SourceVersion, MutationEpoch: d.MutationEpoch,
 		ActiveIndexGen: d.ActiveIndexGen,
@@ -1606,7 +1609,8 @@ func (s *Service) ingest(ctx context.Context, doc *Document, cfg BaseConfig, fil
 	doc.Status = StatusReady
 	doc.Phase = ""
 	doc.Progress = 100
-	doc.Incomplete = false
+	// doc.Incomplete stays quality-driven: an INCOMPLETE extraction must not
+	// be silently reset to complete on the ready path (v0.6.2).
 	doc.UpdatedAt = now()
 	doc.SourceVersion++
 	if err := s.store.activateDocumentGeneration(ctx, doc.ID, expectedEpoch, generation, *doc); err != nil {
@@ -1664,8 +1668,16 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	if parsed.IR != nil {
 		doc.IR = parsed.IR
 	}
+	// Native extraction diagnostics feed the persisted quality model.
+	var nativeHealthy bool
+	if parsed.PDFQuality != nil {
+		nativeHealthy = parsed.PDFQuality.Healthy()
+		doc.PagesTotal = parsed.PDFQuality.Pages
+	}
+	doc.ExtractionMethod = extractionMethodOf(parsed)
+	doc.QualityWarnings = append(doc.QualityWarnings, parsed.Warnings...)
 	// The parser may still provide fragmented native text while requesting a
-	// healthier OCR pass (upstream's text-layer health behavior).
+	// healthier OCR pass. OCR is a fallback, never destructive replacement.
 	nativeOK := nativeAvailable && !parsed.NeedsOCR
 
 	mode := s.resolveOCRMode(cfg)
@@ -1677,12 +1689,18 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	}()
 	ocrUsable := (isPDF || isImage) && s.ocr != nil && s.ocr.Available()
 	contentUsable := isPDF && s.content != nil && s.content.Available()
+	ocrPages := 0
+	ocrPartial := false
 	runOCR := func() (string, bool) {
 		if !ocrUsable {
 			return "", false
 		}
 		if isPDF {
-			if renderedText, ok := s.runRenderedPageOCR(ctx, data); ok {
+			if renderedText, pages, ok := s.runRenderedPageOCR(ctx, data); ok {
+				ocrPages = pages
+				if parsed.PDFQuality != nil && parsed.PDFQuality.Pages > pages {
+					ocrPartial = true
+				}
 				return renderedText, true
 			}
 		} else if text, ok := s.runOCRImage(ctx, data); ok {
@@ -1723,10 +1741,12 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 	if mode == "forced" {
 		if text, ok := runOCR(); ok {
 			doc.IR = documentir.FromText(parsed.Title, text, "ocr", "builtin-v1")
+			s.recordExtractionQuality(doc, text, "ocr", nativeHealthy, ocrPages, ocrPartial)
 			return text, parsed.Title, nil
 		}
 		if text, ok := runContentConverter(); ok {
 			doc.IR = documentir.FromText(parsed.Title, text, "content-converter", "builtin-v1")
+			s.recordExtractionQuality(doc, text, "fallback", nativeHealthy, 0, false)
 			return text, parsed.Title, nil
 		}
 		if nativeAvailable {
@@ -1736,30 +1756,37 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 		return "", "", fmt.Errorf("forced OCR failed")
 	}
 	if nativeOK {
+		s.recordExtractionQuality(doc, parsed.Text, doc.ExtractionMethod, nativeHealthy, 0, false)
 		return parsed.Text, parsed.Title, nil
 	}
 	if !nativeAvailable {
 		// Upstream asks the content-signature reader first when the primary
 		// PDF parser produced no text at all; OCR is its next fallback.
 		if text, ok := runContentConverter(); ok {
+			s.recordExtractionQuality(doc, text, "fallback", true, 0, false)
 			return text, parsed.Title, nil
 		}
 		if text, ok := runOCR(); ok {
+			s.recordExtractionQuality(doc, text, "ocr", true, ocrPages, ocrPartial)
 			return text, parsed.Title, nil
 		}
 	} else {
-		// A fragmented layer is still native evidence, so try OCR before
-		// replacing it with a converter's reconstruction.
-		if text, ok := runOCR(); ok {
+		// A fragmented layer is still native evidence. OCR may replace it
+		// only when it measurably improves coverage and quality (v0.6.2
+		// OCR replacement safety rule); otherwise the native text stays.
+		if text, ok := runOCR(); ok && ocrCandidateWins(parsed.Text, nativeHealthy, text, doc.PagesTotal) {
 			doc.IR = documentir.FromText(parsed.Title, text, "ocr", "builtin-v1")
+			s.recordExtractionQuality(doc, text, "ocr", true, ocrPages, ocrPartial)
 			return text, parsed.Title, nil
 		}
-		if text, ok := runContentConverter(); ok {
+		if text, ok := runContentConverter(); ok && ocrCandidateWins(parsed.Text, nativeHealthy, text, doc.PagesTotal) {
 			doc.IR = documentir.FromText(parsed.Title, text, "content-converter", "builtin-v1")
+			s.recordExtractionQuality(doc, text, "fallback", true, 0, false)
 			return text, parsed.Title, nil
 		}
 	}
 	if nativeAvailable {
+		s.recordExtractionQuality(doc, parsed.Text, doc.ExtractionMethod, nativeHealthy, 0, false)
 		return parsed.Text, parsed.Title, nil
 	}
 	if parseErr != nil {
@@ -1817,23 +1844,23 @@ func (s *Service) runEmbeddedRasterOCR(ctx context.Context, data []byte) (string
 // complete PDF pages first. Renderer, validation, and per-page OCR failures
 // are isolated so ingestion can continue through the older PDF-envelope and
 // embedded-raster fallbacks.
-func (s *Service) runRenderedPageOCR(ctx context.Context, data []byte) (string, bool) {
+func (s *Service) runRenderedPageOCR(ctx context.Context, data []byte) (string, int, bool) {
 	if !s.ocrRendererAvailable() {
-		return "", false
+		return "", 0, false
 	}
 	output, err := s.ocrRenderer.DecodeLimit(ctx, "pdf", data, parser.MaxOCRRenderOutputBytes)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	pages, err := parser.ParseRenderedPDFPages(output)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	pageTexts := make(map[int]string, len(pages))
 	orderedPages := make([]int, 0, len(pages))
 	for _, page := range pages {
 		if err := ctx.Err(); err != nil {
-			return "", false
+			return "", 0, false
 		}
 		text, ok := s.runOCRImage(ctx, page.PNG)
 		if !ok {
@@ -1844,13 +1871,13 @@ func (s *Service) runRenderedPageOCR(ctx context.Context, data []byte) (string, 
 		orderedPages = append(orderedPages, page.Page)
 	}
 	if len(orderedPages) == 0 {
-		return "", false
+		return "", 0, false
 	}
 	pageParts := make([]string, 0, len(orderedPages))
 	for _, page := range orderedPages {
 		pageParts = append(pageParts, pageTexts[page])
 	}
-	return strings.Join(pageParts, "\n\n"), true
+	return strings.Join(pageParts, "\n\n"), len(pages), true
 }
 
 // appendImageCaptions enriches searchable text with best-effort vision model
@@ -1915,7 +1942,7 @@ func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, o
 		embedder = providers[0]
 	}
 	if !opts.Semantic || embedder == nil || embedder.ModelKey() == "none" {
-		return s.structureAwarePieces(text, doc.IR, opts), nil
+		return hygienizeChunks(s.structureAwarePieces(text, doc.IR, opts)), nil
 	}
 	segments := chunk.SemanticSegments(text, opts.Separator)
 	if len(segments) == 0 {
@@ -1942,7 +1969,13 @@ func (s *Service) buildPieces(ctx context.Context, text string, doc *Document, o
 			inline[i] = segment.Vector
 		}
 	}
-	return pieces, inline
+	hygiened := hygienizeChunks(pieces)
+	if len(hygiened) != len(pieces) {
+		// Inline vectors map to pre-hygiene indexes; dropping them keeps the
+		// semantic path honest instead of misaligned.
+		inline = nil
+	}
+	return hygiened, inline
 }
 
 func (s *Service) structuralPieces(text string, opts ChunkOptions) []chunk.Piece {

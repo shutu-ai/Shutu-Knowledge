@@ -72,6 +72,13 @@ best-effort: unsupported rasters or provider failures never prevent import.
 
 ## Lifecycle
 
+### Retrieval modes and `embedding.provider: none`
+
+With the default `embedding.provider: none` configuration, ingestion is
+lexical only: retrieval runs through BM25/full-text ranking and semantic
+(vector) retrieval is unavailable. Configure an embedding model to enable
+semantic and hybrid retrieval. This is independent of extraction quality.
+
 Documents move through `pending`, `processing` (with parsing/embedding
 phases), and `ready` or `failed`. Model drift can mark chunks stale, and
 interrupted work is marked incomplete. On startup Knowledge resumes recoverable

@@ -683,6 +683,7 @@ async function renderDocuments(generation = routeGeneration, baseId = state.sele
 
   const statusText = (doc) => h("div", {}, [
     chip(doc.status),
+    doc.qualityStatus && doc.sourceType !== "directory" ? chip(doc.qualityStatus) : null,
     doc.sourceType !== "directory" ? chip(doc.embeddingReady
       ? "Embedding ready"
       : (doc.status === "processing" && doc.phase === "embedding" ? "Embedding pending" : "Lexical only")) : null,

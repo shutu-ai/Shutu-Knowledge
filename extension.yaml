@@ -1,6 +1,6 @@
 id: shutu-knowledge
 name: Shutu Knowledge
-version: 0.6.1
+version: 0.6.2
 extension_api: "1.0"
 description: Knowledge bases, documents, hybrid retrieval, and model tools for shutu-agent
 capabilities:

@@ -253,3 +253,12 @@ func TestSelectHistoricalRepresentativesSamplesEarlierHalf(t *testing.T) {
 		seen[unit.Version] = true
 	}
 }
+func TestGlobalHistoryPreservesGlobalRouting(t *testing.T) {
+	plan := RouteQuery("Summarize the current Open5GS corpus, release history, and main capabilities.")
+	if plan.Intent != IntentGlobal {
+		t.Fatalf("intent=%s want global", plan.Intent)
+	}
+	if plan.Temporal.Intent != TemporalHistorical || plan.Temporal.Range != nil {
+		t.Fatalf("temporal=%+v", plan.Temporal)
+	}
+}

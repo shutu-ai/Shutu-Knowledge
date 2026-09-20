@@ -113,6 +113,31 @@ func RouteQuery(query string) QueryPlan {
 		confidence = 1
 	}
 	temporal := ParseTemporalQuery(query)
+	// Broad analytical intents outrank ambiguous range/history. A global
+	// summary that merely mentions “release history” must keep its ordinary
+	// global evidence path instead of collapsing to release-only history.
+	preserveHistory := false
+	if temporal.Intent == TemporalRangeHistory &&
+		(signals[string(IntentGlobal)] > signals[string(IntentFact)] ||
+			signals[string(IntentCrossDocument)] > signals[string(IntentFact)] ||
+			signals[string(IntentComparison)] > signals[string(IntentFact)] ||
+			signals[string(IntentMultiHop)] > signals[string(IntentFact)]) {
+		preserveHistory = true
+		temporal.Intent = TemporalHistorical
+		temporal.Range = nil
+		if signals[string(IntentGlobal)] > 0 {
+			intent, best = IntentGlobal, signals[string(IntentGlobal)]
+		}
+		if signals[string(IntentMultiHop)] > best {
+			intent, best = IntentMultiHop, signals[string(IntentMultiHop)]
+		}
+		if signals[string(IntentComparison)] > best {
+			intent, best = IntentComparison, signals[string(IntentComparison)]
+		}
+		if signals[string(IntentCrossDocument)] > best {
+			intent, best = IntentCrossDocument, signals[string(IntentCrossDocument)]
+		}
+	}
 	// An explicit version is scope metadata, not automatic proof that the
 	// question stops being comparison/global/multi-hop/cross-document.
 	preserveIntent := temporal.Intent == TemporalExplicitVersion &&
@@ -120,15 +145,19 @@ func RouteQuery(query string) QueryPlan {
 			signals[string(IntentCrossDocument)] > signals[string(IntentFact)] ||
 			signals[string(IntentGlobal)] > signals[string(IntentFact)] ||
 			signals[string(IntentMultiHop)] > signals[string(IntentFact)])
-	if temporal.Intent != TemporalNone && !preserveIntent {
+	if temporal.Intent != TemporalNone && !preserveIntent && !preserveHistory {
 		signals[string(IntentTemporal)] += 4
 		if signals[string(IntentTemporal)] > best {
 			intent = IntentTemporal
 			best = signals[string(IntentTemporal)]
 		}
 		confidence = float64(best) / float64(total+4)
-		if confidence < 0.35 { confidence = 0.35 }
-		if confidence > 1 { confidence = 1 }
+		if confidence < 0.35 {
+			confidence = 0.35
+		}
+		if confidence > 1 {
+			confidence = 1
+		}
 	}
 	diagnostics := make([]string, 0, 3)
 	if temporal.Intent == TemporalCurrent {

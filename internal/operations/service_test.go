@@ -827,6 +827,62 @@ func TestRestartReplaysInterruptedCommand(t *testing.T) {
 	}
 }
 
+func TestStopRequeuesInterruptedRetryableCommand(t *testing.T) {
+	db, err := storage.Open(filepath.Join(t.TempDir(), "operations.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	first, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Register("block", func(ctx context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	op, err := first.Submit(context.Background(), Request{
+		Type: "block", CommandSchemaVersion: CommandSchemaV1,
+		Payload: json.RawMessage(`{"value":"interrupted"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, first, op.ID, StateRunning)
+	first.Stop()
+
+	current, err := first.Get(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != StateQueued {
+		t.Fatalf("state after stop = %s, want %s: %s %s", current.State, StateQueued, current.ErrorCode, current.ErrorMessage)
+	}
+	if current.Attempt != 1 || !current.Retryable {
+		t.Fatalf("attempt=%d retryable=%t, want attempt 1 retryable", current.Attempt, current.Retryable)
+	}
+
+	second, err := New(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Register("block", func(_ context.Context, _ Operation, _ json.RawMessage, _ func(Progress)) (any, error) {
+		return map[string]any{"replayed": true}, nil
+	})
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.Stop)
+
+	replayed := waitForState(t, second, op.ID, StateSucceeded)
+	if replayed.Attempt != 2 {
+		t.Fatalf("replayed attempt = %d, want 2", replayed.Attempt)
+	}
+}
+
 func TestRetryHonorsAttemptLimitAndRecordsEvents(t *testing.T) {
 	db, err := storage.Open(filepath.Join(t.TempDir(), "operations.db"))
 	if err != nil {

@@ -78,8 +78,22 @@ No garbage chunks dominate Top-K; OCR does not participate for this corpus.
 
 ## Artifact
 
-- `shutu-knowledge-0.6.2-windows-amd64.zip` - size and SHA-256 recorded at
-  publication; source SHA documented in the closure commit.
+- Package: `shutu-knowledge-0.6.2-windows-amd64.zip`
+- Size: 12,682,414 bytes
+- SHA-256: `58f391805c75c0708c8dc104ab0ac059f10a693a23233f10dc54aabd493d339c`
+- Release source SHA: `1ae78de38593a0d7db58a7c2b6846fdd2a607544`
+
+## Formal package smoke (unzipped package, isolated home)
+
+- Startup + runtime status: PASS (`doctor` ready, schema 21)
+- Fragmented per-glyph text fixture: ready / WARNING (reassembled, tiny
+  fixture flagged LOW_TEXT_DENSITY) / retrievable - the reassembled text is
+  searchable and the per-glyph fragmentation is resolved
+- True scanned fixture without OCR runtime installed: explicitly
+  `parse_failed` (visible failure, never silent ready)
+- Import quality metadata visible via API: qualityStatus / extractionMethod
+- Restart: quality metadata persists
+- Offline restart (`offline=1`): PASS
 
 ## Remaining limitations
 

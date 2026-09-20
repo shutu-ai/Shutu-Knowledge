@@ -76,12 +76,32 @@ in v0.6.1) did not regress.
 
 No garbage chunks dominate Top-K; OCR does not participate for this corpus.
 
+## Release provenance
+
+- Release source SHA: `1ae78de38593a0d7db58a7c2b6846fdd2a607544`
+- Tag: `v0.6.2` (annotated), tag object `24ab3c9e2efd4710b9547be57024384cb95f496e`,
+  tag target `1ae78de38593a0d7db58a7c2b6846fdd2a607544`
+- Push/tag CI (run `35522967668`, refs/tags/v0.6.2): **success** - build,
+  release-package, runtime-release, release-host windows/macos/ubuntu
+- Master CI on the release commit and on the closure commit: success
+
 ## Artifact
 
-- Package: `shutu-knowledge-0.6.2-windows-amd64.zip`
-- Size: 12,682,414 bytes
-- SHA-256: `58f391805c75c0708c8dc104ab0ac059f10a693a23233f10dc54aabd493d339c`
-- Release source SHA: `1ae78de38593a0d7db58a7c2b6846fdd2a607544`
+Published on the GitHub Release `Shutu Knowledge v0.6.2`:
+
+- Package: `shutu-knowledge-0.6.2-windows-amd64.zip` (built by the release CI
+  from the tagged source; `BUILD-METADATA.json` records `git_sha =
+  1ae78de38593a0d7db58a7c2b6846fdd2a607544`, version 0.6.2, storage
+  format 2 / reader 8 / writer 8)
+- Size: 12,626,237 bytes
+- SHA-256: `8a8eedb66535ff4eab146d88f46555184b32a30dd2c85639b9f50c73e9193875`
+- Post-download verification: re-downloaded the published asset and
+  recomputed SHA-256 - exact match
+- Internal `checksums.sha256`: all entries verified OK
+
+A pre-CI local package from the same source and packaging script
+(12,682,414 bytes, SHA-256 `58f391805c75c0708c8dc104ab0ac059f10a693a23233f10dc54aabd493d339c`)
+was used for the formal package smoke below before publication.
 
 ## Formal package smoke (unzipped package, isolated home)
 

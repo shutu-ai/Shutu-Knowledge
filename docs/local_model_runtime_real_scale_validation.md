@@ -90,6 +90,24 @@ Mix: 50 exact lookup, 30 semantic reverse, 30 cross-workbook, 20 analysis, 20 jo
 
 The evaluator recorded candidate join evidence for only **3 / 20** join queries in every mode. It found no unsupported join claims because the QA harness did not generate join assertions.
 
+## Repeated-run and background contention evidence
+
+Three consecutive representative hybrid+reranker runs (20 mixed exact, semantic, cross-workbook, analysis, and join queries per run) all passed. Every eligible search applied the reranker. Run 1 includes cold helper startup; steady-state run 2/run 3 working sets were effectively flat.
+
+| Run | Success / rerank applied | p50 | p95 | Max | Max aggregate RSS | Max CPU |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 20 / 20 | 10.57 s | 13.28 s | 17.59 s | 31.4 MB | 35.4% |
+| 2 | 20 / 20 | 10.57 s | 12.48 s | 12.72 s | 2,241.6 MB | 302.2% |
+| 3 | 20 / 20 | 10.68 s | 12.64 s | 12.89 s | 2,245.6 MB | 299.4% |
+
+The aggregate RSS transition from run 1 to run 2 reflects helper model loading, not monotonic growth: run 2 to run 3 increased only 4.0 MB. CPU remained below ~3 of 4 logical threads.
+
+A separate contention test started a full largest-document reindex and issued 20 interactive searches while it was active: 10 vector-only and 10 hybrid+reranker. All 20 searches succeeded; reranking applied in 20/20. Vector p50/p95 was 8.89 s / 11.51 s; hybrid+reranker p50/p95 was 11.27 s / 12.90 s. The background reindex was then canceled. The prior active generation remained authoritative and searchable, and the corpus remained at 154,475 / 154,475 embedded vectors; startup recovery performs the explicit interrupted-status transition.
+
+### Synthetic runtime smoke
+
+`TestSyntheticRuntimeLoadCancelAndRetry` runs a multi-batch, mixed-token-length document through cancellation and retry. It verifies that cancel keeps the old generation fully active and that retry atomically publishes a newer full generation.
+
 ## What passed
 
 - All 154,475 active chunks have the active model-space vector.
@@ -97,6 +115,7 @@ The evaluator recorded candidate join evidence for only **3 / 20** join queries 
 - 100/100 BM25, vector, hybrid, and hybrid+reranker latency runs returned without HTTP errors or deadline failures.
 - 100/100 eligible hybrid searches applied the local reranker.
 - The 150-question QA completed without search errors.
+- A committed synthetic multi-batch load test passes cancellation and retry with mixed token lengths.
 - Cancellation kept the old active index usable and restart resumed recovery.
 
 ## What remains weak

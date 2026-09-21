@@ -178,6 +178,11 @@ type Options struct {
 	ModelLoadTimeout time.Duration
 	// IdleTimeout stops an unused process; zero keeps it until Close.
 	IdleTimeout time.Duration
+	// MaxRequestsPerProcess retires a long-lived helper after successful
+	// inference requests. Zero keeps the process until idle timeout or Close.
+	// Native ML runtimes can retain allocator arenas across requests, so
+	// managed processes use a bounded request generation to cap RSS growth.
+	MaxRequestsPerProcess int
 	// Now is injectable for tests.
 	Now func() time.Time
 	// EmbeddingCommand overrides Command for embeddings.
@@ -196,6 +201,8 @@ type helperProcess struct {
 	scanner       *bufio.Scanner
 	wait          chan struct{}
 	lastUsed      time.Time
+	requests      int
+	maxRequests   int
 	stderr        captureBuffer
 	lastError     string
 	stop          func()
@@ -264,6 +271,7 @@ type Manager struct {
 	requestTimeout   time.Duration
 	modelLoadTimeout time.Duration
 	idleTimeout      time.Duration
+	maxRequests      int
 	now              func() time.Time
 	stop             chan struct{}
 	stopOnce         sync.Once
@@ -302,6 +310,7 @@ func NewManager(options Options) *Manager {
 		requestTimeout:   options.RequestTimeout,
 		modelLoadTimeout: options.ModelLoadTimeout,
 		idleTimeout:      options.IdleTimeout,
+		maxRequests:      options.MaxRequestsPerProcess,
 		now:              now,
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
@@ -850,6 +859,13 @@ func (p *helperProcess) callLocked(parent context.Context, method, capability st
 		}
 	}
 	p.lastUsed = time.Now()
+	if p.maxRequests > 0 {
+		p.requests++
+		if p.requests >= p.maxRequests {
+			p.requests = 0
+			p.closeLocked()
+		}
+	}
 	return nil
 }
 

@@ -573,6 +573,15 @@ func (a *App) newRuntimeManager() *runtime.Manager {
 			return configured
 		}(),
 		IdleTimeout: duration(a.Config.Runtime.IdleTimeoutMS, 300000),
+		// Managed ONNX runtimes can retain native allocator arenas across
+		// requests. A bounded process generation keeps long import jobs from
+		// growing without bound while still amortizing model loads.
+		MaxRequestsPerProcess: func() int {
+			if a.ManagedRuntime {
+				return 64
+			}
+			return 0
+		}(),
 	})
 }
 

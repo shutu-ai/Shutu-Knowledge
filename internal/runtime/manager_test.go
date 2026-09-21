@@ -63,6 +63,24 @@ func TestManagerEmbedsReranksExtractsAndProbes(t *testing.T) {
 	}
 }
 
+func TestManagerRetiresHelperAfterRequestLimit(t *testing.T) {
+	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
+	manager := NewManager(Options{
+		Command: helperCommand(t), StartupTimeout: 2 * time.Second,
+		RequestTimeout: 2 * time.Second, MaxRequestsPerProcess: 1,
+	})
+	defer manager.Close()
+
+	var embeddingResult struct {
+		Vectors [][]float64 `json:"vectors"`
+	}
+	for i := 0; i < 3; i++ {
+		if err := manager.Call(context.Background(), CapabilityEmbedding, map[string]any{}, &embeddingResult); err != nil {
+			t.Fatalf("call %d after request retirement failed: %v", i+1, err)
+		}
+	}
+}
+
 func TestManagerRebuildsCrashedHelper(t *testing.T) {
 	t.Setenv("SHUTU_RUNTIME_HELPER", "1")
 	manager := NewManager(Options{Command: helperCommand(t), StartupTimeout: 2 * time.Second, RequestTimeout: 2 * time.Second})

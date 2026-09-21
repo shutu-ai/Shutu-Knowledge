@@ -342,7 +342,10 @@ async function health(capability) {
   try {
     if (capability === "embedding") {
       const { model, extractor } = await embeddingModel(item.model);
-      await extractor(["runtime health smoke"], { pooling: "last_token", normalize: true });
+      await extractor(["runtime health smoke"], {
+        pooling: "last_token", normalize: true,
+        truncation: true, max_length: 512,
+      });
       setComponent("embedding", { lifecycle: "READY", ready: true, model: model.id, revision: model.revision, lastError: undefined });
       await saveState();
       return { ready: true, capability, status: "ready", lifecycle: "READY", path: runtimeHome, version: "transformers.js/onnxruntime-node", model: model.id, details: { revision: model.revision, lifecycle: "READY" } };
@@ -375,8 +378,14 @@ async function embed(params, report = null) {
   reportModelPhase(report, "loading");
   setComponent("embedding", { lifecycle: "LOADING", ready: false, model: model.id, revision: model.revision });
   await saveState();
-  const output = await extractor(texts, { pooling: "last_token", normalize: true });
+  const output = await extractor(texts, {
+    pooling: "last_token", normalize: true,
+    truncation: true, max_length: 512,
+  });
   const vectors = output.tolist();
+  // Explicitly release the ONNX tensor before the request-scoped reference
+  // goes out of scope. Node does not guarantee timely native-memory GC.
+  output.dispose?.();
   if (!Array.isArray(vectors) || vectors.length !== texts.length || vectors.some((row) => !Array.isArray(row) || row.length === 0)) {
     throw new Error("embedding runtime returned an invalid vector batch");
   }
@@ -401,6 +410,8 @@ async function rerank(params, report = null) {
   });
   const output = await classifier(inputs);
   const logits = output.logits.tolist();
+  output.logits.dispose?.();
+  output.dispose?.();
   const scores = logits.map((row) => {
     const value = Number(row[0]);
     return 1 / (1 + Math.exp(-Math.max(-60, Math.min(60, value))));

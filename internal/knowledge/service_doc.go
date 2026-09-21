@@ -1998,6 +1998,13 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 		}
 	}
 	useLeafStructure := ir.Parser == "docx" || ir.Parser == "epub"
+	hasStructuredRows := make(map[string]bool)
+	for i := range ir.Nodes {
+		node := &ir.Nodes[i]
+		if node.Type == documentir.TypeTable || node.Type == documentir.TypeTableRow {
+			hasStructuredRows[node.ParentID] = true
+		}
+	}
 	var pieces []chunk.Piece
 	for _, node := range ir.Nodes {
 		include := false
@@ -2016,17 +2023,8 @@ func (s *Service) structureAwarePieces(text string, ir *documentir.Document, opt
 		if !include {
 			continue
 		}
-		if node.Type == documentir.TypeSheet {
-			hasRows := false
-			for _, child := range ir.Nodes {
-				if child.ParentID == node.ID && (child.Type == documentir.TypeTable || child.Type == documentir.TypeTableRow) {
-					hasRows = true
-					break
-				}
-			}
-			if hasRows {
-				continue
-			}
+		if node.Type == documentir.TypeSheet && hasStructuredRows[node.ID] {
+			continue
 		}
 		if strings.TrimSpace(node.Text) == "" {
 			continue
@@ -2066,6 +2064,33 @@ func nodesForPiece(ir *documentir.Document, text, heading string) ([]string, doc
 	var anchor documentir.SourceAnchor
 	bestAnchorScore := -1
 	seen := map[string]bool{}
+	for _, nodeIndex := range ir.NodeTextIndex()[target] {
+		source := ir.Nodes[nodeIndex]
+		if source.Type == documentir.TypeDocument {
+			continue
+		}
+		candidates := []int{nodeIndex}
+		candidates = append(candidates, ir.NodeChildrenIndex()[source.ID]...)
+		for _, candidateIndex := range candidates {
+			candidate := ir.Nodes[candidateIndex]
+			if seen[candidate.ID] {
+				continue
+			}
+			seen[candidate.ID] = true
+			ids = append(ids, candidate.ID)
+			score := sourceAnchorScore(candidate.Type, candidate.Metadata)
+			if anchor.Kind == "" || score > bestAnchorScore {
+				anchor = candidate.SourceAnchor
+				bestAnchorScore = score
+			}
+			if len(ids) >= 8 {
+				return ids, anchor
+			}
+		}
+	}
+	if len(ids) > 0 {
+		return ids, anchor
+	}
 	for _, node := range ir.Nodes {
 		if node.Type == documentir.TypeDocument || strings.TrimSpace(node.Text) == "" {
 			continue
@@ -2109,10 +2134,6 @@ func structuralContext(ir *documentir.Document, ids []string) string {
 	if ir == nil || len(ids) == 0 {
 		return ""
 	}
-	byID := make(map[string]documentir.Node, len(ir.Nodes))
-	for _, node := range ir.Nodes {
-		byID[node.ID] = node
-	}
 	parts := make([]string, 0, 4)
 	seen := map[string]bool{}
 	appendNode := func(node documentir.Node) {
@@ -2124,7 +2145,7 @@ func structuralContext(ir *documentir.Document, ids []string) string {
 		parts = append(parts, value)
 	}
 	for _, id := range ids {
-		node, ok := byID[id]
+		node, ok := ir.NodeByID(id)
 		if !ok {
 			continue
 		}
@@ -2132,7 +2153,7 @@ func structuralContext(ir *documentir.Document, ids []string) string {
 			parts = append(parts, "Section: "+strings.Join(node.HeadingPath, " / "))
 		}
 		for parent := node.ParentID; parent != ""; {
-			ancestor, exists := byID[parent]
+			ancestor, exists := ir.NodeByID(parent)
 			if !exists {
 				break
 			}
@@ -2142,17 +2163,16 @@ func structuralContext(ir *documentir.Document, ids []string) string {
 			parent = ancestor.ParentID
 		}
 		if node.Type == documentir.TypeTableCell || node.Type == documentir.TypeTableRow {
+			row := node
 			if node.Type == documentir.TypeTableCell {
-				if parent, exists := byID[node.ParentID]; exists {
+				if parent, exists := ir.NodeByID(node.ParentID); exists {
 					appendNode(parent)
+					row = parent
 				}
 			}
-			row := node
-			if row.Type == documentir.TypeTableCell {
-				row = byID[row.ParentID]
-			}
-			for _, candidate := range ir.Nodes {
-				if candidate.ParentID == row.ParentID && candidate.Type == documentir.TypeTableRow && candidate.Order < row.Order {
+			for _, siblingIndex := range ir.NodeChildrenIndex()[row.ParentID] {
+				candidate := ir.Nodes[siblingIndex]
+				if candidate.Type == documentir.TypeTableRow && candidate.Order < row.Order {
 					appendNode(candidate)
 					break
 				}

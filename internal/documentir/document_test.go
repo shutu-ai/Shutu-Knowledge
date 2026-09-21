@@ -1,6 +1,9 @@
 package documentir
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestBindDocumentIsDeterministicAndBuildsTree(t *testing.T) {
 	first := FromText("Guide", "# Intro\n\nA paragraph.", "text", "test")
@@ -27,6 +30,27 @@ func TestBindDocumentIsDeterministicAndBuildsTree(t *testing.T) {
 	}
 	if first.Nodes[2].ParentID != first.Nodes[1].ID {
 		t.Fatalf("paragraph parent = %q, want %q", first.Nodes[2].ParentID, first.Nodes[1].ID)
+	}
+}
+
+func TestBindDocumentBuildsLargeTreeWithoutLosingChildren(t *testing.T) {
+	const sections = 5000
+	doc := &Document{IRVersion: Version}
+	doc.Nodes = append(doc.Nodes, Node{ID: "tmp:root", Type: TypeDocument})
+	for i := 0; i < sections; i++ {
+		sectionID := fmt.Sprintf("tmp:section/%d", i)
+		paragraphID := fmt.Sprintf("tmp:paragraph/%d", i)
+		doc.Nodes = append(doc.Nodes, Node{ID: sectionID, Type: TypeSection, ParentID: "tmp:root"})
+		doc.Nodes = append(doc.Nodes, Node{ID: paragraphID, Type: TypeParagraph, ParentID: sectionID})
+	}
+	if err := doc.BindDocument("large-doc"); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Nodes[0].ChildrenIDs) != sections {
+		t.Fatalf("root children = %d, want %d", len(doc.Nodes[0].ChildrenIDs), sections)
+	}
+	if len(doc.Nodes[1].ChildrenIDs) != 1 || doc.Nodes[1].ChildrenIDs[0] != doc.Nodes[2].ID {
+		t.Fatalf("first section children = %#v, want first paragraph", doc.Nodes[1].ChildrenIDs)
 	}
 }
 

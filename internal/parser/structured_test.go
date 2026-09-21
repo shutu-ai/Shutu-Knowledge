@@ -3,6 +3,8 @@ package parser
 import (
 	"archive/zip"
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/documentir"
@@ -161,6 +163,64 @@ func TestXLSXIRCarriesFormulaHeadersUsedRangeAndMergedMetadata(t *testing.T) {
 	}
 	if !usedRange || !formula || !header || !merged {
 		t.Fatalf("XLSX metadata incomplete: %#v", result.IR.Nodes)
+	}
+}
+
+func TestXLSMParsesStructuredWorkbook(t *testing.T) {
+	data := structuredZipFixture(t, map[string]string{
+		"xl/workbook.xml":          `<workbook><sheets><sheet name="Macro" sheetId="1"/></sheets></workbook>`,
+		"xl/sharedStrings.xml":     `<sst><si><t>Field</t></si><si><t>Value</t></si></sst>`,
+		"xl/worksheets/sheet1.xml": `<worksheet><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row></sheetData></worksheet>`,
+	})
+	result, err := NewRegistry().Parse("workbook.xlsm", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Parser != "xlsm" || countIRNodes(result.IR, documentir.TypeSheet) != 1 || countIRNodes(result.IR, documentir.TypeTableCell) != 2 {
+		t.Fatalf("xlsm result parser=%q nodes=%#v", result.Parser, result.IR.Nodes)
+	}
+}
+
+func TestXLSXManyMergedCellsKeepsCellMetadataComplete(t *testing.T) {
+	if testing.Short() {
+		t.Skip("synthetic quadratic-regression fixture is skipped in short mode")
+	}
+	const cells = 10000
+	const merges = 5000
+	var worksheet strings.Builder
+	worksheet.WriteString(`<worksheet><sheetData><row>`)
+	for i := 0; i < cells; i++ {
+		ref := fmt.Sprintf("%s1", columnName(i+1))
+		fmt.Fprintf(&worksheet, `<c r="%s"><v>1</v></c>`, ref)
+	}
+	worksheet.WriteString(`</row></sheetData><mergeCells>`)
+	for i := 0; i < merges; i++ {
+		start := columnName(i*2 + 1)
+		end := columnName(i*2 + 2)
+		fmt.Fprintf(&worksheet, `<mergeCell ref="%s1:%s1"/>`, start, end)
+	}
+	worksheet.WriteString(`</mergeCells></worksheet>`)
+	data := structuredZipFixture(t, map[string]string{
+		"xl/workbook.xml":          `<workbook><sheets><sheet name="Merged" sheetId="1"/></sheets></workbook>`,
+		"xl/worksheets/sheet1.xml": worksheet.String(),
+	})
+
+	result, err := NewRegistry().Parse("many-merged-cells.xlsx", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cellNodes, mergedNodes int
+	for _, node := range result.IR.Nodes {
+		if node.Type != documentir.TypeTableCell {
+			continue
+		}
+		cellNodes++
+		if node.Metadata["merged"] == "true" {
+			mergedNodes++
+		}
+	}
+	if cellNodes != cells || mergedNodes != cells {
+		t.Fatalf("cells=%d merged=%d, want %d/%d", cellNodes, mergedNodes, cells, cells)
 	}
 }
 

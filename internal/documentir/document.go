@@ -45,6 +45,10 @@ type Document struct {
 	ParseConfig   map[string]string `json:"parse_config,omitempty"`
 	Nodes         []Node            `json:"nodes"`
 	Relationships []Relationship    `json:"relationships,omitempty"`
+
+	nodeTextIndex map[string][]int
+	nodeChildIDs  map[string][]int
+	nodeIDs       map[string]int
 }
 
 type Node struct {
@@ -121,6 +125,9 @@ func (d *Document) BindDocument(documentID string) error {
 	if strings.TrimSpace(documentID) == "" {
 		return fmt.Errorf("document ID is empty")
 	}
+	d.nodeTextIndex = nil
+	d.nodeChildIDs = nil
+	d.nodeIDs = nil
 	if d.IRVersion == "" {
 		d.IRVersion = Version
 	}
@@ -144,15 +151,16 @@ func (d *Document) BindDocument(documentID string) error {
 		n.ParentID = oldToNew[n.ParentID]
 		n.ChildrenIDs = nil
 	}
+	indexesByID := make(map[string]int, len(d.Nodes))
+	for i := range d.Nodes {
+		indexesByID[d.Nodes[i].ID] = i
+	}
 	for _, node := range d.Nodes {
 		if node.ParentID == "" {
 			continue
 		}
-		for i := range d.Nodes {
-			if d.Nodes[i].ID == node.ParentID {
-				d.Nodes[i].ChildrenIDs = append(d.Nodes[i].ChildrenIDs, node.ID)
-				break
-			}
+		if parentIndex, ok := indexesByID[node.ParentID]; ok {
+			d.Nodes[parentIndex].ChildrenIDs = append(d.Nodes[parentIndex].ChildrenIDs, node.ID)
 		}
 	}
 	for i := range d.Relationships {
@@ -186,6 +194,47 @@ func (d Document) Validate() error {
 		}
 	}
 	return nil
+}
+
+// NodeTextIndex returns a process-local lookup from normalized node text to
+// node positions. It is intentionally unexported and non-serialized; callers
+// use it only after parser output is bound and immutable.
+func (d *Document) NodeByID(id string) (Node, bool) {
+	d.NodeTextIndex()
+	i, ok := d.nodeIDs[id]
+	if !ok {
+		return Node{}, false
+	}
+	return d.Nodes[i], true
+}
+
+func (d *Document) NodeChildrenIndex() map[string][]int {
+	d.NodeTextIndex()
+	return d.nodeChildIDs
+}
+
+func (d *Document) NodeTextIndex() map[string][]int {
+	if d.nodeTextIndex != nil {
+		return d.nodeTextIndex
+	}
+	index := make(map[string][]int, len(d.Nodes))
+	children := make(map[string][]int)
+	ids := make(map[string]int, len(d.Nodes))
+	for i := range d.Nodes {
+		normalized := strings.TrimSpace(d.Nodes[i].Text)
+		if normalized == "" {
+			continue
+		}
+		index[normalized] = append(index[normalized], i)
+		ids[d.Nodes[i].ID] = i
+		if parent := d.Nodes[i].ParentID; parent != "" {
+			children[parent] = append(children[parent], i)
+		}
+	}
+	d.nodeTextIndex = index
+	d.nodeChildIDs = children
+	d.nodeIDs = ids
+	return index
 }
 
 func (d Document) MarshalJSONStable() ([]byte, error) {

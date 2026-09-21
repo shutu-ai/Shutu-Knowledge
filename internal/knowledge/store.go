@@ -1139,16 +1139,37 @@ func insertDocumentIRTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document
 	if ir.DocumentID != docID {
 		return fmt.Errorf("IR document ID %q does not match %q", ir.DocumentID, docID)
 	}
-	if err := ir.Validate(); err != nil {
+	if err := insertDocumentMetadataTx(ctx, tx, ir, docID, generation); err != nil {
 		return err
 	}
+	if err := insertDocumentNodesTx(ctx, tx, ir, docID, generation, ir.Nodes); err != nil {
+		return err
+	}
+	return insertDocumentRelationshipsTx(ctx, tx, ir, docID, generation)
+}
+
+func insertDocumentMetadataTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document, docID string, generation int64) error {
 	parseConfig, _ := json.Marshal(ir.ParseConfig)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO document_parse_metadata
+	_, err := tx.ExecContext(ctx, `INSERT INTO document_parse_metadata
 		(doc_id, index_generation, ir_version, parser, parser_version, parse_config)
-		VALUES (?, ?, ?, ?, ?, ?)`, docID, generation, ir.IRVersion, ir.Parser, ir.ParserVersion, string(parseConfig)); err != nil {
+		VALUES (?, ?, ?, ?, ?, ?)`, docID, generation, ir.IRVersion, ir.Parser, ir.ParserVersion, string(parseConfig))
+	return err
+}
+
+func insertDocumentNodesTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document, docID string, generation int64, nodes []documentir.Node) error {
+	if len(nodes) == 0 {
+		return nil
+	}
+	nodeStmt, err := tx.PrepareContext(ctx, `INSERT INTO document_nodes
+		(doc_id, index_generation, node_id, parent_node_id, node_type, node_order,
+			 text, heading_path, source_anchor, page_number, slide_number, sheet_name,
+			 bbox, metadata, parser, parser_version, confidence)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
 		return err
 	}
-	for _, node := range ir.Nodes {
+	defer nodeStmt.Close()
+	for _, node := range nodes {
 		heading, _ := json.Marshal(node.HeadingPath)
 		anchor, _ := json.Marshal(node.SourceAnchor)
 		metadata, _ := json.Marshal(node.Metadata)
@@ -1157,28 +1178,35 @@ func insertDocumentIRTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document
 			data, _ := json.Marshal(node.BBox)
 			bbox = string(data)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO document_nodes
-			(doc_id, index_generation, node_id, parent_node_id, node_type, node_order,
-			 text, heading_path, source_anchor, page_number, slide_number, sheet_name,
-			 bbox, metadata, parser, parser_version, confidence)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := nodeStmt.ExecContext(ctx,
 			docID, generation, node.ID, irNullableString(node.ParentID), node.Type, node.Order,
 			node.Text, string(heading), string(anchor), irNullableInt(node.PageNumber), irNullableInt(node.SlideNumber), irNullableString(node.SheetName),
 			bbox, string(metadata), node.Parser, node.ParserVersion, node.Confidence); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func insertDocumentRelationshipsTx(ctx context.Context, tx *sql.Tx, ir *documentir.Document, docID string, generation int64) error {
+	if len(ir.Relationships) == 0 {
+		return nil
+	}
+	relationStmt, err := tx.PrepareContext(ctx, `INSERT INTO document_relationships
+		(doc_id, index_generation, relationship_id, from_node_id, to_node_id,
+			 relationship_type, relationship_order) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer relationStmt.Close()
 	for _, relation := range ir.Relationships {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO document_relationships
-			(doc_id, index_generation, relationship_id, from_node_id, to_node_id,
-			 relationship_type, relationship_order) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := relationStmt.ExecContext(ctx,
 			docID, generation, relation.ID, relation.FromNodeID, relation.ToNodeID, relation.Type, relation.Order); err != nil {
 			return err
 		}
 	}
 	return nil
 }
-
 func irNullableString(value string) any {
 	if value == "" {
 		return nil
@@ -1295,6 +1323,63 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 	if err != nil {
 		return 0, err
 	}
+	const irNodeBatchSize = 50000
+	if ir != nil {
+		if err := s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+			current, err := documentFenceTx(tx, docID, expectedEpoch)
+			if err != nil {
+				return err
+			}
+			if !current.HasDesiredIndexGen || current.DesiredIndexGen != generation || current.IndexState != IndexStateBuilding {
+				return ErrConflict
+			}
+			if err := insertDocumentMetadataTx(ctx, tx, ir, docID, generation); err != nil {
+				return err
+			}
+			end := minInt(irNodeBatchSize, len(ir.Nodes))
+			return insertDocumentNodesTx(ctx, tx, ir, docID, generation, ir.Nodes[:end])
+		}); err != nil {
+			if !errors.Is(err, storage.ErrWriteUnknown) {
+				_ = s.clearStagedGeneration(context.Background(), docID, expectedEpoch, generation)
+			}
+			return 0, err
+		}
+		for start := irNodeBatchSize; start < len(ir.Nodes); start += irNodeBatchSize {
+			end := minInt(start+irNodeBatchSize, len(ir.Nodes))
+			if err := s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+				current, err := documentFenceTx(tx, docID, expectedEpoch)
+				if err != nil {
+					return err
+				}
+				if !current.HasDesiredIndexGen || current.DesiredIndexGen != generation || current.IndexState != IndexStateBuilding {
+					return ErrConflict
+				}
+				return insertDocumentNodesTx(ctx, tx, ir, docID, generation, ir.Nodes[start:end])
+			}); err != nil {
+				if !errors.Is(err, storage.ErrWriteUnknown) {
+					_ = s.clearStagedGeneration(context.Background(), docID, expectedEpoch, generation)
+				}
+				return 0, err
+			}
+		}
+		if len(ir.Relationships) > 0 {
+			if err := s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+				current, err := documentFenceTx(tx, docID, expectedEpoch)
+				if err != nil {
+					return err
+				}
+				if !current.HasDesiredIndexGen || current.DesiredIndexGen != generation || current.IndexState != IndexStateBuilding {
+					return ErrConflict
+				}
+				return insertDocumentRelationshipsTx(ctx, tx, ir, docID, generation)
+			}); err != nil {
+				if !errors.Is(err, storage.ErrWriteUnknown) {
+					_ = s.clearStagedGeneration(context.Background(), docID, expectedEpoch, generation)
+				}
+				return 0, err
+			}
+		}
+	}
 	for start := 0; start < len(chunks); start += batchSize {
 		end := minInt(start+batchSize, len(chunks))
 		batch := chunks[start:end]
@@ -1305,11 +1390,6 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 			}
 			if !current.HasDesiredIndexGen || current.DesiredIndexGen != generation || current.IndexState != IndexStateBuilding {
 				return ErrConflict
-			}
-			if start == 0 {
-				if err := insertDocumentIRTx(ctx, tx, ir, docID, generation); err != nil {
-					return err
-				}
 			}
 			for _, chunk := range batch {
 				if err := insertChunkTx(ctx, tx, chunk); err != nil {

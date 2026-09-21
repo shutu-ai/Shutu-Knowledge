@@ -183,7 +183,7 @@ func windowBlock(text string, size, overlap int) []string {
 		cutBytes := maxInt(findCut(window, len(window), windowStartBytes), 1)
 		cut := maxInt(utf8.RuneCountInString(window[:cutBytes]), 1)
 		out = append(out, strings.TrimSpace(string(runes[start:start+cut])))
-		next := maxInt(cut-overlap, start+1)
+		next := maxInt(cut-overlap, start+cut)
 		if next <= start {
 			break
 		}

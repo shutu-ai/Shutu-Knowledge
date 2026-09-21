@@ -22,7 +22,7 @@ const maxArchiveBytes = 256 << 20
 // unsupported until the optional external helper lands in a later phase.
 type zipOfficeParser struct{}
 
-func (zipOfficeParser) Extensions() []string { return []string{"docx", "pptx", "xlsx", "epub"} }
+func (zipOfficeParser) Extensions() []string { return []string{"docx", "pptx", "xlsx", "xlsm", "epub"} }
 
 func (p zipOfficeParser) Parse(fileName string, data []byte) (Result, error) {
 	entries, err := readArchive(data)
@@ -36,9 +36,9 @@ func (p zipOfficeParser) Parse(fileName string, data []byte) (Result, error) {
 	case "pptx":
 		text, err := parsePptx(entries)
 		return officeResult("pptx", text, err, entries), err
-	case "xlsx":
+	case "xlsx", "xlsm":
 		text, err := parseXlsx(entries)
-		return officeResult("xlsx", text, err, entries), err
+		return officeResult(ExtensionOf(fileName), text, err, entries), err
 	case "epub":
 		title, text, err := parseEpub(entries)
 		return Result{Title: title, Text: text, IR: documentir.FromText(title, text, "epub", "builtin-v1"), Parser: "epub", ParserVersion: "builtin-v1"}, err

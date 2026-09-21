@@ -38,6 +38,17 @@ func TestChunkHeadingPathAndFenceProtection(t *testing.T) {
 	}
 }
 
+func TestWindowBlockShortCutDoesNotCreepOneRune(t *testing.T) {
+	text := strings.Repeat("| a | b |\n", 100)
+	out := windowBlock(text, 20, 15)
+	if len(out) == 0 {
+		t.Fatal("expected windows")
+	}
+	if len(out) > 100 {
+		t.Fatalf("short cuts caused chunk creep: %d windows for %d runes", len(out), len([]rune(text)))
+	}
+}
+
 func TestChunkTokenBudgetsCJK(t *testing.T) {
 	// 800-token budget on CJK text (~1.5 chars/token) -> ~1200-char windows.
 	text := strings.Repeat("这是一段测试文本，用于验证分词预算。", 200)

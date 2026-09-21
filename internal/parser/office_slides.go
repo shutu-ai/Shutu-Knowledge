@@ -439,9 +439,10 @@ func (r xlsxRow) Range() string {
 }
 
 type xlsxStructuredSheet struct {
-	Name   string
-	Rows   []xlsxRow
-	Merges []string
+	Name        string
+	Rows        []xlsxRow
+	Merges      []string
+	mergedCells map[string]struct{}
 }
 
 func (s xlsxStructuredSheet) Text() string {
@@ -511,7 +512,11 @@ func (s xlsxStructuredSheet) HeaderFor(index int) string {
 	return strings.TrimSpace(s.Rows[0].Cells[index].Value)
 }
 
-func (s xlsxStructuredSheet) IsMerged(ref string) bool {
+func (s *xlsxStructuredSheet) indexMergedCells() {
+	if s.mergedCells != nil {
+		return
+	}
+	s.mergedCells = make(map[string]struct{}, len(s.Merges))
 	for _, merge := range s.Merges {
 		parts := strings.SplitN(merge, ":", 2)
 		if len(parts) != 2 {
@@ -519,12 +524,21 @@ func (s xlsxStructuredSheet) IsMerged(ref string) bool {
 		}
 		startCol, startRow := xlsxCellPosition(parts[0])
 		endCol, endRow := xlsxCellPosition(parts[1])
-		col, row := xlsxCellPosition(ref)
-		if col >= startCol && col <= endCol && row >= startRow && row <= endRow {
-			return true
+		if startCol == 0 || startRow == 0 || endCol == 0 || endRow == 0 {
+			continue
+		}
+		for row := startRow; row <= endRow; row++ {
+			for col := startCol; col <= endCol; col++ {
+				s.mergedCells[fmt.Sprintf("%s%d", columnName(col), row)] = struct{}{}
+			}
 		}
 	}
-	return false
+}
+
+func (s *xlsxStructuredSheet) IsMerged(ref string) bool {
+	s.indexMergedCells()
+	_, ok := s.mergedCells[ref]
+	return ok
 }
 
 func xlsxStructuredSheets(entries map[string][]byte) []xlsxStructuredSheet {
@@ -543,7 +557,9 @@ func xlsxStructuredSheets(entries map[string][]byte) []xlsxStructuredSheet {
 		if index < len(workbookNames) && strings.TrimSpace(workbookNames[index]) != "" {
 			sheetName = workbookNames[index]
 		}
-		out = append(out, xlsxStructuredSheet{Name: sheetName, Rows: parseXLSXRows(entries[name], shared), Merges: parseXLSXMerges(entries[name])})
+		sheet := xlsxStructuredSheet{Name: sheetName, Rows: parseXLSXRows(entries[name], shared), Merges: parseXLSXMerges(entries[name])}
+		sheet.indexMergedCells()
+		out = append(out, sheet)
 	}
 	return out
 }

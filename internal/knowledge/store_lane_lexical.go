@@ -136,10 +136,28 @@ func (s *store) LexicalSearch(ctx context.Context, q queryRunner, query string, 
 	if err != nil {
 		return nil, err
 	}
-	querySQL := laneSelect + `, bm25(chunk_fts) AS fts_score
+	// bm25() is an FTS5 auxiliary function and is valid only when the lane
+	// actually runs a MATCH query. Short tokens use the LIKE branch; giving
+	// them a plain chunks scan avoids SQLite referencing missing FTS columns.
+	fromClause := `
+		FROM chunks c
+		JOIN documents d ON d.id = c.doc_id
+		JOIN bases b ON b.id = c.base_id`
+	if len(matchTerms) > 0 {
+		fromClause = `
 		FROM chunk_fts JOIN chunks c ON c.rowid = chunk_fts.rowid
 		JOIN documents d ON d.id = c.doc_id
-		JOIN bases b ON b.id = c.base_id
+		JOIN bases b ON b.id = c.base_id`
+	}
+	querySQL := laneSelect
+	if len(matchTerms) > 0 {
+		querySQL += `, bm25(chunk_fts) AS fts_score`
+	} else {
+		// Keep laneSelect's column shape for the LIKE-only scan; short-token
+		// hits have no BM25 rank and remain in stored order.
+		querySQL += `, 0 AS fts_score`
+	}
+	querySQL += fromClause + `
 		WHERE d.lifecycle_state = 'active' AND b.lifecycle_state = 'active'
 		AND c.index_generation = d.active_index_generation` + scope
 	if len(matchTerms) > 0 {
@@ -154,7 +172,11 @@ func (s *store) LexicalSearch(ctx context.Context, q queryRunner, query string, 
 		querySQL += ` AND c.text LIKE ? ESCAPE '\'`
 		args = append(args, "%"+escapeLike(term)+"%")
 	}
-	querySQL += " ORDER BY fts_score LIMIT ?"
+	if len(matchTerms) > 0 {
+		querySQL += " ORDER BY fts_score LIMIT ?"
+	} else {
+		querySQL += " ORDER BY c.idx LIMIT ?"
+	}
 	args = append(args, limit)
 	rows, err := q.QueryContext(ctx, querySQL, args...)
 	if err != nil {

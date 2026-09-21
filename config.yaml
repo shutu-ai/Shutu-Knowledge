@@ -46,7 +46,7 @@ retrieval:
   rrfVectorWeight: 1
   siblingChunks: 1
   contextTimeoutMs: 4000
-  searchTimeoutMs: 8000
+  searchTimeoutMs: 25000
 processing:
   provider: builtin
   apiKey: ""

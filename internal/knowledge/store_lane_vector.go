@@ -1,12 +1,13 @@
 package knowledge
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
-	"sort"
 
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
@@ -14,15 +15,40 @@ import (
 // VectorSearch brute-force scans scoped embeddings for one model space and
 // ranks by cosine similarity (normalized vectors, so dot == cosine). Vectors
 // with a mismatched dimension are skipped, never mixed.
+type vectorCandidate struct {
+	hit       LaneHit
+	embedding []float32
+}
+
+type vectorCandidateHeap []vectorCandidate
+
+func (h vectorCandidateHeap) Len() int { return len(h) }
+func (h vectorCandidateHeap) Less(i, j int) bool {
+	return h[i].hit.Score < h[j].hit.Score
+}
+func (h vectorCandidateHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *vectorCandidateHeap) Push(x any)   { *h = append(*h, x.(vectorCandidate)) }
+func (h *vectorCandidateHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+// VectorSearch finds the top-K vectors in one bounded pass, then loads full
+// chunk data only for those candidates. At real corpus scale, returning every
+// row's text/context while scoring would turn a vector scan into an I/O scan.
 func (s *store) VectorSearch(ctx context.Context, q queryRunner, queryVector []float64, baseIDs, docIDs []string, limit int, modelKey string) ([]LaneHit, error) {
-	if len(queryVector) == 0 {
+	if len(queryVector) == 0 || limit <= 0 {
 		return nil, nil
 	}
 	scope, scopeArgs, err := scopeSQL(baseIDs, docIDs)
 	if err != nil {
 		return nil, err
 	}
-	querySQL := laneSelect + `
+	querySQL := `SELECT c.id, c.doc_id, c.base_id, c.idx, c.embedding,
+		c.index_generation, d.source_version
 		FROM chunks c JOIN documents d ON d.id = c.doc_id
 		JOIN bases b ON b.id = c.base_id
 		WHERE c.embedding IS NOT NULL AND d.lifecycle_state = 'active' AND b.lifecycle_state = 'active'
@@ -34,41 +60,103 @@ func (s *store) VectorSearch(ctx context.Context, q queryRunner, queryVector []f
 	}
 	querySQL += scope
 	queryArgs = append(queryArgs, scopeArgs...)
+
+	queryFloat32 := make([]float32, len(queryVector))
+	for i, v := range queryVector {
+		queryFloat32[i] = float32(v)
+	}
+	top := &vectorCandidateHeap{}
 	rows, err := q.QueryContext(ctx, querySQL, queryArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("vector lane: %w", err)
 	}
-	defer rows.Close()
-	var hits []LaneHit
 	for rows.Next() {
+		var candidate vectorCandidate
+		var embedding []byte
+		if err := rows.Scan(&candidate.hit.ID, &candidate.hit.DocID, &candidate.hit.BaseID,
+			&candidate.hit.Index, &embedding, &candidate.hit.IndexGeneration,
+			&candidate.hit.SourceVersion); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		candidate.embedding = decodeEmbedding(embedding)
+		if len(candidate.embedding) != len(queryFloat32) {
+			continue
+		}
+		candidate.hit.HasEmbedding = true
+		candidate.hit.Score = dotProduct(queryFloat32, candidate.embedding)
+		if top.Len() < limit {
+			heap.Push(top, candidate)
+		} else if candidate.hit.Score > (*top)[0].hit.Score {
+			(*top)[0] = candidate
+			heap.Fix(top, 0)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	count := top.Len()
+	candidates := make([]vectorCandidate, count)
+	for i := count - 1; i >= 0; i-- {
+		candidates[i] = heap.Pop(top).(vectorCandidate)
+	}
+	ids := make([]string, 0, count)
+	scoreByID := make(map[string]float64, count)
+	embeddingByID := make(map[string][]float32, count)
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.hit.ID)
+		scoreByID[candidate.hit.ID] = candidate.hit.Score
+		embeddingByID[candidate.hit.ID] = candidate.embedding
+	}
+
+	fullSQL := laneSelect + `
+		FROM chunks c JOIN documents d ON d.id = c.doc_id
+		WHERE c.id IN (` + placeholders(count) + `)`
+	fullRows, err := q.QueryContext(ctx, fullSQL, stringSliceToAny(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer fullRows.Close()
+	fullByID := make(map[string]LaneHit, count)
+	for fullRows.Next() {
 		var hit LaneHit
 		var embedding []byte
-		if err := rows.Scan(&hit.ID, &hit.DocID, &hit.BaseID, &hit.Index, &hit.Text, &hit.Heading,
+		if err := fullRows.Scan(&hit.ID, &hit.DocID, &hit.BaseID, &hit.Index, &hit.Text, &hit.Heading,
 			&hit.Context, &hit.EmbeddingHash, &hit.CreatedAt, &embedding,
 			&hit.IndexGeneration, &hit.SourceVersion); err != nil {
 			return nil, err
 		}
-		hit.Embedding = decodeEmbedding(embedding)
-		if len(hit.Embedding) != len(queryVector) {
+		fullByID[hit.ID] = hit
+	}
+	if err := fullRows.Err(); err != nil {
+		return nil, err
+	}
+
+	hits := make([]LaneHit, 0, count)
+	for _, candidate := range candidates {
+		hit, ok := fullByID[candidate.hit.ID]
+		if !ok {
 			continue
 		}
+		hit.Score = candidate.hit.Score
 		hit.HasEmbedding = true
-		queryFloat32 := make([]float32, len(queryVector))
-		for i, v := range queryVector {
-			queryFloat32[i] = float32(v)
-		}
-		hit.Score = dotProduct(queryFloat32, hit.Embedding)
+		hit.Embedding = candidate.embedding
 		hit.EmbeddingText = searchTextOf(hit.Chunk)
 		hits = append(hits, hit)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
-	if len(hits) > limit {
-		hits = hits[:limit]
-	}
+	// Candidate order is already best-first; no second sort is needed.
 	return hits, nil
+}
+
+func stringSliceToAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
 }
 
 func dotProduct(a, b []float32) float64 {
@@ -111,6 +199,42 @@ func (s *store) PutChunkVectors(docID string, generation int64, modelKey string,
 	return s.PutChunkVectorsContext(context.Background(), docID, generation, modelKey, byHash)
 }
 
+// PutChunkVectorsByID persists already embedded rows using chunk primary IDs.
+func (s *store) PutChunkVectorsByID(docID string, generation int64, modelKey string, byID map[string][]float64) error {
+	return s.PutChunkVectorsByIDContext(context.Background(), docID, generation, modelKey, byID)
+}
+
+// PutChunkVectorsByIDContext persists one embedded batch under the caller's
+// cancellation boundary. Chunk IDs turn each vector update into a primary-key
+// write, which stays bounded even when a document has tens of thousands of
+// similarly named chunks.
+func (s *store) PutChunkVectorsByIDContext(ctx context.Context, docID string, generation int64, modelKey string, byID map[string][]float64) error {
+	if len(byID) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	write := func() error {
+		return s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+			for id, vector := range byID {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE id = ? AND doc_id = ? AND index_generation = ?`,
+					encodeEmbedding(vector), modelKey, id, docID, generation,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	err := write()
+	if errors.Is(err, storage.ErrWriteUnknown) && ctx.Err() == nil {
+		err = write()
+	}
+	return err
+}
+
 // PutChunkVectorsContext persists one embedded batch under the caller's
 // cancellation boundary. Each batch is already bounded by the embedding
 // worker, and the unique Storage Writer remains the only write path.
@@ -121,7 +245,7 @@ func (s *store) PutChunkVectorsContext(ctx context.Context, docID string, genera
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+	err := s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
 		for hash, vector := range byHash {
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND index_generation = ? AND embedding_text_hash = ?`,
@@ -132,6 +256,23 @@ func (s *store) PutChunkVectorsContext(ctx context.Context, docID string, genera
 		}
 		return nil
 	})
+	// A vector batch is idempotent. If the writer lost the first outcome
+	// after admission, retry once while the caller is still active so a
+	// transient SQLite timeout cannot strand the rest of a large index.
+	if errors.Is(err, storage.ErrWriteUnknown) && ctx.Err() == nil {
+		err = s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+			for hash, vector := range byHash {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE chunks SET embedding = ?, embedding_model = ? WHERE doc_id = ? AND index_generation = ? AND embedding_text_hash = ?`,
+					encodeEmbedding(vector), modelKey, docID, generation, hash,
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	return err
 }
 
 // ListEmbeddingVectorsByHashes implements library-wide vector reuse: stored

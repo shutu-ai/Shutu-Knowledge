@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 
 const source = new URL("../src/", import.meta.url);
 const target = new URL("../../internal/web/dist/", import.meta.url);
@@ -10,11 +10,24 @@ const target = new URL("../../internal/web/dist/", import.meta.url);
 if (existsSync(target)) {
   for (const entry of await readdir(target, { withFileTypes: true })) {
     const path = new URL(entry.isDirectory() ? `${entry.name}/` : entry.name, target);
-    await rm(path, { recursive: true, force: true });
+    await rm(path, { recursive: true, force: true }).catch((error) => {
+      // Windows can briefly deny unlinking deployed assets. Regular files are
+      // safely replaced in place by copyFile below; only stale directories
+      // require recursive removal.
+      if (entry.isDirectory() || error?.code !== "EPERM") throw error;
+    });
   }
 }
 await mkdir(target, { recursive: true });
-await cp(source, target, { recursive: true });
+for (const entry of await readdir(source, { withFileTypes: true })) {
+  const from = new URL(entry.name, source);
+  const to = new URL(entry.name, target);
+  if (entry.isDirectory()) {
+    await cp(from, to, { recursive: true });
+  } else {
+    await copyFile(from, to);
+  }
+}
 
 const files = [];
 async function walk(dir) {

@@ -1249,7 +1249,11 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 		if err != nil {
 			return err
 		}
-		if current.IndexState == IndexStateBuilding {
+		// A canceled worker can leave a staged generation marked building even
+		// though the business document is no longer active. That generation is
+		// not authoritative; clear it below and allocate the same next number.
+		if current.IndexState == IndexStateBuilding &&
+			(!current.HasDesiredIndexGen || current.DesiredIndexGen <= current.ActiveIndexGen) {
 			return ErrConflict
 		}
 		expectedEpoch = current.MutationEpoch

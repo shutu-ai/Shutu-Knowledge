@@ -550,14 +550,22 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 	// the current order and reports degraded.
 	var rerankScores map[string]float64
 	reranker := commonReranker(ordered, providersByBase)
-	if reranker != nil && len(ordered) > 1 {
+	// Recall broadly, but cross-encode only the final-sized head. At real
+	// corpus scale, scoring the full 3x candidate pool repeatedly exceeded the
+	// bounded search budget while scoring candidates that could never enter a
+	// top-K result.
+	rerankCandidates := ordered
+	if len(rerankCandidates) > topK {
+		rerankCandidates = rerankCandidates[:topK]
+	}
+	if reranker != nil && len(rerankCandidates) > 1 {
 		releaseModelSlot, acquireErr := s.acquireSearchModelSlot(ctx)
 		if acquireErr != nil {
 			return SearchResult{}, acquireErr
 		}
 		rerankStart := Now()
-		texts := make([]string, 0, len(ordered))
-		for _, c := range ordered {
+		texts := make([]string, 0, len(rerankCandidates))
+		for _, c := range rerankCandidates {
 			texts = append(texts, clipToTokens(c.EmbeddingText, 352))
 		}
 		modelKey := reranker.ModelKey()
@@ -565,7 +573,7 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 		if strings.HasPrefix(modelKey, "local-rerank:") {
 			providerName = "local"
 		}
-		status := RerankStatus{Provider: providerName, Model: modelKey, Attempted: true, CandidateCount: len(ordered)}
+		status := RerankStatus{Provider: providerName, Model: modelKey, Attempted: true, CandidateCount: len(rerankCandidates)}
 		scores, err := reranker.Rerank(ctx, clipToTokens(query, 128), texts)
 		releaseModelSlot()
 		status.ElapsedMS = Now().UnixMilli() - rerankStart.UnixMilli()
@@ -582,17 +590,18 @@ func (s *Service) search(ctx context.Context, req SearchRequest) (SearchResult, 
 			status.Applied = true
 			result.Rerank = &status
 			rerankScores = map[string]float64{}
-			for i, c := range ordered {
+			for i, c := range rerankCandidates {
 				rerankScores[c.ID] = scores[i]
 			}
+			sort.SliceStable(rerankCandidates, func(i, j int) bool {
+				return rerankScores[rerankCandidates[i].ID] > rerankScores[rerankCandidates[j].ID]
+			})
+			ordered = rerankCandidates
 		}
 	}
 
 	// Final ordering: rerank scores when applied, otherwise fused order.
 	if rerankScores != nil {
-		sort.SliceStable(ordered, func(i, j int) bool {
-			return rerankScores[ordered[i].ID] > rerankScores[ordered[j].ID]
-		})
 		rerankStage = append([]Chunk(nil), ordered...)
 	}
 	if rerankScores != nil {

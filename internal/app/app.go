@@ -678,9 +678,6 @@ func (a *App) UpdateConfigWithContext(ctx context.Context, cfg config.Config) er
 		cancel()
 	}
 	a.Config = cfg
-	if a.Knowledge != nil {
-		a.Knowledge.SetGlobalConfig(cfg)
-	}
 	if a.Models != nil {
 		a.Models = models.NewManager(a.modelCacheDir(), cfg.Models.HFEndpoint, nil)
 	}
@@ -688,7 +685,10 @@ func (a *App) UpdateConfigWithContext(ctx context.Context, cfg config.Config) er
 		a.Runtime = a.newRuntimeManager()
 	}
 	if a.Knowledge != nil {
+		// Install the new runtime before derived helpers are rebuilt. The old
+		// manager is closed and must never be captured by office/OCR helpers.
 		a.Knowledge.SetRuntime(a.Runtime)
+		a.Knowledge.SetGlobalConfig(cfg)
 	}
 	return nil
 }

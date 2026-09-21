@@ -37,27 +37,39 @@ env.allowLocalModels = true;
 // tokenizer loader needs the normal cache resolver during an offline restart;
 // once the manifest is READY, no model download is required.
 env.allowRemoteModels = !offline;
+// Real corpus embedding on Windows exposed severe oversubscription when the
+// ONNX runtime used its default thread pool. These are deliberately conservative
+// defaults: one worker process performs inference serially, so four intra-op
+// threads give stable CPU use without the search path competing with dozens of
+// native threads. They can be overridden for benchmarking.
+const onnxThreads = Math.max(1, Math.min(4, Number(process.env.SHUTU_ONNX_INTRA_OP_THREADS || "4")));
+const sessionOptions = {
+  intraOpNumThreads: onnxThreads,
+  interOpNumThreads: 1,
+  executionMode: "sequential",
+  graph_optimization_level: "all",
+};
 
 const DEFAULT_EMBEDDING = {
-  id: "onnx-community/Qwen3-Embedding-0.6B-ONNX",
-  revision: "c25a394dd583836952667c12f008335071b3f43d",
+  id: "Xenova/all-MiniLM-L6-v2",
+  revision: "751bff37182d3f1213fa05d7196b954e230abad9",
   dtype: "q4",
   files: {
-    "config.json": "66a10929782f3c9a3cd5dec90e2a95c60e05736134a63cd54479eeae80bed175",
-    "tokenizer_config.json": "977648852447cb6587327ff3205b0a84cf2fc9f05621d6c8e88a497caafab2e1",
-    "tokenizer.json": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
-    "onnx/model_q4.onnx": "8be554b37368134c3f38613c6f6ad0b7bb5f3a6465ab87574dbc0dcf24daa428",
+    "config.json": "7135149f7cffa1a573466c6e4d8423ed73b62fd2332c575bf738a0d033f70df7",
+    "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+    "onnx/model_q4.onnx": "ac0f989345605769651a18bb796fda6235d921a37bd4ac065cb51781da44d079",
   },
 };
 const DEFAULT_RERANK = {
   id: "Xenova/bge-reranker-base",
   revision: "280bcc27a84e0b898c251e06fddb25171bd9b101",
-  dtype: "fp32",
+  dtype: "q4",
   files: {
     "config.json": "b6575b9d5be20d6747417c8e20c5a0db1636356e0b6d422d7244c628423c4d4c",
     "tokenizer_config.json": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
     "tokenizer.json": "48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c",
-    "onnx/model.onnx": "15b9a8c3da82eddf263df571281166e00e9308fe19d077084b642ebfcaf06d2b",
+    "onnx/model_q4.onnx": "d17d795bad1d16cc75c5ff8949192da41b61e203188f923ce157eeacd7222e5f",
   },
 };
 
@@ -261,7 +273,7 @@ async function embeddingModel(modelName, report = null) {
     });
     await saveState();
     let source = model.id;
-    const options = { dtype: model.dtype, revision: model.revision };
+    const options = { dtype: model.dtype, revision: model.revision, session_options: sessionOptions };
     if (localFiles) {
       reportModelPhase(report, "verifying");
       await verifyModel(model);
@@ -298,7 +310,7 @@ async function rerankModel(modelName, report = null) {
     });
     await saveState();
     let source = model.id;
-    const options = { revision: model.revision };
+    const options = { revision: model.revision, session_options: sessionOptions };
     if (localFiles) {
       reportModelPhase(report, "verifying");
       await verifyModel(model);
@@ -341,7 +353,10 @@ async function health(capability) {
   }
   try {
     if (capability === "embedding") {
-      const { model, extractor } = await embeddingModel(item.model);
+      const configuredModel = item.revision && !String(item.model).includes("@")
+        ? `${item.model}@${item.revision}`
+        : item.model;
+      const { model, extractor } = await embeddingModel(configuredModel);
       await extractor(["runtime health smoke"], {
         pooling: "last_token", normalize: true,
         truncation: true, max_length: 512,
@@ -351,7 +366,10 @@ async function health(capability) {
       return { ready: true, capability, status: "ready", lifecycle: "READY", path: runtimeHome, version: "transformers.js/onnxruntime-node", model: model.id, details: { revision: model.revision, lifecycle: "READY" } };
     }
     if (capability === "rerank") {
-      const { model, tokenizer, classifier } = await rerankModel(item.model);
+      const configuredRerankModel = item.revision && !String(item.model).includes("@")
+        ? `${item.model}@${item.revision}`
+        : item.model;
+      const { model, tokenizer, classifier } = await rerankModel(configuredRerankModel);
       const inputs = tokenizer(["health"], { text_pair: ["health"], padding: true, truncation: true, max_length: 32 });
       await classifier(inputs);
       setComponent("rerank", { lifecycle: "READY", ready: true, model: model.id, revision: model.revision, lastError: undefined });

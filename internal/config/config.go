@@ -244,7 +244,7 @@ func Defaults() Config {
 	c.Retrieval.RRFVectorWeight = 1
 	c.Retrieval.SiblingChunks = 1
 	c.Retrieval.ContextTimeoutMS = 4000
-	c.Retrieval.SearchTimeoutMS = 8000
+	c.Retrieval.SearchTimeoutMS = 25000
 	c.Processing.Provider = "builtin"
 	c.Processing.APIHost = "https://mineru.net"
 	c.Workflow.ConflictStrategy = "rename"
@@ -452,7 +452,7 @@ func (c *Config) clamp() {
 	c.Retrieval.RRFVectorWeight = clampFloat(c.Retrieval.RRFVectorWeight, 0.1, 5, 1)
 	c.Retrieval.SiblingChunks = clampInt(c.Retrieval.SiblingChunks, 0, 3, 1)
 	c.Retrieval.ContextTimeoutMS = clampInt(c.Retrieval.ContextTimeoutMS, 500, 60000, 4000)
-	c.Retrieval.SearchTimeoutMS = clampInt(c.Retrieval.SearchTimeoutMS, 500, 600000, 8000)
+	c.Retrieval.SearchTimeoutMS = clampInt(c.Retrieval.SearchTimeoutMS, 500, 600000, 25000)
 	c.Workflow.URLRefreshHours = clampInt(c.Workflow.URLRefreshHours, 0, 24*365, 0)
 	c.AutoRetrieve.Weight = clampInt(c.AutoRetrieve.Weight, 0, 5, 3)
 	c.Jobs.ImportWorkers = clampInt(c.Jobs.ImportWorkers, 1, 32, 5)

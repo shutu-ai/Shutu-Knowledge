@@ -2201,30 +2201,55 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		return "", nil
 	}
 	modelKey := embedder.ModelKey()
+	// Vectors carried into the staged generation by putChunksReplace are
+	// already materialized; querying and rewriting them again can turn a large
+	// reindex into tens of thousands of expensive hash-scoped updates.
+	type pendingVector struct {
+		id, hash, text string
+	}
 	hashes := make([]string, 0, len(rows))
-	textByHash := map[string]string{}
+	pending := make([]pendingVector, 0, len(rows))
 	for _, row := range rows {
+		if len(row.StageEmbedding) > 0 && row.StageEmbeddingModel == modelKey {
+			continue
+		}
 		hashes = append(hashes, row.EmbeddingHash)
-		textByHash[row.EmbeddingHash] = row.EmbeddingText
+		pending = append(pending, pendingVector{id: row.ID, hash: row.EmbeddingHash, text: row.EmbeddingText})
 	}
 	reuse, err := s.store.ListEmbeddingVectorsByHashesContext(ctx, hashes, modelKey)
 	if err != nil {
 		return ErrEmbeddingProvider, err
 	}
-	var pendingHashes []string
-	reusedForDocument := map[string][]float64{}
-	for _, hash := range hashes {
-		if vector, ok := reuse[hash]; ok {
+	reusedByID := make(map[string][]float64, len(reuse))
+	stillPending := pending[:0]
+	for _, item := range pending {
+		if vector, ok := reuse[item.hash]; ok {
 			// Hash reuse is library-wide, but the vector still has to be
 			// materialized on this document before vector search can see it.
-			reusedForDocument[hash] = vector
+			reusedByID[item.id] = vector
 		} else {
-			pendingHashes = append(pendingHashes, hash)
+			stillPending = append(stillPending, item)
 		}
 	}
-	if len(reusedForDocument) > 0 {
-		if err := s.store.PutChunkVectorsContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, reusedForDocument); err != nil {
-			return ErrEmbeddingProvider, err
+	pending = stillPending
+	if len(reusedByID) > 0 {
+		// Group library-wide reuse into bounded primary-key transactions. This
+		// avoids both per-row hash scans and one oversized transaction for a
+		// large document.
+		reuseIDs := make([]string, 0, len(reusedByID))
+		for id := range reusedByID {
+			reuseIDs = append(reuseIDs, id)
+		}
+		const vectorWriteBatch = 500
+		for start := 0; start < len(reuseIDs); start += vectorWriteBatch {
+			end := minInt(start+vectorWriteBatch, len(reuseIDs))
+			batch := make(map[string][]float64, end-start)
+			for _, id := range reuseIDs[start:end] {
+				batch[id] = reusedByID[id]
+			}
+			if err := s.store.PutChunkVectorsByIDContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, batch); err != nil {
+				return ErrEmbeddingProvider, err
+			}
 		}
 	}
 	dimension := 0
@@ -2240,12 +2265,12 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		doc.UpdatedAt = now()
 		_ = s.store.putDocumentContext(ctx, *doc)
 	}
-	for start := 0; start < len(pendingHashes); start += batchSize {
-		end := minInt(start+batchSize, len(pendingHashes))
-		batch := pendingHashes[start:end]
+	for start := 0; start < len(pending); start += batchSize {
+		end := minInt(start+batchSize, len(pending))
+		batch := pending[start:end]
 		texts := make([]string, 0, len(batch))
-		for _, hash := range batch {
-			texts = append(texts, textByHash[hash])
+		for _, item := range batch {
+			texts = append(texts, item.text)
 		}
 		vectors, err := embedder.Embed(ctx, texts)
 		if err != nil {
@@ -2260,14 +2285,14 @@ func (s *Service) embedChunks(ctx context.Context, doc *Document, rows []Chunk, 
 		if dimension == 0 {
 			dimension = len(vectors[0])
 		}
-		byHash := map[string][]float64{}
+		byID := make(map[string][]float64, len(vectors))
 		for i, vector := range vectors {
 			if len(vector) != dimension {
 				return ErrDimensionMismatch, fmt.Errorf("vector width %d differs from stored %d", len(vector), dimension)
 			}
-			byHash[batch[i]] = vector
+			byID[batch[i].id] = vector
 		}
-		if err := s.store.PutChunkVectorsContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, byHash); err != nil {
+		if err := s.store.PutChunkVectorsByIDContext(ctx, doc.ID, rows[0].IndexGeneration, modelKey, byID); err != nil {
 			return ErrEmbeddingProvider, err
 		}
 		report()

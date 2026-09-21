@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1241,6 +1242,7 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 
 	var generation int64
 	var expectedEpoch int64
+	var activeGeneration int64
 	carried := map[string][2]any{}
 	err := s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
 		current, err := documentFenceTx(tx, docID, 0)
@@ -1251,18 +1253,7 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 			return ErrConflict
 		}
 		expectedEpoch = current.MutationEpoch
-		// A failed or abandoned attempt can leave an unpublished generation after
-		// the authoritative active generation. Remove it before allocating the
-		// same generation number again; active and retired-but-cited rows remain.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks
-		WHERE doc_id = ? AND index_generation > ?`, docID, current.ActiveIndexGen); err != nil {
-			return err
-		}
-		for _, table := range []string{"document_nodes", "document_relationships", "chunk_node_links", "document_parse_metadata"} {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE doc_id = ? AND index_generation > ?`, docID, current.ActiveIndexGen); err != nil {
-				return err
-			}
-		}
+		activeGeneration = current.ActiveIndexGen
 		// Carry over stored vectors whose embedding-text hash survives the
 		// re-chunk and whose model identity equals the target space. Hash equality
 		// alone would let model A vectors enter a model B generation.
@@ -1321,6 +1312,13 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 		return nil
 	})
 	if err != nil {
+		return 0, err
+	}
+	// A failed or abandoned attempt can leave a large unpublished generation.
+	// Clean it in bounded transactions; the old single control transaction
+	// could exceed its budget before deleting hundreds of thousands of rows.
+	if err := s.clearStagedGenerationsAfter(ctx, docID, activeGeneration); err != nil {
+		_ = s.clearStagedGeneration(context.Background(), docID, expectedEpoch, generation)
 		return 0, err
 	}
 	const irNodeBatchSize = 50000
@@ -1429,32 +1427,69 @@ func (s *store) putChunksReplace(ctx context.Context, chunks []Chunk, targetMode
 	return generation, nil
 }
 
-func (s *store) clearStagedGeneration(ctx context.Context, docID string, expectedEpoch, generation int64) error {
-	const batchSize = 256
-	for {
-		var affected int64
-		err := s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
-			result, err := tx.Exec(`DELETE FROM chunks WHERE rowid IN (
-				SELECT rowid FROM chunks WHERE doc_id = ? AND index_generation = ? LIMIT ?
-			)`, docID, generation, batchSize)
+func (s *store) clearStagedGenerationsAfter(ctx context.Context, docID string, activeGeneration int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var generations []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(group_concat(distinct_generation), '') FROM (
+		SELECT DISTINCT index_generation AS distinct_generation FROM chunks
+		WHERE doc_id = ? AND index_generation > ?
+		UNION
+		SELECT DISTINCT index_generation FROM document_nodes
+		WHERE doc_id = ? AND index_generation > ?
+	)`, docID, activeGeneration, docID, activeGeneration).Scan(&generations); err != nil {
+		return err
+	}
+	if len(generations) > 0 {
+		for _, part := range strings.Split(string(generations), ",") {
+			generation, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
 			if err != nil {
 				return err
 			}
-			affected, err = result.RowsAffected()
-			return err
-		})
-		if err != nil || affected < batchSize {
-			if err != nil {
+			if err := s.clearGenerationData(ctx, docID, generation); err != nil {
 				return err
 			}
-			for _, table := range []string{"chunk_node_links", "document_relationships", "document_nodes", "document_parse_metadata"} {
-				if _, cleanupErr := s.db.ExecPriority(ctx, storage.ControlWrite,
-					`DELETE FROM `+table+` WHERE doc_id = ? AND index_generation = ?`, docID, generation); cleanupErr != nil {
-					return cleanupErr
-				}
-			}
-			break
 		}
+	}
+	return nil
+}
+
+func (s *store) clearGenerationData(ctx context.Context, docID string, generation int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	const batchSize = 5000
+	// Children first so an interrupted cleanup never leaves links for deleted
+	// chunks. Each table is drained independently in bounded transactions.
+	for _, table := range []string{"chunk_node_links", "document_nodes", "document_relationships", "document_parse_metadata", "chunks"} {
+		for {
+			var affected int64
+			err := s.db.WriteTx(ctx, storage.NormalWrite, nil, func(tx *sql.Tx) error {
+				result, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE rowid IN (
+					SELECT rowid FROM `+table+`
+					WHERE doc_id = ? AND index_generation = ? LIMIT ?
+				)`, docID, generation, batchSize)
+				if err != nil {
+					return err
+				}
+				affected, err = result.RowsAffected()
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			if affected < batchSize {
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (s *store) clearStagedGeneration(ctx context.Context, docID string, expectedEpoch, generation int64) error {
+	if err := s.clearGenerationData(ctx, docID, generation); err != nil {
+		return err
 	}
 	return s.db.WriteTx(ctx, storage.ControlWrite, nil, func(tx *sql.Tx) error {
 		result, err := tx.Exec(`UPDATE documents SET desired_index_generation = NULL,

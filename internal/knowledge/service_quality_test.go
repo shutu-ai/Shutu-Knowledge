@@ -216,6 +216,22 @@ func TestTrueScannedPDFUsesOCRWithQuality(t *testing.T) {
 	}
 }
 
+func TestNonPDFNativeExtractionIsHealthy(t *testing.T) {
+	f := newFixture(t)
+	_ = f.createBase(t)
+	doc := &Document{FileName: "financial.xlsx"}
+	text, _, err := f.service.parseFileContent(context.Background(), doc, BaseConfig{}, goldenXLSX(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(text) == "" {
+		t.Fatal("empty native text")
+	}
+	if doc.QualityStatus != QualityGood {
+		t.Fatalf("quality status = %q, warnings=%v, want %s", doc.QualityStatus, doc.QualityWarnings, QualityGood)
+	}
+}
+
 // Section 25: the silent catastrophic loss detector. 3,285 pages with 2,740
 // characters must never classify as GOOD.
 func TestCatastrophicLossDetector(t *testing.T) {

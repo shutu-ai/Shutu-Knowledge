@@ -1669,7 +1669,7 @@ func (s *Service) parseFileContent(ctx context.Context, doc *Document, cfg BaseC
 		doc.IR = parsed.IR
 	}
 	// Native extraction diagnostics feed the persisted quality model.
-	var nativeHealthy bool
+	nativeHealthy := nativeAvailable
 	if parsed.PDFQuality != nil {
 		nativeHealthy = parsed.PDFQuality.Healthy()
 		doc.PagesTotal = parsed.PDFQuality.Pages

@@ -90,6 +90,20 @@ Mix: 50 exact lookup, 30 semantic reverse, 30 cross-workbook, 20 analysis, 20 jo
 
 The evaluator recorded candidate join evidence for only **3 / 20** join queries in every mode. It found no unsupported join claims because the QA harness did not generate join assertions.
 
+## Synthetic scale matrix
+
+A separate isolated base used mixed-length synthetic text, the same local MiniLM model, batch 16, and four ONNX threads. It confirmed the operating point before the real-corpus run. The smallest phase used 50 chunks because the bulk document builder emits 50-chunk units; 100/1,000 points are covered by cumulative 50- and 800-chunk runs.
+
+| Chunks | Wall time | Throughput | Peak aggregate RSS | Mean server+helper CPU |
+|---:|---:|---:|---:|---:|
+| 50 | 1.56 s (three warm docs) | 32.1 chunks/s | 1.12 GB | 325.6% |
+| 800 | 24.93 s | 32.1 chunks/s | 1.12 GB | ~325% |
+| 2,000 | 42.90 s | 46.6 chunks/s | 1.12 GB | 325.6% |
+| 10,000 | 151.82 s | 52.7 chunks/s | 1.10 GB | 398.7% |
+| 50,000 | 823.17 s | 48.6 chunks/s | 1.12 GB | 398.6% |
+
+No failures occurred. CPU saturated near four intra-op threads rather than the prior runaway level, and RSS stayed approximately flat from 2,000 to 50,000 chunks.
+
 ## Repeated-run and background contention evidence
 
 Three consecutive representative hybrid+reranker runs (20 mixed exact, semantic, cross-workbook, analysis, and join queries per run) all passed. Every eligible search applied the reranker. Run 1 includes cold helper startup; steady-state run 2/run 3 working sets were effectively flat.

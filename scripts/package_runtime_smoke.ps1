@@ -120,11 +120,11 @@ server:
   addr: 127.0.0.1:$port
 embedding:
   provider: local
-  model: onnx-community/Qwen3-Embedding-0.6B-ONNX
+  model: Xenova/all-MiniLM-L6-v2@751bff37182d3f1213fa05d7196b954e230abad9
   batch: 4
 rerank:
   enabled: false
-  model: local:Xenova/bge-reranker-base
+  model: local:Xenova/bge-reranker-base@280bcc27a84e0b898c251e06fddb25171bd9b101
 retrieval:
   mode: vector
   topK: 10

@@ -22,16 +22,16 @@
     "models": [
       {
         "component": "embedding",
-        "model": "onnx-community/Qwen3-Embedding-0.6B-ONNX",
-        "revision": "c25a394dd583836952667c12f008335071b3f43d",
+        "model": "Xenova/all-MiniLM-L6-v2",
+        "revision": "751bff37182d3f1213fa05d7196b954e230abad9",
         "runtime": "transformers.js/onnxruntime-node",
-        "dimension": 1024,
+        "dimension": 384,
         "license": "upstream model terms",
         "files": {
-          "config.json": "66a10929782f3c9a3cd5dec90e2a95c60e05736134a63cd54479eeae80bed175",
-          "tokenizer_config.json": "977648852447cb6587327ff3205b0a84cf2fc9f05621d6c8e88a497caafab2e1",
-          "tokenizer.json": "def76fb086971c7867b829c23a26261e38d9d74e02139253b38aeb9df8b4b50a",
-          "onnx/model_q4.onnx": "8be554b37368134c3f38613c6f6ad0b7bb5f3a6465ab87574dbc0dcf24daa428"
+          "config.json": "7135149f7cffa1a573466c6e4d8423ed73b62fd2332c575bf738a0d033f70df7",
+          "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+          "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+          "onnx/model_q4.onnx": "ac0f989345605769651a18bb796fda6235d921a37bd4ac065cb51781da44d079"
         }
       },
       {
@@ -44,7 +44,7 @@
           "config.json": "b6575b9d5be20d6747417c8e20c5a0db1636356e0b6d422d7244c628423c4d4c",
           "tokenizer_config.json": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
           "tokenizer.json": "48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c",
-          "onnx/model.onnx": "15b9a8c3da82eddf263df571281166e00e9308fe19d077084b642ebfcaf06d2b"
+          "onnx/model_q4.onnx": "d17d795bad1d16cc75c5ff8949192da41b61e203188f923ce157eeacd7222e5f"
         }
       }
     ],

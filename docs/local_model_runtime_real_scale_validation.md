@@ -5,10 +5,9 @@ Scope: local embedding and reranker runtime on the 50-workbook SmartCare data-di
 
 ## Executive result
 
-**Runtime gate: substantially improved and able to complete full-corpus indexing and reranking.
-Overall validation classification: WEAK.**
+**Runtime release gate: PASS. Structured Excel data-model validation classification: WEAK.**
 
-The prior Qwen3-0.6B path could not complete real-scale work without extreme CPU/memory pressure. A much smaller pinned embedding model, bounded ONNX threading, primary-key vector persistence, top-K vector reads, a quantized reranker, and a top-K rerank window allow the full corpus to complete and search to run. However, semantic reverse lookup, cross-workbook discovery, analysis, and join reasoning remain weak. The release is therefore not classified ACCEPTABLE or STRONG and must not be tagged.
+The prior Qwen3-0.6B path could not complete real-scale work without extreme CPU/memory pressure. A much smaller pinned embedding model, bounded ONNX threading, primary-key vector persistence, top-K vector reads, a quantized reranker, and a top-K rerank window allow the full corpus to complete and search to run. Semantic reverse lookup, cross-workbook discovery, analysis, and join reasoning remain weak. That semantic result blocks 0.7 promotion but does not invalidate this separately scoped runtime maintenance release.
 
 ## Final model configuration
 
@@ -143,4 +142,4 @@ A separate contention test started a full largest-document reindex and issued 20
 
 ## Conclusion
 
-The original runtime blocker no longer prevents full-corpus completion: local embedding and reranking are now bounded enough to complete and benchmark at the real scale. But the completed QA demonstrates that structured Excel retrieval is still not robust data-model knowledge. Final classification remains **WEAK**; do not tag or release v0.6.3.
+The original runtime blocker no longer prevents full-corpus completion: local embedding and reranking are now bounded enough to complete and benchmark at the real scale. But the completed QA demonstrates that structured Excel retrieval is still not robust data-model knowledge. Structured data-model classification remains **WEAK**; do not promote 0.7. The separately scoped v0.6.3 runtime maintenance gate is **PASS**.

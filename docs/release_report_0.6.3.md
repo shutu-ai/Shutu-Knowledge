@@ -2,7 +2,7 @@
 
 Type: MAINTENANCE RELEASE (local embedding / reranker runtime stability).
 Baseline: v0.6.2 (`1ae78de38593a0d7db58a7c2b6846fdd2a607544`).
-Candidate source: `1636e5bd45eda6e647bbc7b741576d8489eb88a3`.
+Candidate source: `4699a697674020ce5e90b69523a764917cb8bf55`. The candidate adds only packaged runtime-model metadata/package-smoke alignment after the runtime audit.
 
 ## Scope audit
 
@@ -53,16 +53,28 @@ runtime release claim and does not justify 0.7 promotion.
 
 | Gate | Result |
 | --- | --- |
-| Build (`go build ./...`) | pending |
-| `go vet ./...` | pending |
-| `go test ./...` | pending |
-| Race (`go test -race ./...`) | pending |
+| Build (`go build ./...`) | PASS |
+| `go vet ./...` | PASS |
+| `go test ./...` | PASS |
+| Race (`go test -race ./...`) | PASS |
 | Web typecheck/tests/build | pending |
 | Browser E2E | pending |
-| Windows package smoke | pending |
-| Push CI | pending |
+| Windows package smoke | PASS |
+| Push CI | pending (run started after this candidate commit) |
 
 ## Release provenance
 
 To be completed after tag CI, artifact publication, and post-download hash
 verification.
+
+## Pre-tag local candidate evidence
+
+- Final candidate: `4699a697674020ce5e90b69523a764917cb8bf55`
+- Formal package smoke: PASS (text + OCR fixtures, semantic retrieval,
+  runtime status)
+- Package offline restart: PASS
+- Pre-CI package size: 12,712,015 bytes
+- Pre-CI package SHA-256: `e2ca5a63d38fc75d9470a7eeaa52f8cad09904e4d9f62530d14795340f7aeb6f`
+- Managed runtime direct smoke: PASS (embedding + reranker + PDF/OCR)
+- Managed runtime offline restart: PASS
+- Native host lifecycle acceptance: PASS

@@ -162,8 +162,8 @@ func TestCrossProcessHistoricalReaderSurvivesGenerationGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(string(pinnedCount)) != strconv.Itoa(chunksPerDoc) {
-		t.Fatalf("cross-process reader pinned %s chunks, want %d",
-			string(pinnedCount), chunksPerDoc)
+		t.Fatalf("cross-process reader pinned %q (%d bytes), want %d",
+			string(pinnedCount), len(pinnedCount), chunksPerDoc)
 	}
 
 	expired := now() - retiredGenerationRetentionMS - 1
@@ -288,8 +288,8 @@ func runCrossReaderChild(t *testing.T) error {
 		return fmt.Errorf("child pinned invalid generation view: count=%d first=%+v",
 			len(pinned), pinned[0])
 	}
-	if err := os.WriteFile(filepath.Join(workspace, "pinned"),
-		[]byte(strconv.Itoa(len(pinned))), 0o600); err != nil {
+	if err := writeCrossReaderMarker(filepath.Join(workspace, "pinned"),
+		[]byte(strconv.Itoa(len(pinned)))); err != nil {
 		return err
 	}
 
@@ -348,6 +348,30 @@ func runCrossReaderChild(t *testing.T) error {
 			oldChunks, oldMappings, activeChunks)
 	}
 	return os.WriteFile(filepath.Join(workspace, "reader-done"), []byte("1"), 0o600)
+}
+
+func writeCrossReaderMarker(path string, content []byte) error {
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer func() { _ = os.Remove(tempName) }()
+	if _, err := temp.Write(content); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	return nil
 }
 
 func waitForHistoricalReaderFile(t *testing.T, path string) {

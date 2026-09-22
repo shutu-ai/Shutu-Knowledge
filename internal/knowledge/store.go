@@ -1575,27 +1575,10 @@ func (s *store) pruneRetiredGenerationsWithContext(ctx context.Context, docID st
 	// Live search requests hold their WAL snapshot. This bounded grace also
 	// gives a caller time to issue a continuation for a prior generation;
 	// after expiry the explicit request receives evidence-expired rather than
-	// silently reading a newer version.
-	for {
-		var affected int64
-		err := s.db.WriteTx(ctx, storage.MaintenanceWrite, nil, func(tx *sql.Tx) error {
-			result, err := tx.Exec(`DELETE FROM chunks WHERE rowid IN (
-			SELECT rowid FROM chunks
-			WHERE doc_id = ? AND index_generation < ? AND created_at < ? LIMIT ?
-		)`, docID, activeGeneration, cutoff, batchSize)
-			if err != nil {
-				return err
-			}
-			affected, err = result.RowsAffected()
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-		if affected < batchSize {
-			break
-		}
-	}
+	// silently reading a newer version. Retire the durable mapping before
+	// removing chunks: any read transaction that started first retains the
+	// complete generation in its WAL snapshot, while every later transaction
+	// fails closed on the missing mapping instead of seeing a partial view.
 	rows, err := s.db.QueryContext(ctx, `SELECT COALESCE(raw_file_path, '') FROM document_generations
 		WHERE doc_id = ? AND index_generation < ? AND created_at < ?`,
 		docID, activeGeneration, cutoff)
@@ -1620,6 +1603,26 @@ func (s *store) pruneRetiredGenerationsWithContext(ctx context.Context, docID st
 		WHERE doc_id = ? AND index_generation < ? AND created_at < ?`,
 		docID, activeGeneration, cutoff); err != nil {
 		return nil, err
+	}
+	for {
+		var affected int64
+		err := s.db.WriteTx(ctx, storage.MaintenanceWrite, nil, func(tx *sql.Tx) error {
+			result, err := tx.Exec(`DELETE FROM chunks WHERE rowid IN (
+			SELECT rowid FROM chunks
+			WHERE doc_id = ? AND index_generation < ? AND created_at < ? LIMIT ?
+		)`, docID, activeGeneration, cutoff, batchSize)
+			if err != nil {
+				return err
+			}
+			affected, err = result.RowsAffected()
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		if affected < batchSize {
+			break
+		}
 	}
 	return rawPaths, nil
 }

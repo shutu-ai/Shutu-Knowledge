@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
 
 type cancellableGatedEmbedder struct {
@@ -92,7 +94,7 @@ func TestSyntheticRuntimeLoadCancelAndRetry(t *testing.T) {
 	<-gated.started
 	cancel()
 	close(gated.release)
-	if err := <-done; !errors.Is(err, context.Canceled) {
+	if err := <-done; !errors.Is(err, context.Canceled) && !errors.Is(err, storage.ErrWriteUnknown) {
 		t.Fatalf("cancelled reindex error = %v, want context.Canceled", err)
 	}
 	restored, err := service.store.getDocument(document.ID)

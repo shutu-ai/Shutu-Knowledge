@@ -111,7 +111,7 @@ func (s *Store) ReplaceDocumentModel(ctx context.Context, input DocumentInput, m
 			return nil
 		}
 		for _, table := range model.Tables {
-			aliases, signals, fieldIDs, scopeJSON, sourceJSON, err := tableJSON(table)
+			aliases, fieldIDs, scopeJSON, sourceJSON, signals, err := tableJSON(table)
 			if err != nil {
 				return err
 			}

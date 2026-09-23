@@ -265,6 +265,7 @@ func compileRegion(model *Model, input DocumentInput, region schemaRegion) {
 		Description:     region.Description,
 		BusinessPurpose: region.Purpose, PurposeEvidence: region.PurposeEvidence, PurposeInferred: region.PurposeInferred,
 	}
+	seenIdentities := make(map[string]string)
 	for _, row := range region.DataRows {
 		values := splitRowValues(row.Text)
 		if isSchemaHeaderValues(values) {
@@ -278,6 +279,15 @@ func compileRegion(model *Model, input DocumentInput, region schemaRegion) {
 		if field.ID == "" {
 			continue
 		}
+		identity := field.Identity()
+		fingerprint := fieldRepresentation(field)
+		if previous, exists := seenIdentities[identity]; exists {
+			if previous != fingerprint {
+				model.Diagnostics = append(model.Diagnostics, Diagnostic{Code: "SD6", Severity: "warning", Message: "duplicate scoped field name with different definition skipped; no false merge", Source: field.Source})
+			}
+			continue
+		}
+		seenIdentities[identity] = fingerprint
 		model.Fields = append(model.Fields, field)
 		table.FieldIDs = append(table.FieldIDs, field.ID)
 		if field.Enum != nil {
@@ -304,7 +314,7 @@ func compileField(model *Model, input DocumentInput, table LogicalTable, columns
 	name := get("field")
 	display := name
 	scope := table.Scope
-	fieldIdentity := strings.Join([]string{input.DocumentID, table.RegionAnchor, table.Name, name}, "\x00")
+	fieldIdentity := strings.Join([]string{input.DocumentID, table.RegionAnchor, table.ID, table.Name, name}, "\x00")
 	fieldID := EntityID("schfield", input.BaseID, input.Generation, fieldIdentity)
 	granularity := RangeProvenance
 	if row.Range == "" {
@@ -642,4 +652,3 @@ func buildConcepts(model *Model) {
 	}
 	_ = fmt.Sprint
 }
-

@@ -9,7 +9,7 @@ import (
 // SearchSchema activates generic schema entities independently of evidence
 // chunks. It is the stable facade used by the HTTP and Extension API layers.
 func (s *Service) SearchSchema(ctx context.Context, baseID, query string, topK int) (schemamodel.SchemaSearchResponse, error) {
-	models, err := schemamodel.NewStore(s.store.db).ActiveModels(ctx, baseID)
+	models, err := s.activeSchemaModels(ctx, baseID)
 	if err != nil {
 		return schemamodel.SchemaSearchResponse{}, err
 	}
@@ -19,7 +19,7 @@ func (s *Service) SearchSchema(ctx context.Context, baseID, query string, topK i
 // ResolveDataRequirement resolves business language to schema candidates and
 // explicitly stops before SQL generation.
 func (s *Service) ResolveDataRequirement(ctx context.Context, baseID, query string, maxPerConcept, maxTables int) (schemamodel.ResolvedRequirement, error) {
-	models, err := schemamodel.NewStore(s.store.db).ActiveModels(ctx, baseID)
+	models, err := s.activeSchemaModels(ctx, baseID)
 	if err != nil {
 		return schemamodel.ResolvedRequirement{}, err
 	}
@@ -28,7 +28,7 @@ func (s *Service) ResolveDataRequirement(ctx context.Context, baseID, query stri
 
 // GetSchemaTable returns one logical table and its owned fields.
 func (s *Service) GetSchemaTable(ctx context.Context, baseID, tableID string) (schemamodel.LogicalTable, []schemamodel.Field, error) {
-	models, err := schemamodel.NewStore(s.store.db).ActiveModels(ctx, baseID)
+	models, err := s.activeSchemaModels(ctx, baseID)
 	if err != nil {
 		return schemamodel.LogicalTable{}, nil, err
 	}
@@ -42,7 +42,7 @@ func (s *Service) GetSchemaTable(ctx context.Context, baseID, tableID string) (s
 
 // GetSchemaField returns one scoped field; field ID is never just a name.
 func (s *Service) GetSchemaField(ctx context.Context, baseID, fieldID string) (schemamodel.Field, error) {
-	models, err := schemamodel.NewStore(s.store.db).ActiveModels(ctx, baseID)
+	models, err := s.activeSchemaModels(ctx, baseID)
 	if err != nil {
 		return schemamodel.Field{}, err
 	}

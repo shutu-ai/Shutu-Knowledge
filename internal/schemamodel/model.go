@@ -184,7 +184,7 @@ type Diagnostic struct {
 
 // Identity returns the required composite field identity.
 func (f Field) Identity() string {
-	return strings.Join([]string{f.Scope.Key(), normalizeIdentity(f.TableName), normalizeIdentity(f.Name)}, "\x00")
+	return strings.Join([]string{f.Scope.Key(), f.TableID, normalizeIdentity(f.Name)}, "\x00")
 }
 
 // TableIdentity returns the normalized logical-table identity.

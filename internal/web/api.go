@@ -57,6 +57,7 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /api/documents/{id}/understanding", s.documentUnderstanding)
 	mux.HandleFunc("GET /api/documents/{id}/raw", s.rawDocument)
 	mux.HandleFunc("POST /api/documents/{id}/reindex", s.reindexOne)
+	mux.HandleFunc("POST /api/documents/{id}/schema/compile", s.compileDocumentSchema)
 	mux.HandleFunc("GET /api/jobs/{id}", s.jobStatus)
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.jobCancel)
 	mux.HandleFunc("GET /api/groups", s.listGroups)

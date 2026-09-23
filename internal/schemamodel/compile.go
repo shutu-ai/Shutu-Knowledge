@@ -13,6 +13,7 @@ type SourceRow struct {
 	NodeID string
 	Text   string
 	Range  string
+	Sheet  string
 }
 
 // DocumentInput scopes one spreadsheet document for schema compilation.
@@ -62,9 +63,53 @@ type schemaRegion struct {
 
 // CompileDocument detects schema regions and compiles a generic schema model.
 // Low-confidence non-dictionary tables produce an empty model and false
-// Detected; they remain on the ordinary Excel path.
+// Detected; they remain on the ordinary Excel path. Rows from multiple sheets
+// are compiled in separate scopes so equal region anchors never collide.
 func CompileDocument(input DocumentInput) (Model, bool) {
-	model := Model{BaseID: input.BaseID, Generation: input.Generation}
+	groups, order := groupRowsBySheet(input.Rows)
+	if len(groups) == 0 {
+		return Model{BaseID: input.BaseID, DocumentID: input.DocumentID, Generation: input.Generation}, false
+	}
+	combined := Model{BaseID: input.BaseID, DocumentID: input.DocumentID, Generation: input.Generation}
+	detected := false
+	for _, sheet := range order {
+		sheetInput := input
+		sheetInput.SheetName = sheet
+		sheetInput.Rows = groups[sheet]
+		model, sheetDetected := compileDocumentRows(sheetInput)
+		detected = detected || sheetDetected
+		combined.Tables = append(combined.Tables, model.Tables...)
+		combined.Fields = append(combined.Fields, model.Fields...)
+		combined.Enums = append(combined.Enums, model.Enums...)
+		combined.Concepts = append(combined.Concepts, model.Concepts...)
+		combined.KeyCandidates = append(combined.KeyCandidates, model.KeyCandidates...)
+		combined.Diagnostics = append(combined.Diagnostics, model.Diagnostics...)
+	}
+	buildConcepts(&combined)
+	combined.SortCanonical()
+	return combined, detected
+}
+
+func groupRowsBySheet(rows []SourceRow) (map[string][]SourceRow, []string) {
+	groups := make(map[string][]SourceRow)
+	var order []string
+	seen := make(map[string]bool)
+	for _, row := range rows {
+		sheet := NormalizeText(row.Sheet)
+		if sheet == "" {
+			sheet = "Sheet"
+		}
+		if !seen[sheet] {
+			seen[sheet] = true
+			order = append(order, sheet)
+		}
+		groups[sheet] = append(groups[sheet], row)
+	}
+	return groups, order
+}
+
+func compileDocumentRows(input DocumentInput) (Model, bool) {
+	model := Model{BaseID: input.BaseID, DocumentID: input.DocumentID, Generation: input.Generation}
 	regions := detectSchemaRegions(input.Rows)
 	if len(regions) == 0 {
 		return model, false
@@ -578,10 +623,10 @@ func buildConcepts(model *Model) {
 	builders := make(map[string]*conceptBuilder)
 	for _, field := range model.Fields {
 		for _, name := range field.Concepts {
-			id := EntityID("schcon", model.BaseID, model.Generation, "concept:"+name)
+			id := EntityID("schcon", model.BaseID, model.Generation, model.DocumentID+"\x00concept:"+name)
 			builder, ok := builders[id]
 			if !ok {
-				builder = &conceptBuilder{concept: BusinessConcept{ID: id, BaseID: model.BaseID, Generation: model.Generation, Name: name, Confidence: 0.62}}
+				builder = &conceptBuilder{concept: BusinessConcept{ID: id, BaseID: model.BaseID, DocumentID: model.DocumentID, Generation: model.Generation, Name: name, Confidence: 0.62}}
 				builders[id] = builder
 			}
 			builder.concept.FieldIDs = append(builder.concept.FieldIDs, field.ID)
@@ -597,3 +642,4 @@ func buildConcepts(model *Model) {
 	}
 	_ = fmt.Sprint
 }
+

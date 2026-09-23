@@ -181,7 +181,7 @@ func TestStorageFormatRejectsIncompatibleDatabase(t *testing.T) {
 	t.Run("future writer", func(t *testing.T) {
 		db := openTestDB(t)
 		path := db.Path()
-		if _, err := db.Exec(`UPDATE storage_format SET min_writer_version = 9 WHERE id = 1`); err != nil {
+		if _, err := db.Exec(`UPDATE storage_format SET min_writer_version = 10 WHERE id = 1`); err != nil {
 			t.Fatal(err)
 		}
 		if err := db.Close(); err != nil {
@@ -827,3 +827,4 @@ func TestMaintainSQLOptimizesFTSAndThresholdVacuum(t *testing.T) {
 		t.Fatalf("canceled maintenance error = %v", err)
 	}
 }
+

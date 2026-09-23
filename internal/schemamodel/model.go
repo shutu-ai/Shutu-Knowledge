@@ -151,6 +151,7 @@ type Field struct {
 // ontology and never asserts that similar fields are equivalent.
 type BusinessConcept struct {
 	ID          string      `json:"id"`
+	DocumentID  string      `json:"document_id,omitempty"`
 	BaseID      string      `json:"base_id"`
 	Generation  int64       `json:"generation"`
 	Name        string      `json:"name"`
@@ -163,6 +164,7 @@ type BusinessConcept struct {
 // Model is an immutable schema compilation snapshot.
 type Model struct {
 	BaseID        string            `json:"base_id"`
+	DocumentID    string            `json:"document_id,omitempty"`
 	Generation    int64             `json:"generation"`
 	Tables        []LogicalTable    `json:"tables,omitempty"`
 	Fields        []Field           `json:"fields,omitempty"`
@@ -283,7 +285,7 @@ func (m Model) Validate() error {
 		}
 	}
 	for _, concept := range m.Concepts {
-		if concept.ID == "" || concept.Name == "" || len(concept.FieldIDs) == 0 {
+		if concept.ID == "" || concept.Name == "" || concept.DocumentID == "" || len(concept.FieldIDs) == 0 {
 			return fmt.Errorf("schema concept %q lacks name/fields", concept.ID)
 		}
 		for _, fieldID := range concept.FieldIDs {
@@ -330,6 +332,27 @@ func compactSourceRefs(values []SourceRef) []SourceRef {
 		}
 		out = append(out, value)
 		previous = value
+	}
+	return out
+}
+
+// TableByID returns a copy of the requested logical table.
+func (m Model) TableByID(id string) (LogicalTable, bool) {
+	for _, table := range m.Tables {
+		if table.ID == id {
+			return table, true
+		}
+	}
+	return LogicalTable{}, false
+}
+
+// FieldsByID returns fields owned by one logical table in model order.
+func (m Model) FieldsByID(tableID string) []Field {
+	out := make([]Field, 0)
+	for _, field := range m.Fields {
+		if field.TableID == tableID {
+			out = append(out, field)
+		}
 	}
 	return out
 }

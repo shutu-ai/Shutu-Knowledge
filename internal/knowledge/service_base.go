@@ -24,6 +24,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/rerank"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
 	"github.com/shutu-ai/shutu-knowledge/internal/scheduler"
+	"github.com/shutu-ai/shutu-knowledge/internal/schemamodel"
 	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
 )
@@ -76,6 +77,10 @@ type Service struct {
 	sharedModelAdmission scheduler.Admission
 	metricsMu            sync.Mutex
 	metrics              MetricsSnapshot
+	schemaCacheMu        sync.RWMutex
+	schemaCacheBaseID    string
+	schemaCacheModels    []schemamodel.Model
+	schemaCacheValid     bool
 }
 
 // NewService builds the service over the shared database.

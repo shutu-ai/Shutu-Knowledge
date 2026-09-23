@@ -19,10 +19,10 @@ var migrationFS embed.FS
 // These are compatibility contract versions, not migration counts.
 const (
 	CurrentStorageFormatVersion = 2
-	CurrentStorageReaderVersion = 8
-	CurrentStorageWriterVersion = 8
-	MinStorageReaderVersion     = 8
-	MinStorageWriterVersion     = 8
+	CurrentStorageReaderVersion = 9
+	CurrentStorageWriterVersion = 9
+	MinStorageReaderVersion     = 9
+	MinStorageWriterVersion     = 9
 )
 
 var (
@@ -198,3 +198,5 @@ func validateStorageFormat(db *sql.DB) error {
 	}
 	return nil
 }
+
+

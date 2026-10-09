@@ -1,6 +1,6 @@
 # Agent Integration Architecture
 
-Status: **Phase 1 shared-query implementation substantially complete; MCP adapter not installed yet.**
+Status: **Phase 1 complete; MCP adapter not installed yet.**
 
 ## Layering
 

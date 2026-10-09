@@ -861,7 +861,7 @@ examples/mcp/*
 ## 18. 开发执行顺序清单（Codex 可直接逐项更新）
 
 - [x] G0 本地代码审计、SHA/dirty 记录、既有测试基线、功能差异矩阵。
-- [ ] G1 Agent Query Application 服务统一化，兼容 Evidence/REST/Extension。
+- [x] G1 Agent Query Application 服务统一化，兼容 Evidence/REST/Extension。
 - [ ] G2 Semantic query / explore / expand / temporal / provenance / structured adapter 完整化。
 - [ ] G3 MCP stdio、HTTP、9 tools、Resources、真实协议兼容与 wire E2E。
 - [ ] G4 Portable Agent Skill、references、触发/不触发案例、Codex 安装指南。

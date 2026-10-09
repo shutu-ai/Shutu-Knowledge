@@ -866,7 +866,7 @@ examples/mcp/*
 - [x] G3 MCP stdio、HTTP、9 tools、Resources、真实协议兼容与 wire E2E。
 - [x] G4 Portable Agent Skill、references、触发/不触发案例、Codex 安装指南。
 - [x] G5 安全、权限、升级/回滚、Windows 安装包、跨平台可用性矩阵。
-- [ ] G6 Eval harness、200Q gold set、评分/trace/成本/复现机制。
+- [x] G6 Eval harness、200Q gold set、评分/trace/成本/复现机制。
 - [ ] G7 A/B/C 正式实验、错误诊断、效果优化、独立 holdout 再验收。
 - [ ] G8 基于实测决定是否启用 selective LLM enrichment，给出 D-arm 结果或拒绝理由。
 - [ ] G9 完整 CI、发布门禁、使用文档和 evidence-backed acceptance report。

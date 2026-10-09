@@ -59,15 +59,17 @@ type Diagnostic struct {
 // Request is the shared query shape. Explicit BaseIDs authorize/limit the
 // call; when omitted, the existing enabled Knowledge scope decides the scope.
 type Request struct {
-	Query                 string                `json:"query"`
-	ExtraQueries          []string              `json:"extraQueries,omitempty"`
-	BaseIDs               []string              `json:"baseIds,omitempty"`
-	Generation            Generation            `json:"generation,omitempty"`
-	DocumentVersionPolicy DocumentVersionPolicy `json:"documentVersionPolicy,omitempty"`
-	Mode                  Mode                  `json:"mode,omitempty"`
-	TopK                  int                   `json:"topK,omitempty"`
-	Debug                 bool                  `json:"debug,omitempty"`
-	IncludeStructured     bool                  `json:"includeStructured,omitempty"`
+	Query                 string                  `json:"query"`
+	ExtraQueries          []string                `json:"extraQueries,omitempty"`
+	BaseIDs               []string                `json:"baseIds,omitempty"`
+	Generation            Generation              `json:"generation,omitempty"`
+	DocumentVersionPolicy DocumentVersionPolicy   `json:"documentVersionPolicy,omitempty"`
+	Mode                  Mode                    `json:"mode,omitempty"`
+	EvidenceMode          string                  `json:"evidenceMode,omitempty"`
+	TopK                  int                     `json:"topK,omitempty"`
+	Filter                *knowledge.SearchFilter `json:"filter,omitempty"`
+	Debug                 bool                    `json:"debug,omitempty"`
+	IncludeStructured     bool                    `json:"includeStructured,omitempty"`
 }
 
 // Result is the shared response envelope. Evidence is authoritative; semantic
@@ -269,6 +271,22 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	return out, nil
 }
 
+// ContextForBase preserves the existing single-base Extension contract while
+// routing through the shared application layer. Missing semantic state remains
+// a NotFound error instead of an evidence-only degraded package.
+func (s *Service) ContextForBase(ctx context.Context, baseID, query string, tokenBudget int) (semantic.ContextPackage, error) {
+	result, err := s.Context(ctx, ContextRequest{
+		Query: query, BaseIDs: []string{baseID}, TokenBudget: tokenBudget,
+	})
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	if len(result.Packages) == 1 {
+		return result.Packages[0].Package, nil
+	}
+	return semantic.ContextPackage{}, knowledge.ErrNotFound
+}
+
 // Capabilities returns discovery data and per-base semantic readiness. It is
 // read-only and deliberately does not expose internal base IDs that are not in
 // the enabled scope.
@@ -311,7 +329,7 @@ func (s *Service) Capabilities(ctx context.Context) (Capabilities, error) {
 func (s *Service) searchEvidence(ctx context.Context, request Request, scope []string) (*knowledge.SearchResult, error) {
 	req := knowledge.SearchRequest{
 		Query: request.Query, Queries: request.ExtraQueries, BaseIDs: scope,
-		TopK: request.TopK, Mode: evidenceKnowledgeMode(request.Mode), Debug: request.Debug,
+		TopK: request.TopK, Mode: evidenceKnowledgeMode(request.Mode, request.EvidenceMode), Debug: request.Debug,
 	}
 	// A one-base scope retains the existing BaseID behavior for compatibility.
 	if len(scope) == 1 {
@@ -475,11 +493,16 @@ func normalizeVersionPolicy(policy DocumentVersionPolicy) DocumentVersionPolicy 
 	}
 }
 
-func evidenceKnowledgeMode(mode Mode) string {
-	if mode == ModeHybrid || mode == ModeAuto {
+func evidenceKnowledgeMode(mode Mode, evidenceMode string) string {
+	switch evidenceMode {
+	case "auto", "hybrid", "vector", "lexical":
+		return evidenceMode
+	default:
+		if mode == ModeEvidence {
+			return ""
+		}
 		return "hybrid"
 	}
-	return "hybrid"
 }
 
 func modes() []Mode {

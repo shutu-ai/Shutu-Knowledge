@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/health"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
@@ -532,5 +533,68 @@ func TestKnowledgeCompileContextToolConsumesSemanticMemory(t *testing.T) {
 	}
 	if result.EstimatedTokens > result.TokenBudget {
 		t.Fatalf("semantic context tokens = %d, budget %d", result.EstimatedTokens, result.TokenBudget)
+	}
+}
+
+func TestExtensionSearchAndContextUseSharedQueryApplication(t *testing.T) {
+	application := testApp(t)
+	ctx := context.Background()
+	base, err := application.Knowledge.CreateBase("Shared query contract", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := application.Knowledge.AddTextDocument(ctx, base.ID, "Shared query source",
+		"# Shared query source\n\nThe shared KPI contract keeps evidence citations authoritative.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = document
+
+	shared, err := application.AgentQuery.Search(ctx, agentquery.Request{
+		Query: "KPI", BaseIDs: []string{base.ID},
+		Mode: agentquery.ModeEvidence, EvidenceMode: "lexical", TopK: 10,
+	})
+	if err != nil {
+		t.Fatalf("shared search: %v", err)
+	}
+	call, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name: "knowledge_search", Arguments: map[string]any{"query": "KPI", "topK": 10},
+	})
+	if err != nil || call.Error != "" {
+		t.Fatalf("tool search: call=%#v err=%v", call, err)
+	}
+	tool, ok := call.Value.(searchToolResult)
+	if !ok {
+		t.Fatalf("tool search type = %T", call.Value)
+	}
+	sharedEvidence := *shared.Evidence
+	toolEvidence := tool.SearchResult
+	sharedEvidence.ElapsedMS = 0
+	toolEvidence.ElapsedMS = 0
+	if !reflect.DeepEqual(toolEvidence, sharedEvidence) {
+		t.Fatalf("search contracts diverged:\nshared=%#v\ntool=%#v", sharedEvidence, toolEvidence)
+	}
+
+	if _, err := application.Knowledge.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatal(err)
+	}
+	query := "How is the shared KPI contract used?"
+	sharedContext, err := application.AgentQuery.ContextForBase(ctx, base.ID, query, 2048)
+	if err != nil {
+		t.Fatalf("shared context: %v", err)
+	}
+	contextCall, err := CallTool(ctx, application, extension.ToolCallRequest{
+		Name:      "knowledge_compile_context",
+		Arguments: map[string]any{"baseId": base.ID, "query": query, "tokenBudget": 2048},
+	})
+	if err != nil || contextCall.Error != "" {
+		t.Fatalf("tool context: call=%#v err=%v", contextCall, err)
+	}
+	toolContext, ok := contextCall.Value.(semantic.ContextPackage)
+	if !ok {
+		t.Fatalf("tool context type = %T", contextCall.Value)
+	}
+	if !reflect.DeepEqual(toolContext, sharedContext) {
+		t.Fatal("context contracts diverged")
 	}
 }

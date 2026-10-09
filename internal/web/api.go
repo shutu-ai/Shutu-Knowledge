@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/jobs"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
@@ -442,18 +444,37 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.app.Knowledge.Search(r.Context(), body)
+	// Recall Test owns its replay history. Extension tool and automatic-RAG
+	// searches call the shared application layer directly and are intentionally
+	// excluded.
+	result, err := s.searchThroughAgentQuery(r.Context(), body)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	// Recall Test owns its replay history. Extension tool and automatic-RAG
-	// searches call Knowledge.Search directly and are intentionally excluded.
 	if _, err := s.app.Knowledge.SaveSearchHistoryContext(r.Context(), body, result); err != nil {
 		writeErr(w, err)
 		return
 	}
 	writeOK(w, result)
+}
+
+// searchThroughAgentQuery keeps the Recall Test REST DTO stable while routing
+// execution through the protocol-independent query application.
+func (s *Server) searchThroughAgentQuery(ctx context.Context, body knowledge.SearchRequest) (knowledge.SearchResult, error) {
+	baseIDs := body.BaseIDs
+	if body.BaseID != "" {
+		baseIDs = []string{body.BaseID}
+	}
+	result, err := s.app.AgentQuery.Search(ctx, agentquery.Request{
+		Query: body.Query, ExtraQueries: body.Queries, BaseIDs: baseIDs,
+		Mode: agentquery.ModeEvidence, EvidenceMode: body.Mode,
+		TopK: body.TopK, Filter: body.Filter, Debug: body.Debug,
+	})
+	if err != nil {
+		return knowledge.SearchResult{}, err
+	}
+	return *result.Evidence, nil
 }
 
 func (s *Server) listSearchHistory(w http.ResponseWriter, r *http.Request) {

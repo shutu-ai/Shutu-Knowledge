@@ -55,7 +55,7 @@ func (s *Server) compileKnowledgeContext(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	result, err := s.app.Knowledge.CompileKnowledgeContext(r.Context(), r.PathValue("id"), body.Query, body.TokenBudget)
+	result, err := s.app.AgentQuery.ContextForBase(r.Context(), r.PathValue("id"), body.Query, body.TokenBudget)
 	if err != nil {
 		writeErr(w, err)
 		return

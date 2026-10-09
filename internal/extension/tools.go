@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
@@ -117,9 +118,13 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 				return nil, err
 			}
 		}
-		req := knowledge.SearchRequest{
-			Query: args.Query, Queries: args.ExtraQueries, BaseID: args.BaseID,
-			TopK: args.TopK, Mode: args.Mode,
+		req := agentquery.Request{
+			Query: args.Query, ExtraQueries: args.ExtraQueries,
+			Mode: agentquery.ModeEvidence, EvidenceMode: args.Mode,
+			TopK: args.TopK,
+		}
+		if args.BaseID != "" {
+			req.BaseIDs = []string{args.BaseID}
 		}
 		if args.DocIDs != nil || args.TitleIncludes != "" || args.SourceTypes != nil || args.UpdatedAfter != 0 || args.UpdatedBefore != 0 || args.Pages != nil || args.Slides != nil || args.Sheets != nil || args.NodeTypes != nil {
 			req.Filter = &knowledge.SearchFilter{
@@ -128,11 +133,11 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 				Structure: &knowledge.StructureFilter{Pages: args.Pages, Slides: args.Slides, Sheets: args.Sheets, NodeTypes: args.NodeTypes},
 			}
 		}
-		result, err := service.Search(ctx, req)
+		result, err := application.AgentQuery.Search(ctx, req)
 		if err != nil {
 			return nil, err
 		}
-		return searchToolResult{SearchResult: result, Citations: citations(result.Hits)}, nil
+		return searchToolResult{SearchResult: *result.Evidence, Citations: citations(result.Evidence.Hits)}, nil
 
 	case "knowledge_compile_context":
 		var args struct {
@@ -152,7 +157,7 @@ func callTool(ctx context.Context, application *app.App, request extension.ToolC
 		if err := requireEnabledBase(ctx, service, args.BaseID); err != nil {
 			return nil, err
 		}
-		return service.CompileKnowledgeContext(ctx, args.BaseID, args.Query, args.TokenBudget)
+		return application.AgentQuery.ContextForBase(ctx, args.BaseID, args.Query, args.TokenBudget)
 
 	case "knowledge_list_bases":
 		var args struct {

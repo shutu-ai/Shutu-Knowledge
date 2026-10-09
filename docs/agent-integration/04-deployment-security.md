@@ -2,6 +2,21 @@
 
 Status: **Phase 5 hardening implemented; package gates re-runnable per release.**
 
+
+## Release verification record (this cycle)
+- `scripts/package_release.ps1 -Platform windows-amd64` from the clean Phase 5
+  checkout produced `shutu-knowledge-0.7.0-windows-amd64.zip` (14,270,435 bytes,
+  SHA256 `311fa9…d0929`, Git `2cbb742`); the built-in static secret audit passed.
+- The packaged binary was extracted to an empty directory (no dev tree) and
+  verified: `version` reports the matching commit and storage contract;
+  `doctor` reports `status=ready` on a fresh data home; the packaged `mcp`
+  stdio mode answered a real `initialize` JSON-RPC line with the server
+  capabilities and no banner or progress output.
+- The full OCR runtime smoke (`package_runtime_smoke.ps1`) requires the external
+  OCR container image and sample office documents; it remains a release-host
+  gate to run where those artifacts exist.
+- `go test ./... -count=1` passed on the same commit, including the new
+  security tests in `internal/mcp/security_test.go`.
 ## Security baseline (implemented)
 
 | Threat (plan §10.1) | Control | Where |

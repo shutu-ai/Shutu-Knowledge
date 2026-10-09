@@ -47,7 +47,11 @@ func (s *server) registerGraphTools() {
 }
 
 func (s *server) toolExplore(ctx context.Context, req *mcp.CallToolRequest, input exploreInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_explore", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_explore", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
+		if err := checkQueryBounds(input.Query); err != nil {
+			return errorEnvelope(traceID, CodeResourceLimit, err.Error()), nil
+		}
+
 		relationTypes, err := relationTypesFromInput(input.RelationTypes)
 		if err != nil {
 			return errorEnvelope(traceID, CodeInvalidArgument, err.Error()), nil
@@ -74,7 +78,7 @@ func (s *server) toolExplore(ctx context.Context, req *mcp.CallToolRequest, inpu
 }
 
 func (s *server) toolExpand(ctx context.Context, req *mcp.CallToolRequest, input expandInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_expand", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_expand", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
 		if len(input.RootUnitIDs) == 0 {
 			return errorEnvelope(traceID, CodeInvalidArgument, "root_unit_ids is required"), nil
 		}

@@ -34,6 +34,8 @@ const (
 	CodeUnitNotFound       EnvelopeErrorCode = "UNIT_NOT_FOUND"
 	CodeEvidenceUnresolved EnvelopeErrorCode = "EVIDENCE_UNRESOLVED"
 	CodeIndexNotReady      EnvelopeErrorCode = "INDEX_NOT_READY"
+	CodeResourceLimit      EnvelopeErrorCode = "RESOURCE_LIMIT"
+	CodeTimeout            EnvelopeErrorCode = "TIMEOUT"
 	CodeInternal           EnvelopeErrorCode = "INTERNAL_ERROR"
 )
 

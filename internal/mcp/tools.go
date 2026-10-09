@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -58,11 +59,28 @@ func relationTypesFromInput(types []string) ([]semantic.RelationType, error) {
 // the single envelope contract. Application-level errors are returned as
 // IsError results carrying the envelope; only infrastructure failures return
 // a Go error so the SDK maps them onto the transport.
-func runTool[In any](s *server, name string, input In, run func(traceID string) (*Envelope, error)) (*mcp.CallToolResult, any, error) {
+// runTool wraps one tool execution with the request limits (concurrency slot +
+// per-call deadline), a fresh trace id, trace recording, and the single
+// envelope contract. Application-level errors are returned as IsError results
+// carrying the envelope; only infrastructure failures return a Go error.
+func runTool[In any](s *server, name string, ctx context.Context, input In, run func(ctx context.Context, traceID string) (*Envelope, error)) (*mcp.CallToolResult, any, error) {
+	release, err := s.limiter.acquire(ctx)
+	if err != nil {
+		if errors.Is(err, errDeadline) {
+			return errorToolResult(errorEnvelope(newTraceID(), CodeResourceLimit, "too many concurrent tool calls; retry after the current calls finish")), nil, nil
+		}
+		return nil, nil, err
+	}
+	defer release()
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	startedAt := time.Now()
 	traceID := newTraceID()
-	envelope, err := run(traceID)
+	envelope, err := run(callCtx, traceID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errorToolResult(errorEnvelope(traceID, CodeTimeout, "tool call exceeded its deadline; results are partial and no citation in it should be trusted as complete")), nil, nil
+		}
 		return nil, nil, err
 	}
 	record := traceRecord{

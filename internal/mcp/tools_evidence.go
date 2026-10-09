@@ -40,7 +40,7 @@ func (s *server) registerEvidenceTools() {
 }
 
 func (s *server) toolEvidence(ctx context.Context, req *mcp.CallToolRequest, input evidenceInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_evidence", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_evidence", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
 		maxChars := input.MaxChars
 		if maxChars <= 0 {
 			maxChars = 1200
@@ -190,7 +190,10 @@ func (s *server) resolveEvidenceExcerpt(ctx context.Context, scope []string, sou
 }
 
 func (s *server) toolContext(ctx context.Context, req *mcp.CallToolRequest, input contextInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_context", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_context", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
+		if err := checkQueryBounds(input.Query); err != nil {
+			return errorEnvelope(traceID, CodeResourceLimit, err.Error()), nil
+		}
 		result, err := s.agentQuery.Context(ctx, agentquery.ContextRequest{
 			Query: input.Query, BaseIDs: input.BaseIDs,
 			Generation:    generationFromInput(input.Generation),

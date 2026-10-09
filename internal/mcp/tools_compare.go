@@ -28,7 +28,10 @@ func (s *server) registerCompareTools() {
 }
 
 func (s *server) toolCompareVersions(ctx context.Context, req *mcp.CallToolRequest, input compareVersionsInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_compare_versions", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_compare_versions", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
+		if err := checkQueryBounds(input.Query); err != nil {
+			return errorEnvelope(traceID, CodeResourceLimit, err.Error()), nil
+		}
 		from := strings.TrimSpace(input.From)
 		to := strings.TrimSpace(input.To)
 		if from == "" || to == "" {

@@ -16,6 +16,7 @@ type server struct {
 	knowledge  *knowledge.Service
 	agentQuery *agentquery.Service
 	traces     *traceRegistry
+	limiter    *toolLimiter
 }
 
 // Options binds the adapter to one application instance.
@@ -42,6 +43,7 @@ func New(options Options) (*mcp.Server, error) {
 		knowledge:  options.Knowledge,
 		agentQuery: options.AgentQuery,
 		traces:     newTraceRegistry(),
+		limiter:    newToolLimiter(),
 	}
 	s.registerQueryTools()
 	s.registerGraphTools()

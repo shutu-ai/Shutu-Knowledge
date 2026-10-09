@@ -47,7 +47,7 @@ func (s *server) registerQueryTools() {
 }
 
 func (s *server) toolListBases(ctx context.Context, req *mcp.CallToolRequest, input listBasesInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_list_bases", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_list_bases", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
 		capabilities, err := s.agentQuery.Capabilities(ctx)
 		if err != nil {
 			code, message := mapAgentQueryError(err)
@@ -134,7 +134,7 @@ func modeNames(modes []agentquery.Mode) []string {
 }
 
 func (s *server) toolCapabilities(ctx context.Context, req *mcp.CallToolRequest, input capabilitiesInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_capabilities", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_capabilities", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
 		capabilities, err := s.agentQuery.Capabilities(ctx)
 		if err != nil {
 			code, message := mapAgentQueryError(err)
@@ -176,7 +176,10 @@ func (s *server) toolCapabilities(ctx context.Context, req *mcp.CallToolRequest,
 }
 
 func (s *server) toolSearch(ctx context.Context, req *mcp.CallToolRequest, input searchInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_search", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_search", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
+		if err := checkQueryBounds(input.Query); err != nil {
+			return errorEnvelope(traceID, CodeResourceLimit, err.Error()), nil
+		}
 		result, err := s.agentQuery.Search(ctx, agentquery.Request{
 			Query: input.Query, BaseIDs: input.BaseIDs,
 			Mode: agentquery.Mode(input.Mode), EvidenceMode: input.EvidenceMode,

@@ -23,7 +23,7 @@ func (s *server) registerDiagnosticTools() {
 }
 
 func (s *server) toolDiagnostics(ctx context.Context, req *mcp.CallToolRequest, input diagnosticsInput) (*mcp.CallToolResult, any, error) {
-	return runTool(s, "knowledge_diagnostics", input, func(traceID string) (*Envelope, error) {
+	return runTool(s, "knowledge_diagnostics", ctx, input, func(ctx context.Context, traceID string) (*Envelope, error) {
 		if strings.TrimSpace(input.TraceID) != "" {
 			record, ok := s.traces.lookup(strings.TrimSpace(input.TraceID))
 			if !ok {

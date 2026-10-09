@@ -864,7 +864,7 @@ examples/mcp/*
 - [x] G1 Agent Query Application 服务统一化，兼容 Evidence/REST/Extension。
  - [x] G2 Semantic query / explore / expand / temporal / provenance / structured adapter 完整化。
 - [x] G3 MCP stdio、HTTP、9 tools、Resources、真实协议兼容与 wire E2E。
-- [ ] G4 Portable Agent Skill、references、触发/不触发案例、Codex 安装指南。
+- [x] G4 Portable Agent Skill、references、触发/不触发案例、Codex 安装指南。
 - [ ] G5 安全、权限、升级/回滚、Windows 安装包、跨平台可用性矩阵。
 - [ ] G6 Eval harness、200Q gold set、评分/trace/成本/复现机制。
 - [ ] G7 A/B/C 正式实验、错误诊断、效果优化、独立 holdout 再验收。

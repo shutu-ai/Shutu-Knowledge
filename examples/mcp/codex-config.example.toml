@@ -1,0 +1,18 @@
+# Example Codex MCP registration for Shutu-Knowledge.
+# Copy the [mcp_servers.*] block into your project or user config and adjust:
+#   - command: absolute path to the shutu-knowledge binary
+#   - SHUTU_KNOWLEDGE_HOME: the data home holding your indexed knowledge bases
+# Documentation: docs/agent-integration/02-mcp-tools.md
+
+[mcp_servers.shutu-knowledge]
+command = "C:/path/to/shutu-knowledge.exe"
+args = ["mcp"]
+
+[mcp_servers.shutu-knowledge.env]
+SHUTU_KNOWLEDGE_HOME = "C:/path/to/data"
+
+# Streamable HTTP alternative (server started separately with
+# `shutu-knowledge mcp --http 127.0.0.1:7801`):
+#
+# [mcp_servers.shutu-knowledge]
+# url = "http://127.0.0.1:7801"

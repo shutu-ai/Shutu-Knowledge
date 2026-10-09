@@ -6,7 +6,7 @@ const navigation = [
   ["bases", "Knowledge Bases"],
   ["documents", "Documents"],
   ["import", "Import"],
-  ["knowledge", "Knowledge"],
+  ["knowledge", "Semantic Memory"],
   ["recall", "Recall Test"],
   ["models", "Models"],
   ["settings", "Settings"],
@@ -22,6 +22,7 @@ const toastNode = document.getElementById("toast");
 let toastTimer;
 let documentRefreshPromise;
 let documentListRefresh;
+let semanticCompilationBusy = false;
 let routeGeneration = 0;
 let routeAbortController;
 const MAX_IMPORT_FILES = 20;
@@ -87,6 +88,7 @@ async function guard(action, successMessage) {
 
 const selectedBase = () => state.bases.find((base) => base.id === state.selectedBaseId);
 const operationStore = new Map();
+const pendingBaseDeletes = new Set();
 const number = formatNumber;
 const date = formatDate;
 const chip = (value = "unknown") => h("span", { class: `chip ${String(value).toLowerCase().replace(/\s+/g, "-")}` }, localized(value));
@@ -313,12 +315,10 @@ function rememberOperation(operation, label = "") {
       phase: operation.phase || operationPhaseText(operation),
       file: "",
     };
-  } else if (["failed", "cancelled", "interrupted"].includes(operation.state)) {
-    state.documentJobs[operation.operationId] = {
-      label: entry.label, kind: operation.type, status: operation.state,
-      progress: operation.completedUnits || 0, total: operation.totalUnits || 0,
-      phase: operation.phase || operationPhaseText(operation), file: "",
-    };
+  } else {
+    // Terminal failures are surfaced through the error toast, not left as a
+    // completed-looking progress card with 0 active tasks.
+    delete state.documentJobs[operation.operationId];
   }
   return entry;
 }
@@ -343,10 +343,8 @@ async function trackOperation(operation, label) {
       }
       if (["succeeded", "failed", "cancelled", "interrupted"].includes(current.state)) {
         refreshDocumentViewInBackground();
-        if (current.state === "succeeded") {
-          delete state.documentJobs[current.operationId];
-          removeDocumentJobCard(current.operationId);
-        }
+        delete state.documentJobs[current.operationId];
+        removeDocumentJobCard(current.operationId);
         if (current.state !== "succeeded") {
           throw new Error(current.errorMessage || `Operation ${current.state}`);
         }
@@ -361,7 +359,7 @@ async function trackOperation(operation, label) {
   } finally {
     const stored = operationStore.get(operation.operationId);
     if (stored === remembered) remembered.pollPromise = null;
-    if (remembered.operation?.state === "succeeded") {
+    if (["succeeded", "failed", "cancelled", "interrupted"].includes(remembered.operation?.state)) {
       delete state.documentJobs[operation.operationId];
       removeDocumentJobCard(operation.operationId);
     }
@@ -606,14 +604,26 @@ async function renderBases() {
           await api.updateBase(base.id, { name }); await loadBases(); await render();
         }, "Base renamed") }, "Rename"),
         h("button", { class: "button small danger", onclick: () => guard(async () => {
+          const generation = routeGeneration;
           if (!window.confirm(`Delete "${base.name}" and all documents?`)) return;
           const operation = await api.submitOperation({
             type: "delete_base", commandSchemaVersion: 1,
             target: { baseId: base.id }, input: {},
           }, crypto.randomUUID());
-          await trackOperation(operation, `delete ${base.name}`);
+          // A durable delete is accepted before its lifecycle fence becomes
+          // visible in /api/bases. Remove it from the current view immediately,
+          // then reconcile once the terminal operation result is known.
+          pendingBaseDeletes.add(base.id);
+          state.bases = state.bases.filter((item) => item.id !== base.id);
           if (state.selectedBaseId === base.id) syncBasePicker("");
-          await loadBases(); await render();
+          if (generation === routeGeneration) await render();
+          try {
+            await trackOperation(operation, `delete ${base.name}`);
+          } finally {
+            pendingBaseDeletes.delete(base.id);
+            await loadBases();
+            if (generation === routeGeneration) await render();
+          }
         }, "Base deleted") }, "Delete"),
       ]),
     ])),
@@ -650,11 +660,33 @@ async function renderDocuments(generation = routeGeneration, baseId = state.sele
           syncBasePicker(value);
           state.docFolder = "";
           state.docPreview = null;
+          state.docOffset = 0;
           await render();
         }),
       ]),
-      h("div", { class: "empty panel" }, "Select a knowledge base to manage its documents."),
     ]));
+
+    // "All knowledge bases" is a KB selector, not a cross-base document
+    // query: every document action and folder route remains base-scoped.
+    const baseRows = state.bases.map((base) => h("tr", {},
+      h("td", { "data-label": localized("Name"), class: "truncate" }, base.name),
+      h("td", { "data-label": localized("Documents") }, number(base.documentCount)),
+      h("td", { "data-label": localized("Chunks") }, number(base.chunkCount)),
+      h("td", { "data-label": localized("Updated"), class: "muted" }, date(base.updatedAt || base.createdAt)),
+      h("td", { "data-label": localized("Actions") }, h("button", {
+        class: "button small", type: "button",
+        onclick: async () => {
+          syncBasePicker(base.id);
+          state.docFolder = "";
+          state.docPreview = null;
+          state.docOffset = 0;
+          await render();
+        },
+      }, localized("Open"))),
+    ));
+    screen.append(h("section", { class: "section" }, table(
+      ["Name", "Documents", "Chunks", "Updated", "Actions"], baseRows
+    )));
     return;
   }
   screen.append(h("section", { class: "section loading-state", "aria-live": "polite" }, [
@@ -1223,7 +1255,7 @@ async function renderImport() {
 async function renderKnowledge() {
   if (!state.selectedBaseId) {
     screen.append(h("section", { class: "section" }, [
-      h("div", { class: "section-head" }, h("h2", {}, "Knowledge")),
+      h("div", { class: "section-head" }, h("h2", {}, "Semantic Memory")),
       basePicker(async (value) => { syncBasePicker(value); await render(); }),
       h("div", { class: "empty panel" }, "Select a knowledge base to compile semantic memory."),
     ]));
@@ -1231,10 +1263,28 @@ async function renderKnowledge() {
   }
   screen.append(h("section", { class: "section toolbar" }, [
     basePicker(async (value) => { syncBasePicker(value); await render(); }),
-    h("button", { class: "button primary", onclick: () => guard(async () => {
-      await api.compileSemanticMemory(state.selectedBaseId);
-      await render();
-    }, "Semantic memory compiled") }, [icon(icons.refresh), "Compile semantic memory"]),
+    h("button", {
+      class: "button primary", disabled: semanticCompilationBusy,
+      onclick: async (event) => {
+        if (semanticCompilationBusy) return;
+        const button = event.currentTarget;
+        const baseId = state.selectedBaseId;
+        semanticCompilationBusy = true;
+        button.disabled = true;
+        button.setAttribute("aria-busy", "true");
+        button.replaceChildren(icon(icons.refresh), localized("Compiling semantic memory..."));
+        try {
+          await api.compileSemanticMemory(baseId);
+          showToast("Semantic memory compiled");
+        } catch (error) {
+          showToast(error.message, true);
+          semanticCompilationBusy = false;
+          return;
+        }
+        semanticCompilationBusy = false;
+        await render();
+      },
+    }, [icon(icons.refresh), semanticCompilationBusy ? localized("Compiling semantic memory...") : "Compile semantic memory"]),
   ]));
 
   let compilation = null;
@@ -2260,7 +2310,8 @@ async function renderSettings() {
 }
 
 async function loadBases() {
-  state.bases = await api.bases({ signal: routeAbortController?.signal });
+  const bases = await api.bases({ signal: routeAbortController?.signal });
+  state.bases = bases.filter((base) => !pendingBaseDeletes.has(base.id));
   if (!state.bases.some((base) => base.id === state.selectedBaseId)) syncBasePicker("");
 }
 

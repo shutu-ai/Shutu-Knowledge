@@ -1285,8 +1285,15 @@ func (s *Service) ReindexDocument(ctx context.Context, id string) (Document, err
 	} else if doc.RawText == "" {
 		return Document{}, fmt.Errorf("document has no recoverable source text")
 	}
-	if err := s.ingest(ctx, &doc, base.Config, data); err != nil {
-		return Document{}, err
+	ingestErr := s.ingest(ctx, &doc, base.Config, data)
+	if refreshErr := s.refreshAncestorDirectoryStatusesContext(ctx, doc.BaseID, doc.ID); refreshErr != nil {
+		if ingestErr == nil {
+			return Document{}, refreshErr
+		}
+		return Document{}, ingestErr
+	}
+	if ingestErr != nil {
+		return Document{}, ingestErr
 	}
 	return doc, nil
 }

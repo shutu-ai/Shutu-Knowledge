@@ -332,9 +332,44 @@ async function run() {
     await waitForPageValue(page, "created base", 10_000,
       `document.body.innerText.includes("E2E Operations")`);
 
+    // Deleting an empty base submits a durable operation. The row must leave
+    // the page as soon as that submission is accepted, without waiting for a
+    // route change or manual refresh.
+    await evaluateWithArgs({ name: "E2E Empty Delete" }, `
+      const form = [...document.querySelectorAll("form")].find((item) =>
+        [...item.querySelectorAll("h2")].some((heading) => heading.textContent === "New knowledge base"));
+      if (!form) throw new Error("empty base form missing");
+      form.querySelector('[name="name"]').value = args.name;
+      form.requestSubmit();
+    `);
+    await waitForPageValue(page, "created empty base", 10_000,
+      `[...document.querySelectorAll(".list-row")].some((row) => row.textContent.includes("E2E Empty Delete"))`);
+    await evaluateWithArgs({ baseName: "E2E Empty Delete" }, `
+      const row = [...document.querySelectorAll(".list-row")].find((item) => item.textContent.includes(args.baseName));
+      if (!row) throw new Error("empty base row missing");
+      const nativeFetch = window.fetch.bind(window);
+      window.__emptyDeleteNativeFetch = nativeFetch;
+      window.__emptyDeleteNativeConfirm = window.confirm;
+      window.fetch = async (input, init) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (url.includes("/api/operations/")) return new Promise(() => {});
+        return nativeFetch(input, init);
+      };
+      window.confirm = () => true;
+      [...row.querySelectorAll("button")].find((button) => button.textContent.trim() === "Delete").click();
+    `);
+    await waitForPageValue(page, "empty base hidden immediately", 2_000,
+      `![...document.querySelectorAll(".list-row")].some((row) => row.textContent.includes("E2E Empty Delete"))`);
+    await evaluate(page, `
+      window.fetch = window.__emptyDeleteNativeFetch;
+      window.confirm = window.__emptyDeleteNativeConfirm;
+      delete window.__emptyDeleteNativeFetch;
+      delete window.__emptyDeleteNativeConfirm;
+    `);
+
     await navigate("import");
-    await waitForPageValue(page, "text import form", 10_000,
-      `[...document.querySelectorAll("#screen form h2")].some((item) => item.textContent === "Text")`);
+    await waitForPageValue(page, "import picker", 10_000,
+      `document.querySelector('select[aria-label="Knowledge base"]')`);
     await evaluateWithArgs({ base: "E2E Operations" }, `
       const picker = document.querySelector('select[aria-label="Knowledge base"]');
       picker.value = [...picker.options].find((option) => option.text === args.base).value;
@@ -342,6 +377,8 @@ async function run() {
     `);
     await waitForPageValue(page, "import base selection", 10_000,
       `document.querySelector('select[aria-label="Knowledge base"]')?.selectedOptions?.[0]?.text === "E2E Operations"`);
+    await waitForPageValue(page, "text import form", 10_000,
+      `[...document.querySelectorAll("#screen form h2")].some((item) => item.textContent === "Text")`);
     await evaluateWithArgs({
       title: "Browser lifecycle document",
       content: "Chrome E2E imported this operational recovery procedure. The release token is E2E-7788.",
@@ -355,8 +392,9 @@ async function run() {
     `);
 
     // A directory path is validated by the worker, not by the receiver, so
-    // this exercises the browser operation card across a real 202-to-failure
-    // lifecycle without stubbing the OperationStore.
+    // this exercises a real 202-to-failure lifecycle. The durable operation
+    // remains inspectable by API, while the browser clears its progress card
+    // instead of showing a completed-looking panel with zero active tasks.
     const missingDirectory = "definitely-missing-e2e-directory";
     await evaluateWithArgs({ path: missingDirectory }, `
       const form = [...document.querySelectorAll("form")].find((item) =>
@@ -365,19 +403,20 @@ async function run() {
       form.querySelector('[name="path"]').value = args.path;
       form.requestSubmit();
     `);
-    await waitForPageValue(page, "failed import operation card", 10_000, `
-      [...document.querySelectorAll("[data-document-job-id]")].some((card) =>
-        card.textContent.includes("${missingDirectory}") &&
-        card.querySelector("[data-document-job-status]")?.textContent.trim().toLowerCase() !== "succeeded")
+    let failedDirectoryOperation;
+    await waitFor("failed import durable operation", 10_000, async () => {
+      const page1 = await apiValue(apiPort, "/api/operations?limit=100");
+      failedDirectoryOperation = (page1.operations ?? []).find((item) =>
+        item.type === "import_directory");
+      return failedDirectoryOperation?.state === "failed";
+    });
+    assert(failedDirectoryOperation?.state === "failed", "directory operation did not fail");
+    await waitForPageValue(page, "failed import card cleared", 2_000, `
+      ![...document.querySelectorAll("[data-document-job-id]")].some((card) =>
+        card.textContent.includes("${missingDirectory}"))
     `);
-    await waitForPageValue(page, "failed import terminal state", 10_000, `
-      [...document.querySelectorAll("[data-document-job-id]")].some((card) =>
-        card.textContent.includes("${missingDirectory}") &&
-        card.querySelector("[data-document-job-status]")?.textContent.trim().toLowerCase() === "failed" &&
-        [...card.querySelectorAll("button")].some((button) => button.textContent.trim() === "Retry"))
-    `);
-    await waitForPageValue(page, "failed import active count", 10_000,
-      `document.querySelector("[data-document-job-summary]")?.textContent === "0 active tasks"`);
+    await waitForPageValue(page, "failed import error toast", 2_000,
+      `document.querySelector("#toast.error")?.style.display !== "none"`);
 
     await navigate("documents");
     await waitForPageValue(page, "ready imported document", 20_000, `

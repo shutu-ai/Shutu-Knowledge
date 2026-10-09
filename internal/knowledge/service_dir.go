@@ -216,6 +216,13 @@ func normalizeDirectoryPath(sourcePath string) string {
 	return filepath.Clean(absolute)
 }
 
+// isOfficeOwnerTempFile reports Excel/Word owner lock files such as
+// "~$Report.xlsx". They are transient editor metadata, often non-OOXML while
+// the document remains open, and must not make a knowledge-base scan fail.
+func isOfficeOwnerTempFile(fileName string) bool {
+	return strings.HasPrefix(fileName, "~$")
+}
+
 // scanDirectoryTree recursively returns supported files and ordinary
 // directories, sorted by stable relative path. Read errors are retained per
 // entry so one unreadable subtree cannot hide the rest of the source tree.
@@ -259,6 +266,9 @@ func (s *Service) scanDirectoryTree(ctx context.Context, root string) ([]directo
 			entries = append(entries, entry)
 			return nil
 		}
+		if isOfficeOwnerTempFile(d.Name()) {
+			return nil
+		}
 		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
 		if !supported[ext] {
 			return nil
@@ -292,6 +302,9 @@ func (s *Service) scanDirectory(root string) ([]directoryEntry, error) {
 			return nil // unreadable subtree: skip, per-file errors surface elsewhere
 		}
 		if d.IsDir() {
+			return nil
+		}
+		if isOfficeOwnerTempFile(d.Name()) {
 			return nil
 		}
 		ext := strings.TrimPrefix(filepath.Ext(p), ".")
@@ -762,6 +775,33 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 	if failures > 0 {
 		return &DirectoryImportError{Count: failures, Path: root, Err: firstErr}
 	}
+
+	// Existing nested containers can retain a terminal failure from an earlier
+	// targeted scan (for example, their source was temporarily missing). A
+	// successful root sync proves their current subtree is synced again, so
+	// those stale markers must not outlive the good files beneath them.
+	for _, entry := range index.docs {
+		if entry.SourceType != "directory" || entry.ID == rootID || entry.Status == StatusReady {
+			continue
+		}
+		nested, err := s.store.getDocumentContext(ctx, entry.ID)
+		if err != nil {
+			return err
+		}
+		if nested.SourceType != "directory" || nested.Status == StatusReady {
+			continue
+		}
+		nested.Status = StatusReady
+		nested.Phase = ""
+		nested.Progress = 100
+		nested.ErrorCode = ""
+		nested.ErrorMessage = ""
+		nested.UpdatedAt = now()
+		if err := s.store.putDocumentContext(ctx, nested); err != nil {
+			return err
+		}
+	}
+
 	container, err := s.store.getDocumentContext(ctx, rootID)
 	if err != nil {
 		return err
@@ -774,6 +814,76 @@ func (s *Service) syncNestedDirectoryTree(ctx context.Context, baseID, rootID, r
 	container.UpdatedAt = now()
 	if err := s.store.putDocumentContext(ctx, container); err != nil {
 		return err
+	}
+	return nil
+}
+
+// directoryAggregateStatus summarizes the observable lifecycle of a directory
+// subtree. A directory is ready only when every descendant is ready; any
+// failed child keeps the branch failed, while active children keep it
+// processing.
+func directoryAggregateStatus(descendants []Document) (string, string, string) {
+	for _, doc := range descendants {
+		switch doc.Status {
+		case StatusFailed:
+			message := doc.ErrorMessage
+			if message == "" {
+				message = "nested document failed"
+			}
+			return StatusFailed, ErrParseFailed, fmt.Sprintf("%s: %s", doc.Title, message)
+		case StatusPending, StatusProcessing:
+			return StatusProcessing, "", ""
+		}
+	}
+	return StatusReady, "", ""
+}
+
+// refreshAncestorDirectoryStatuses keeps directory rows synchronized when a
+// single child is repaired or indexed outside a full directory import. It
+// never interrupts a directory that is currently scanning.
+func (s *Service) refreshAncestorDirectoryStatusesContext(ctx context.Context, baseID, childID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	path, err := s.store.documentPathMetadataContext(ctx, baseID, childID)
+	if err != nil {
+		return err
+	}
+	if len(path) < 2 {
+		return nil
+	}
+	for _, ancestor := range path[:len(path)-1] {
+		if ancestor.SourceType != "directory" {
+			continue
+		}
+		current, err := s.store.getDocumentContext(ctx, ancestor.ID)
+		if err != nil {
+			return err
+		}
+		if current.SourceType != "directory" ||
+			!(current.Status == StatusReady || current.Status == StatusFailed) {
+			continue
+		}
+		descendants, err := s.store.listDocumentMetadataTreeContext(ctx, baseID, ancestor.ID)
+		if err != nil {
+			return err
+		}
+		status, code, message := directoryAggregateStatus(descendants[1:])
+		if status == current.Status {
+			continue
+		}
+		current.Status = status
+		current.Phase = ""
+		current.Progress = map[string]int{StatusReady: 100}[status]
+		current.ErrorCode = code
+		current.ErrorMessage = message
+		current.UpdatedAt = now()
+		if err := s.store.putDocumentContext(ctx, current); err != nil {
+			return err
+		}
 	}
 	return nil
 }

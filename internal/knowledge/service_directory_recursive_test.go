@@ -79,6 +79,170 @@ func TestDirectoryTreeImportsMultipleNestedLevels(t *testing.T) {
 	}
 }
 
+func TestDirectoryImportSkipsOfficeOwnerTempFiles(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Owner Files", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "dictionary.md"), []byte("valid content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "~$dictionary.xlsm"), []byte("not a zip archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootDoc, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil)
+	if err != nil {
+		t.Fatalf("owner lock file failed directory import: %v", err)
+	}
+	docs, err := service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootDoc.Status != StatusReady {
+		t.Fatalf("root directory = %+v", rootDoc)
+	}
+	for _, doc := range docs {
+		if doc.SourcePath == filepath.Join(root, "~$dictionary.xlsm") {
+			t.Fatalf("owner lock file was tracked: %+v", doc)
+		}
+	}
+}
+
+func TestDirectoryRescanClearsStaleNestedDirectoryStatus(t *testing.T) {
+	service, _ := newSearchFixture(t)
+	base, err := service.CreateBase("Stale Nested", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "good.txt"), []byte("good content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rootDoc, nestedDoc DocumentSummary
+	for _, doc := range docs {
+		if doc.SourceType != "directory" {
+			continue
+		}
+		switch doc.SourcePath {
+		case root:
+			rootDoc = doc
+		case nested:
+			nestedDoc = doc
+		}
+	}
+	if rootDoc.ID == "" || nestedDoc.ID == "" {
+		t.Fatalf("tracked directories missing: %+v", docs)
+	}
+
+	stale, _, err := service.GetDocument(nestedDoc.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Status = StatusFailed
+	stale.ErrorCode = ErrSourceMissing
+	stale.ErrorMessage = "old targeted scan failure"
+	if err := service.store.putDocument(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.RunDirectoryRescan(context.Background(), rootDoc.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	docs, err = service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, doc := range docs {
+		if doc.ID != nestedDoc.ID && doc.ID != rootDoc.ID {
+			continue
+		}
+		if doc.Status != StatusReady || doc.ErrorCode != "" || doc.ErrorMessage != "" {
+			t.Fatalf("directory %s kept stale failure: %+v", doc.SourcePath, doc)
+		}
+	}
+}
+
+func TestReindexFailedChildClearsDirectoryFailure(t *testing.T) {
+	f := newFixture(t)
+	service := f.service
+	base, err := service.CreateBase("Repair Child", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	emptyPath := filepath.Join(root, "empty.md")
+	goodPath := filepath.Join(root, "good.txt")
+	if err := os.WriteFile(emptyPath, []byte("   "), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(goodPath, []byte("good content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RunDirectoryImport(context.Background(), base.ID, root, nil); err == nil {
+		t.Fatal("directory import with empty file should fail")
+	}
+	docs, err := service.ListDocuments(base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rootDoc, failedDoc DocumentSummary
+	for _, doc := range docs {
+		switch doc.SourcePath {
+		case root:
+			rootDoc = doc
+		case emptyPath:
+			failedDoc = doc
+		}
+	}
+	if rootDoc.ID == "" || failedDoc.ID == "" {
+		t.Fatalf("root or failed child missing: %+v", docs)
+	}
+	if rootDoc.Status != StatusFailed || failedDoc.Status != StatusFailed {
+		t.Fatalf("pre-repair statuses: root=%q child=%q", rootDoc.Status, failedDoc.Status)
+	}
+
+	parseable := []byte("now parseable content")
+	prepared, _, err := service.GetDocument(failedDoc.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawPath, err := f.raw.WriteVersion(base.ID, prepared.ID, prepared.SourceVersion+1, ".md", parseable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared.RawFilePath = rawPath
+	if err := service.store.putDocument(prepared); err != nil {
+		t.Fatal(err)
+	}
+	repaired, err := service.ReindexDocument(context.Background(), failedDoc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.Status != StatusReady {
+		t.Fatalf("repaired child = %+v", repaired)
+	}
+	rootFull, _, err := service.GetDocument(rootDoc.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootFull.Status != StatusReady || rootFull.ErrorCode != "" || rootFull.ErrorMessage != "" {
+		t.Fatalf("root kept failed status after child repair: %+v", rootFull)
+	}
+}
+
 func TestDirectorySyncStateWritesPropagateCancellation(t *testing.T) {
 	f := newFixture(t)
 	base := f.createBase(t)

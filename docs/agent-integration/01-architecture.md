@@ -23,6 +23,7 @@ Rules:
 4. Existing Agent Extension v1 remains supported; MCP is additive.
 5. Evidence is authoritative. Semantic and structured lanes are separately labeled.
 6. Semantic failures do not silently become evidence results.
+7. Capability discovery reports structured readiness only when active structured models exist.
 7. All cross-base requests pass through one scope resolution routine.
 
 ## Current Phase 1 wiring

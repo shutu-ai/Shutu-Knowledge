@@ -49,6 +49,10 @@ func TestAgentQueryEvidenceAndCapabilityContract(t *testing.T) {
 	if result.Mode != ModeEvidence || len(result.Evidence.Hits) == 0 {
 		t.Fatalf("evidence result: mode=%q hits=%d", result.Mode, len(result.Evidence.Hits))
 	}
+	if len(result.EvidenceSnapshots) != 1 || result.EvidenceSnapshots[0].BaseID != base.ID ||
+		result.EvidenceSnapshots[0].IndexGeneration == 0 || result.EvidenceSnapshots[0].SourceVersion == 0 {
+		t.Fatalf("evidence snapshots: %+v", result.EvidenceSnapshots)
+	}
 
 	capabilities, err := service.Capabilities(ctx)
 	if err != nil {

@@ -61,7 +61,7 @@ Current supported policy:
 
 `Knowledge.GetSemanticCompilationByID` now exposes one immutable semantic generation. `AgentQuery.Search` reads the pinned compilation and returns a `Snapshot` with its base, generation, and `active` / `pinned` source.
 
-Evidence snapshots are not yet exposed as a first-class shared envelope. The existing search result already carries per-hit `IndexGeneration` and `SourceVersion`; G1/G2 will add the snapshot envelope without inventing a global evidence generation that storage does not currently publish.
+Evidence snapshots are exposed as exact per-document identities in `Result.EvidenceSnapshots` (`baseId`, `documentId`, `indexGeneration`, and `sourceVersion`). SQLite currently has per-document active generations rather than one auditable base-wide index generation, so the shared layer does not invent an aggregate evidence generation.
 
 ## MCP SDK decision
 

@@ -75,17 +75,18 @@ type Request struct {
 // Result is the shared response envelope. Evidence is authoritative; semantic
 // and structured lanes are independent, explicitly labeled result types.
 type Result struct {
-	Query       string                  `json:"query"`
-	Mode        Mode                    `json:"mode"`
-	Requested   Mode                    `json:"requestedMode,omitempty"`
-	Scope       []string                `json:"scope"`
-	Plan        *semantic.QueryPlan     `json:"plan,omitempty"`
-	Evidence    *knowledge.SearchResult `json:"evidence,omitempty"`
-	Semantic    []BaseSemanticResult    `json:"semantic,omitempty"`
-	Structured  []BaseStructuredResult  `json:"structured,omitempty"`
-	Snapshots   []Snapshot              `json:"snapshots,omitempty"`
-	Diagnostics []Diagnostic            `json:"diagnostics,omitempty"`
-	Degraded    bool                    `json:"degraded,omitempty"`
+	Query             string                  `json:"query"`
+	Mode              Mode                    `json:"mode"`
+	Requested         Mode                    `json:"requestedMode,omitempty"`
+	Scope             []string                `json:"scope"`
+	Plan              *semantic.QueryPlan     `json:"plan,omitempty"`
+	Evidence          *knowledge.SearchResult `json:"evidence,omitempty"`
+	Semantic          []BaseSemanticResult    `json:"semantic,omitempty"`
+	Structured        []BaseStructuredResult  `json:"structured,omitempty"`
+	Snapshots         []Snapshot              `json:"snapshots,omitempty"`
+	EvidenceSnapshots []BaseEvidenceSnapshot  `json:"evidenceSnapshots,omitempty"`
+	Diagnostics       []Diagnostic            `json:"diagnostics,omitempty"`
+	Degraded          bool                    `json:"degraded,omitempty"`
 }
 
 // BaseSemanticResult scopes semantic activation to one base and snapshot.
@@ -106,6 +107,17 @@ type Snapshot struct {
 	BaseID             string `json:"baseId"`
 	SemanticGeneration int64  `json:"semanticGeneration,omitempty"`
 	SemanticSource     string `json:"semanticSource,omitempty"`
+}
+
+// BaseEvidenceSnapshot exposes the per-hit evidence generation identities in
+// one base. SQLite currently has per-document active generations, not a single
+// base-wide index generation; reporting these exact identities avoids making
+// up an aggregate generation that cannot be audited.
+type BaseEvidenceSnapshot struct {
+	BaseID          string `json:"baseId"`
+	DocumentID      string `json:"documentId"`
+	IndexGeneration int64  `json:"indexGeneration"`
+	SourceVersion   int64  `json:"sourceVersion"`
 }
 
 // ContextRequest is the shared bounded context shape. A multi-base request
@@ -205,6 +217,7 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 			return Result{}, err
 		}
 		result.Evidence = evidence
+		result.EvidenceSnapshots = evidenceSnapshots(evidence.Generations)
 	}
 
 	if request.Mode != ModeEvidence {
@@ -335,6 +348,35 @@ func (s *Service) Capabilities(ctx context.Context) (Capabilities, error) {
 		cap.Bases = append(cap.Bases, item)
 	}
 	return cap, nil
+}
+
+func evidenceSnapshots(generations []knowledge.SearchGeneration) []BaseEvidenceSnapshot {
+	seen := make(map[BaseEvidenceSnapshot]bool)
+	out := make([]BaseEvidenceSnapshot, 0, len(generations))
+	for _, generation := range generations {
+		item := BaseEvidenceSnapshot{
+			BaseID: generation.BaseID, DocumentID: generation.DocID,
+			IndexGeneration: generation.IndexGeneration, SourceVersion: generation.SourceVersion,
+		}
+		if seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].BaseID != out[j].BaseID {
+			return out[i].BaseID < out[j].BaseID
+		}
+		if out[i].DocumentID != out[j].DocumentID {
+			return out[i].DocumentID < out[j].DocumentID
+		}
+		if out[i].IndexGeneration != out[j].IndexGeneration {
+			return out[i].IndexGeneration < out[j].IndexGeneration
+		}
+		return out[i].SourceVersion < out[j].SourceVersion
+	})
+	return out
 }
 
 func (s *Service) searchEvidence(ctx context.Context, request Request, scope []string) (*knowledge.SearchResult, error) {

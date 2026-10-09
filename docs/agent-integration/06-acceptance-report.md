@@ -62,6 +62,16 @@ Scope: `Shutu-Knowledge_Agent_MCP_Skills_Full_Implementation_Plan.md` Phases 0�
 - Abstention quality at the retrieval layer is an exposed signal, not an
   automated decision.
 
+## Final package freeze
+
+The closing commit `8846e8e` was packaged from the clean tree:
+`shutu-knowledge-0.7.0-windows-amd64.zip`, SHA256
+`6ee1201f5eb5a0e2b9119e68a7d0208f77907b8c301e4a209c00ff7a0d45d350` (binary
+`f2b002de…e7a0459`), secret audit passed. The packaged binary reported
+`version 0.7.0 / 8846e8e` and answered a real `initialize` over stdio with
+clean JSON-RPC — the same evidence chain as the Phase 5 gate, re-run at the
+final commit.
+
 ## Sign-off
 
 All mandatory gates (G0–G7, G9) verified with the evidence linked above; G8

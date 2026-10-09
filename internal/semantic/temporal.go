@@ -573,6 +573,13 @@ func temporalFactScope(content string) (scope string, version string, ok bool) {
 	return predicate + "\x00" + attribute, parsedVersion, true
 }
 
+
+// TemporalVersionVisible reports whether one unit is visible under the given
+// temporal scope. It is the shared visibility rule used by semantic search and
+// protocol-independent graph traversal; it never deletes history.
+func TemporalVersionVisible(unit Unit, temporal TemporalQuery, resolved string) bool {
+	return temporalVersionVisible(unit, temporal, resolved)
+}
 // temporalVersionVisible implements scope filtering without deleting history.
 func temporalVersionVisible(unit Unit, temporal TemporalQuery, resolved string) bool {
 	statusOK := unit.Status == UnitActive || unit.Status == UnitConflicted

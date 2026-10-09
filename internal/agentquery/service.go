@@ -68,6 +68,7 @@ const (
 	ErrSemanticNotReady   ErrorCode = "SEMANTIC_NOT_READY"
 	ErrGenerationNotFound ErrorCode = "GENERATION_NOT_FOUND"
 	ErrVersionUnsupported ErrorCode = "VERSION_UNSUPPORTED"
+	ErrUnitNotFound        ErrorCode = "UNIT_NOT_FOUND"
 )
 
 // Error is a stable shared-contract error. BaseID is populated only when the

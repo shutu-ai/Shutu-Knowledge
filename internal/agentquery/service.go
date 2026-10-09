@@ -159,13 +159,14 @@ type BaseContextPackage struct {
 
 // BaseCapability is the per-base discovery record used by tool adapters.
 type BaseCapability struct {
-	BaseID             string `json:"baseId"`
-	Name               string `json:"name"`
-	DocumentCount      int    `json:"documentCount"`
-	ChunkCount         int    `json:"chunkCount"`
-	SemanticReady      bool   `json:"semanticReady"`
-	SemanticGeneration int64  `json:"semanticGeneration,omitempty"`
-	StructuredReady    bool   `json:"structuredReady"`
+	BaseID               string `json:"baseId"`
+	Name                 string `json:"name"`
+	DocumentCount        int    `json:"documentCount"`
+	ChunkCount           int    `json:"chunkCount"`
+	SemanticReady        bool   `json:"semanticReady"`
+	SemanticGeneration   int64  `json:"semanticGeneration,omitempty"`
+	StructuredReady      bool   `json:"structuredReady"`
+	StructuredModelCount int    `json:"structuredModelCount,omitempty"`
 }
 
 // Capabilities is a bounded discovery response for adapters.
@@ -361,6 +362,12 @@ func (s *Service) Capabilities(ctx context.Context) (Capabilities, error) {
 		item := BaseCapability{
 			BaseID: base.ID, Name: base.Name,
 			DocumentCount: base.DocumentCount, ChunkCount: base.ChunkCount,
+		}
+		if count, err := s.knowledge.StructuredModelCount(ctx, base.ID); err == nil {
+			item.StructuredModelCount = count
+			item.StructuredReady = count > 0
+		} else {
+			return cap, fmt.Errorf("read structured capability for base %s: %w", base.ID, err)
 		}
 		if compilation, err := s.knowledge.GetSemanticCompilation(ctx, base.ID); err == nil {
 			item.SemanticReady = true

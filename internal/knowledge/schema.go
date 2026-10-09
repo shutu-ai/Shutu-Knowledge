@@ -143,6 +143,16 @@ func (s *Service) invalidateSchemaCache() {
 	s.schemaCacheMu.Unlock()
 }
 
+// StructuredModelCount reports the number of active schema snapshots for one
+// base so capability discovery cannot claim structured support without data.
+func (s *Service) StructuredModelCount(ctx context.Context, baseID string) (int, error) {
+	models, err := s.activeSchemaModels(ctx, baseID)
+	if err != nil {
+		return 0, err
+	}
+	return len(models), nil
+}
+
 func (s *Service) CompileDocumentSchema(ctx context.Context, documentID string) (schemamodel.Model, error) {
 	doc, err := s.store.getDocumentContext(ctx, documentID)
 	if err != nil {

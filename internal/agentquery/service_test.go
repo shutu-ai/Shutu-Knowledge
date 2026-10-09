@@ -93,6 +93,16 @@ func TestAgentQuerySemanticHybridGenerationAndContext(t *testing.T) {
 		t.Fatalf("read compilation: %v", err)
 	}
 
+	missingPinnedContext, err := service.Context(ctx, ContextRequest{
+		Query: "KPI", BaseIDs: []string{base.ID}, Generation: Generation("999"),
+	})
+	if err != nil {
+		t.Fatalf("missing pinned context: %v", err)
+	}
+	if len(missingPinnedContext.Packages) != 0 || !missingPinnedContext.Degraded || missingPinnedContext.Diagnostics[0].Code != "SEMANTIC_NOT_READY" {
+		t.Fatalf("missing pinned context result: %+v", missingPinnedContext)
+	}
+
 	semantic, err := service.Search(ctx, Request{
 		Query: "KPI", BaseIDs: []string{base.ID}, Mode: ModeSemantic, TopK: 5,
 	})
@@ -152,6 +162,10 @@ func TestAgentQueryContextAfterCompilation(t *testing.T) {
 	if _, err := service.knowledge.CompileSemanticMemory(ctx, base.ID); err != nil {
 		t.Fatalf("compile semantic memory: %v", err)
 	}
+	compilation, err := service.knowledge.GetSemanticCompilation(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("read compilation: %v", err)
+	}
 	result, err := service.Context(ctx, ContextRequest{
 		Query: "How is the KPI calculated?", BaseIDs: []string{base.ID}, TokenBudget: 2048,
 	})
@@ -160,5 +174,16 @@ func TestAgentQueryContextAfterCompilation(t *testing.T) {
 	}
 	if len(result.Packages) != 1 || result.Packages[0].Package.Query == "" {
 		t.Fatalf("context packages: %+v", result.Packages)
+	}
+
+	pinned, err := service.Context(ctx, ContextRequest{
+		Query: "How is the KPI calculated?", BaseIDs: []string{base.ID},
+		Generation: Generation(strconv.FormatInt(compilation.Generation, 10)), TokenBudget: 2048,
+	})
+	if err != nil {
+		t.Fatalf("pinned context: %v", err)
+	}
+	if len(pinned.Packages) != 1 || pinned.Packages[0].Generation != compilation.Generation || pinned.Degraded {
+		t.Fatalf("pinned context result: %+v", pinned)
 	}
 }

@@ -243,8 +243,13 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	if strings.TrimSpace(request.Query) == "" {
 		return ContextResult{}, errors.New("query is required")
 	}
-	if request.Generation != GenerationActive && request.Generation != "" {
-		return ContextResult{}, errors.New("generation-pinned context compilation is not supported by Knowledge Core yet")
+	pinnedGeneration := int64(0)
+	if request.Generation != GenerationActive {
+		parsed, parseErr := strconv.ParseInt(string(request.Generation), 10, 64)
+		if parseErr != nil || parsed <= 0 {
+			return ContextResult{}, fmt.Errorf("generation must be %q or a positive integer: %w", GenerationActive, parseErr)
+		}
+		pinnedGeneration = parsed
 	}
 	scope, err := s.resolveScope(ctx, request.BaseIDs)
 	if err != nil {
@@ -252,7 +257,13 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	}
 	out := ContextResult{Query: request.Query, Scope: scope}
 	for _, baseID := range scope {
-		pkg, err := s.knowledge.CompileKnowledgeContext(ctx, baseID, request.Query, request.TokenBudget)
+		var pkg semantic.ContextPackage
+		var err error
+		if pinnedGeneration > 0 {
+			pkg, err = s.knowledge.CompileKnowledgeContextByID(ctx, baseID, pinnedGeneration, request.Query, request.TokenBudget)
+		} else {
+			pkg, err = s.knowledge.CompileKnowledgeContext(ctx, baseID, request.Query, request.TokenBudget)
+		}
 		if errors.Is(err, knowledge.ErrNotFound) {
 			out.Diagnostics = append(out.Diagnostics, Diagnostic{
 				Code: "SEMANTIC_NOT_READY", BaseID: baseID,

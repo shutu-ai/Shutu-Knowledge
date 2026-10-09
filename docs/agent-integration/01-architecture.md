@@ -1,6 +1,6 @@
 # Agent Integration Architecture
 
-Status: **Phase 1 foundation implemented; MCP adapter not installed yet.**
+Status: **Phase 1 shared-query implementation substantially complete; MCP adapter not installed yet.**
 
 ## Layering
 
@@ -35,7 +35,7 @@ At HEAD, these paths already route through `internal/agentquery`:
 | REST `POST /api/bases/{id}/semantic/context` | bounded context | Wired to `AgentQuery.ContextForBase` |
 | Extension `knowledge_search` | evidence tool | Wired to `AgentQuery.Search`; adapter restores the stable `searchToolResult` shape |
 | Extension `knowledge_compile_context` | bounded context | Wired to `AgentQuery.ContextForBase`; preserves direct `semantic.ContextPackage` result |
-| Automatic context provider | lexical Auto-RAG | Not migrated yet because it is a distinct bounded injection workflow |
+| Automatic context provider | lexical Auto-RAG | Wired to `AgentQuery.Search` with lexical evidence mode; preserves all injection, score, deduplication, and token-budget policy in the adapter |
 
 The contract test compares shared application output with real Extension tool output for both search and context. Timing metadata is excluded because it is intentionally non-deterministic.
 
@@ -46,7 +46,7 @@ The shared request starts with:
 - `BaseIDs`: explicit authorized bases; omitted means the configured enabled scope.
 - `Mode`: `evidence`, `semantic`, `hybrid`, or `auto`.
 - `EvidenceMode`: existing retrieval lane (`auto`, `hybrid`, `vector`, `lexical`) used while the explicit evidence REST/tool DTO remains stable.
-- `Generation`: semantic `active` or immutable numeric generation.
+- `Generation`: semantic `active` or immutable numeric generation; context compilation supports both active and pinned generations.
 - `Filter`: existing evidence filter until the unified filter contract is expanded.
 - `TopK`, `Debug`, and structured inclusion.
 

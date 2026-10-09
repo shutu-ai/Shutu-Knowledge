@@ -323,8 +323,43 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
-	memory, err := s.SearchSemanticMemory(ctx, baseID, semantic.SearchOptions{Query: query, TopK: 8})
-	if err != nil && !errors.Is(err, ErrNotFound) {
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget)
+}
+
+// CompileKnowledgeContextByID compiles context against one immutable semantic
+// generation. Evidence search still resolves current chunk content through the
+// base; each evidence item retains its original generation/version identity.
+func (s *Service) CompileKnowledgeContextByID(ctx context.Context, baseID string, generation int64, query string, tokenBudget int) (semantic.ContextPackage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.ContextPackage{}, ErrConflict
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
+	}
+	if generation <= 0 {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget)
+}
+
+func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, baseID string, compilation semantic.Compilation, query string, tokenBudget int) (semantic.ContextPackage, error) {
+	memory, err := semantic.SearchCompilation(compilation, semantic.SearchOptions{Query: query, TopK: 8})
+	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
 	queries := []string{query}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/shutu-ai/shutu-agent/sdk/extension"
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/chunk"
 	"github.com/shutu-ai/shutu-knowledge/internal/evidence"
@@ -61,16 +62,15 @@ func ProvideContext(ctx context.Context, application *app.App, request extension
 		selectionLimit = 1
 	}
 
-	result, err := application.Knowledge.Search(ctx, knowledge.SearchRequest{
-		Query:   query,
-		Queries: autoQueryVariants(plan),
-		TopK:    autoCandidateCount,
-		Mode:    "lexical",
-		Filter:  nil,
+	shared, err := application.AgentQuery.Search(ctx, agentquery.Request{
+		Query: query, ExtraQueries: autoQueryVariants(plan),
+		Mode: agentquery.ModeEvidence, EvidenceMode: "lexical",
+		TopK: autoCandidateCount,
 	})
 	if err != nil {
 		return extension.ContextResult{}, err
 	}
+	result := *shared.Evidence
 
 	baseNames := map[string]string{}
 	seats := map[string]int{}

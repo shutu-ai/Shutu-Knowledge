@@ -862,7 +862,7 @@ examples/mcp/*
 
 - [x] G0 本地代码审计、SHA/dirty 记录、既有测试基线、功能差异矩阵。
 - [x] G1 Agent Query Application 服务统一化，兼容 Evidence/REST/Extension。
-- [ ] G2 Semantic query / explore / expand / temporal / provenance / structured adapter 完整化。
+ - [x] G2 Semantic query / explore / expand / temporal / provenance / structured adapter 完整化。
 - [ ] G3 MCP stdio、HTTP、9 tools、Resources、真实协议兼容与 wire E2E。
 - [ ] G4 Portable Agent Skill、references、触发/不触发案例、Codex 安装指南。
 - [ ] G5 安全、权限、升级/回滚、Windows 安装包、跨平台可用性矩阵。

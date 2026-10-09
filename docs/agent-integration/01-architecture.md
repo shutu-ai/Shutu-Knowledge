@@ -1,6 +1,6 @@
 # Agent Integration Architecture
 
-Status: **Phase 1 complete; MCP adapter not installed yet.**
+Status: **Phase 2 complete; MCP adapter not installed yet.**
 
 ## Layering
 
@@ -61,6 +61,44 @@ Current supported policy:
 - `auto` plans intent, includes evidence, and includes semantic only when available.
 - A missing semantic compilation never silently rewrites a semantic request into evidence.
 - Shared errors carry stable codes (`INVALID_ARGUMENT`, `PERMISSION_DENIED`, `BASE_NOT_FOUND`, `SEMANTIC_NOT_READY`, `GENERATION_NOT_FOUND`, `VERSION_UNSUPPORTED`) while adapters retain their existing transport shapes.
+
+## Phase 2 semantic graph traversal
+
+`internal/agentquery/explore.go` adds the shared, protocol-independent graph layer used by
+G2. It introduces two application operations over one immutable semantic generation:
+
+- `Explore`: lexical semantic activation produces seeds, then typed-relation BFS expands
+  them per base.
+- `Expand`: one exact unit ID seeds the walk; a unit hidden by the requested version
+  policy reports `UNIT_NOT_FOUND` with a precise message instead of being silently
+  dropped.
+
+Contract rules enforced by the shared layer:
+
+1. Per-base graphs are independent; results are never merged into a fake cross-base
+   generation. Graphs carry the snapshot generation and the semantic routing plan.
+2. Endpoint visibility reuses the exact semantic search rule (`TemporalVersionVisible`),
+   so `current`, `as_of`, `range`, and `all` policies apply to seeds and expansion alike.
+3. Relation traversal supports `in`/`out`/`both`, relation-type allowlists, per-node
+   fan-out, hop and node ceilings with clamped defaults (1 hop / 64 nodes / 16 fan-out),
+   cycle-safe BFS, and deterministic ordering (seeds keep activation order; adjacency,
+   nodes, edges, and paths are sorted by stable IDs).
+4. `contradicts` edges carry `conflict=true` — reporting that a conflict relation exists,
+   never which side is true — and can be excluded with `excludeConflicts`.
+5. Provenance closure: every node resolves through `semantic.ResolveEvidence` to exact
+   IR/chunk pointers; every edge carries its relation sources or an explicit
+   `projection_only` status (derived_from links only). Traversal fails loudly rather
+   than emitting an unevidenced citation.
+6. Stable errors: `SEMANTIC_NOT_READY` when no requested base has a usable generation,
+   `GENERATION_NOT_FOUND` diagnostics for unusable pins, `UNIT_NOT_FOUND` for missing or
+   version-hidden seeds, plus per-base `SEMANTIC_NOT_READY` diagnostics with
+   `degraded=true` for partial scopes.
+
+G2 isolated fixtures (`explore_test.go`) prove semantic activation over the real compile
+pipeline, cross-document expansion with hop/path accounting, conflict filtering,
+direction/relation/bounds behavior with cycle safety, version consistency for current /
+as-of / evolution policies, provenance closure without ghost citations, and deterministic
+repeats.
 
 ## Snapshot strategy
 

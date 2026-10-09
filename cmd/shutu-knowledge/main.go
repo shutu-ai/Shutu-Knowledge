@@ -45,6 +45,8 @@ func main() {
 		err = cmdDoctor(ctx)
 	case "version":
 		err = cmdVersion()
+	case "mcp":
+		err = cmdMCP(ctx, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -69,6 +71,7 @@ func usage() {
 
 commands:
   serve       run the standalone HTTP server
+  mcp         run the MCP server (stdio by default, --http for streamable HTTP)
   extension   run the Extension Protocol v1 stdio loop (Agent-managed)
   doctor      check storage, migrations, and dependencies
   version     print version`)

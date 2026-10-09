@@ -68,7 +68,7 @@ const (
 	ErrSemanticNotReady   ErrorCode = "SEMANTIC_NOT_READY"
 	ErrGenerationNotFound ErrorCode = "GENERATION_NOT_FOUND"
 	ErrVersionUnsupported ErrorCode = "VERSION_UNSUPPORTED"
-	ErrUnitNotFound        ErrorCode = "UNIT_NOT_FOUND"
+	ErrUnitNotFound       ErrorCode = "UNIT_NOT_FOUND"
 )
 
 // Error is a stable shared-contract error. BaseID is populated only when the
@@ -542,6 +542,13 @@ func (s *Service) searchStructured(ctx context.Context, request Request, scope [
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].BaseID < results[j].BaseID })
 	return results, diagnostics
+}
+
+// ResolveScope exposes the shared scope resolution to protocol adapters that
+// need the authorized base list before issuing a query. It applies the same
+// authorization rules as Search.
+func (s *Service) ResolveScope(ctx context.Context, requested []string) ([]string, error) {
+	return s.resolveScope(ctx, requested)
 }
 
 // resolveScope starts from the existing enabled scope and intersects explicit

@@ -116,6 +116,30 @@ func (s *Service) CompileSemanticMemory(ctx context.Context, baseID string) (sem
 	return s.semanticStore.GetActiveCompilation(ctx, baseID)
 }
 
+// GetSemanticCompilationByID returns one immutable compilation generation for
+// an active base. It lets protocol-independent callers pin a query to a
+// snapshot rather than silently reading the active generation twice.
+func (s *Service) GetSemanticCompilationByID(ctx context.Context, baseID string, generation int64) (semantic.Compilation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.Compilation{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.Compilation{}, ErrConflict
+	}
+	if generation <= 0 {
+		return semantic.Compilation{}, ErrNotFound
+	}
+	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.Compilation{}, ErrNotFound
+	}
+	return compilation, err
+}
+
 // ResolveSemanticUnitEvidence exposes the exact Document IR/chunk pointers
 // behind a compiled semantic unit. It never substitutes a chunk search result.
 func (s *Service) ResolveSemanticUnitEvidence(ctx context.Context, unitID string) ([]semantic.EvidenceSource, error) {

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/health"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
@@ -40,6 +41,7 @@ type App struct {
 	Health         *health.Registry
 	Operations     *operations.Service
 	Knowledge      *knowledge.Service
+	AgentQuery     *agentquery.Service
 	Models         *models.Manager
 	Ollama         *models.Ollama
 	Runtime        runtime.Controller
@@ -109,6 +111,7 @@ func NewWithOptions(ctx context.Context, options Options) (*App, error) {
 	application := &App{Home: home, Config: cfg, Logger: logger, DB: db, RawStore: raw, Health: health.NewRegistry(), instanceLock: instanceLock}
 	application.registerHealth()
 	application.Knowledge = knowledge.NewService(db, raw, cfg)
+	application.AgentQuery = agentquery.New(application.Knowledge)
 	application.modelAdmission = scheduler.NewSemaphore(cfg.Scheduler.Model)
 	application.Knowledge.SetSharedModelAdmission(application.modelAdmission)
 	application.Operations, err = application.newOperationService()

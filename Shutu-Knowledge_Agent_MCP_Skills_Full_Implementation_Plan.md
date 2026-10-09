@@ -869,7 +869,7 @@ examples/mcp/*
 - [x] G6 Eval harness、200Q gold set、评分/trace/成本/复现机制。
 - [x] G7 A/B/C 正式实验、错误诊断、效果优化、独立 holdout 再验收。
 - [x] G8 基于实测决定是否启用 selective LLM enrichment，给出 D-arm 结果或拒绝理由。
-- [ ] G9 完整 CI、发布门禁、使用文档和 evidence-backed acceptance report。
+- [x] G9 完整 CI、发布门禁、使用文档和 evidence-backed acceptance report。
 
 **Codex 工作方式**：按 Gate 实现并在每个 Gate 后运行测试、记录证据，然后继续下一阶段；不要只输出设计文件。外部授权、费用、测试语料或客户端不可用时明确标记 `BLOCKED_EXTERNAL` 并完成不依赖这些条件的代码、测试和文档；不得用模拟成绩代替真实 Agent 成绩。
 

@@ -99,3 +99,26 @@ artifact set is only `INSTALLED` until load and inference smoke succeed.
 
 Removing the Knowledge directory or disabling its extension source leaves the
 Agent with no Knowledge tools, navigation entry, or context contribution.
+
+## MCP Server And Agent Skill (0.7 Agent Integration)
+
+Run the read-only MCP server for Codex or any MCP client:
+
+```sh
+shutu-knowledge mcp                      # stdio (what Codex launches)
+shutu-knowledge mcp --http 127.0.0.1:7801
+```
+
+- HTTP is loopback-only; a non-loopback address refuses to start unless
+  `--allow-remote` is passed after you provide authentication, TLS, and a
+  reverse proxy.
+- Install the research Skill by copying
+  `skills/shutu-knowledge-research/` into the client skills directory; see
+  `skills/shutu-knowledge-research/INSTALL.md` and
+  `docs/agent-integration/02-mcp-tools.md`.
+- Upgrade: replace the binary; the storage contract refuses an incompatible
+  downgrade instead of corrupting data. Rollback: restore the previous binary
+  and, if a writer-version bump was crossed, the pre-upgrade backup of the data
+  home.
+- Security baseline, limits, and the threat-model control map:
+  `docs/agent-integration/04-deployment-security.md`.

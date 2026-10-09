@@ -323,7 +323,7 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
-	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget)
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget, nil)
 }
 
 // CompileKnowledgeContextByID compiles context against one immutable semantic
@@ -354,11 +354,11 @@ func (s *Service) CompileKnowledgeContextByID(ctx context.Context, baseID string
 	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
-	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget)
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget, nil)
 }
 
-func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, baseID string, compilation semantic.Compilation, query string, tokenBudget int) (semantic.ContextPackage, error) {
-	memory, err := semantic.SearchCompilation(compilation, semantic.SearchOptions{Query: query, TopK: 8})
+func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, baseID string, compilation semantic.Compilation, query string, tokenBudget int, temporal *semantic.TemporalQuery) (semantic.ContextPackage, error) {
+	memory, err := semantic.SearchCompilation(compilation, semantic.SearchOptions{Query: query, TopK: 8, Temporal: temporal})
 	if err != nil {
 		return semantic.ContextPackage{}, err
 	}
@@ -367,7 +367,13 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 	// (especially “current”). Add the resolved scope as an additional bounded
 	// retrieval query, then let semantic.CompileContext re-rank and filter.
 	plan := semantic.RouteQuery(query)
+	if temporal != nil {
+		plan.Temporal = *temporal
+	}
 	resolvedVersion := plan.Temporal.FromVersion
+	if len(plan.Temporal.Versions) > 0 {
+		resolvedVersion = plan.Temporal.Versions[0]
+	}
 	if plan.Temporal.Intent == semantic.TemporalCurrent || plan.Temporal.Intent == semantic.TemporalValidity {
 		if version, resolvable := semantic.ResolveCurrentVersion(compilation); resolvable {
 			resolvedVersion = version
@@ -450,7 +456,7 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 			return semantic.ContextPackage{}, err
 		}
 		return semantic.CompileContext(compilation, historyEvidence, semantic.ContextCompileOptions{
-			Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
+			Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4, Temporal: temporal,
 		})
 	}
 	targetedEvidence, err := s.versionEvidence(ctx, compilation, query, targetVersions)
@@ -459,8 +465,65 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 	}
 	evidenceItems = append(targetedEvidence, evidenceItems...)
 	return semantic.CompileContext(compilation, evidenceItems, semantic.ContextCompileOptions{
-		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4,
+		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4, Temporal: temporal,
 	})
+}
+
+// CompileKnowledgeContextWithPolicy is the policy-aware active-generation form
+// used by the shared query application.
+func (s *Service) CompileKnowledgeContextWithPolicy(ctx context.Context, baseID, query string, tokenBudget int, temporal *semantic.TemporalQuery) (semantic.ContextPackage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.ContextPackage{}, ErrConflict
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
+	}
+	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget, temporal)
+}
+
+// CompileKnowledgeContextByIDWithPolicy is the policy-aware immutable
+// generation form used by the shared query application.
+func (s *Service) CompileKnowledgeContextByIDWithPolicy(ctx context.Context, baseID string, generation int64, query string, tokenBudget int, temporal *semantic.TemporalQuery) (semantic.ContextPackage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	base, err := s.store.getBaseContext(ctx, baseID)
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	if base.LifecycleState != LifecycleActive {
+		return semantic.ContextPackage{}, ErrConflict
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
+	}
+	if generation <= 0 {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.ContextPackage{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.ContextPackage{}, err
+	}
+	return s.compileKnowledgeContextWithCompilation(ctx, baseID, compilation, query, tokenBudget, temporal)
 }
 
 // historyRangeEvidence projects one provenanced representative for each selected

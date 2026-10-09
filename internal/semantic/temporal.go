@@ -596,6 +596,14 @@ func temporalVersionVisible(unit Unit, temporal TemporalQuery, resolved string) 
 			return containsIdentity(temporal.Versions, version)
 		}
 		return statusOK
+	case TemporalRangeHistory:
+		if unit.Status == UnitDeleted {
+			return false
+		}
+		if temporal.Range != nil && version != "" {
+			return temporal.Range.ContainsVersion(version)
+		}
+		return statusOK || unit.Status == UnitSuperseded
 	default:
 		return unit.Status == UnitActive
 	}

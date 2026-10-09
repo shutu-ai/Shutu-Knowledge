@@ -47,6 +47,9 @@ The shared request starts with:
 - `Mode`: `evidence`, `semantic`, `hybrid`, or `auto`.
 - `EvidenceMode`: existing retrieval lane (`auto`, `hybrid`, `vector`, `lexical`) used while the explicit evidence REST/tool DTO remains stable.
 - `Generation`: semantic `active` or immutable numeric generation; context compilation supports both active and pinned generations.
+- `VersionPolicy`: `current`, `all`, `as_of`, or an ordered semantic `range`.
+  - Semantic search and context compilation enforce the policy against compiled source versions.
+  - Current evidence retrieval always resolves active documents. If a non-current policy includes evidence, the shared result marks `VERSION_POLICY_DEGRADED` and `degraded=true`; it never claims that retired evidence was queried.
 - `Filter`: existing evidence filter until the unified filter contract is expanded.
 - `TopK`, `Debug`, and structured inclusion.
 

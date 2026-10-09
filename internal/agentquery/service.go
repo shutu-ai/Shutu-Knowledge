@@ -35,9 +35,9 @@ type Generation string
 
 const GenerationActive Generation = "active"
 
-// Explicit document version policy is reserved for the shared contract. The
-// current compiler already honors temporal intent inside semantic/context
-// assembly; general evidence filtering arrives with the Phase 2 contract.
+// DocumentVersionPolicy is the requested temporal scope. Current is the only
+// policy supported by the evidence lane today; semantic supports as-of, range,
+// and all.
 type DocumentVersionPolicy string
 
 const (
@@ -46,6 +46,15 @@ const (
 	VersionRange   DocumentVersionPolicy = "range"
 	VersionAll     DocumentVersionPolicy = "all"
 )
+
+// VersionPolicy carries explicit temporal bounds. Unknown or unsupported
+// bounds are rejected rather than silently interpreted by query routing.
+type VersionPolicy struct {
+	Type        DocumentVersionPolicy `json:"type,omitempty"`
+	AsOf        string                `json:"asOf,omitempty"`
+	FromVersion string                `json:"fromVersion,omitempty"`
+	ToVersion   string                `json:"toVersion,omitempty"`
+}
 
 // Diagnostic is a bounded, stable application-layer diagnostic. It is not a
 // substitute for a transport error when the requested mode cannot run.
@@ -59,17 +68,18 @@ type Diagnostic struct {
 // Request is the shared query shape. Explicit BaseIDs authorize/limit the
 // call; when omitted, the existing enabled Knowledge scope decides the scope.
 type Request struct {
-	Query                 string                  `json:"query"`
-	ExtraQueries          []string                `json:"extraQueries,omitempty"`
-	BaseIDs               []string                `json:"baseIds,omitempty"`
-	Generation            Generation              `json:"generation,omitempty"`
-	DocumentVersionPolicy DocumentVersionPolicy   `json:"documentVersionPolicy,omitempty"`
-	Mode                  Mode                    `json:"mode,omitempty"`
-	EvidenceMode          string                  `json:"evidenceMode,omitempty"`
-	TopK                  int                     `json:"topK,omitempty"`
-	Filter                *knowledge.SearchFilter `json:"filter,omitempty"`
-	Debug                 bool                    `json:"debug,omitempty"`
-	IncludeStructured     bool                    `json:"includeStructured,omitempty"`
+	Query             string                  `json:"query"`
+	ExtraQueries      []string                `json:"extraQueries,omitempty"`
+	BaseIDs           []string                `json:"baseIds,omitempty"`
+	Generation        Generation              `json:"generation,omitempty"`
+	VersionPolicy     VersionPolicy           `json:"versionPolicy,omitempty"`
+	Mode              Mode                    `json:"mode,omitempty"`
+	EvidenceMode      string                  `json:"evidenceMode,omitempty"`
+	SemanticKinds     []semantic.UnitKind     `json:"semanticKinds,omitempty"`
+	TopK              int                     `json:"topK,omitempty"`
+	Filter            *knowledge.SearchFilter `json:"filter,omitempty"`
+	Debug             bool                    `json:"debug,omitempty"`
+	IncludeStructured bool                    `json:"includeStructured,omitempty"`
 }
 
 // Result is the shared response envelope. Evidence is authoritative; semantic
@@ -124,10 +134,11 @@ type BaseEvidenceSnapshot struct {
 // produces one independently scoped package per base; packages are never
 // merged into a fake cross-base generation.
 type ContextRequest struct {
-	Query       string     `json:"query"`
-	BaseIDs     []string   `json:"baseIds,omitempty"`
-	Generation  Generation `json:"generation,omitempty"`
-	TokenBudget int        `json:"tokenBudget,omitempty"`
+	Query         string        `json:"query"`
+	BaseIDs       []string      `json:"baseIds,omitempty"`
+	Generation    Generation    `json:"generation,omitempty"`
+	VersionPolicy VersionPolicy `json:"versionPolicy,omitempty"`
+	TokenBudget   int           `json:"tokenBudget,omitempty"`
 }
 
 // ContextResult contains one package per authorized base.
@@ -184,7 +195,6 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 	}
 	request.Mode = normalizeMode(request.Mode)
 	request.Generation = normalizeGeneration(request.Generation)
-	request.DocumentVersionPolicy = normalizeVersionPolicy(request.DocumentVersionPolicy)
 	if strings.TrimSpace(request.Query) == "" {
 		return Result{}, errors.New("query is required")
 	}
@@ -193,8 +203,9 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 			return Result{}, fmt.Errorf("generation must be %q or a positive integer: %w", GenerationActive, err)
 		}
 	}
-	if request.DocumentVersionPolicy == VersionAsOf || request.DocumentVersionPolicy == VersionRange {
-		return Result{}, errors.New("documentVersionPolicy as_of/range requires explicit temporal bounds")
+	temporal, err := validateVersionPolicy(request.VersionPolicy)
+	if err != nil {
+		return Result{}, err
 	}
 
 	scope, err := s.resolveScope(ctx, request.BaseIDs)
@@ -218,10 +229,18 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 		}
 		result.Evidence = evidence
 		result.EvidenceSnapshots = evidenceSnapshots(evidence.Generations)
+		if temporal.Intent != semantic.TemporalNone && temporal.Intent != semantic.TemporalCurrent {
+			result.Diagnostics = append(result.Diagnostics, Diagnostic{
+				Code:     "VERSION_POLICY_DEGRADED",
+				Message:  "evidence retrieval currently resolves active documents only; semantic lane was filtered by version policy",
+				Severity: "warning",
+			})
+			result.Degraded = true
+		}
 	}
 
 	if request.Mode != ModeEvidence {
-		semanticResults, snapshots, diagnostics := s.searchSemantic(ctx, request, scope)
+		semanticResults, snapshots, diagnostics := s.searchSemantic(ctx, request, temporal, scope)
 		result.Semantic = semanticResults
 		result.Snapshots = append(result.Snapshots, snapshots...)
 		result.Diagnostics = append(result.Diagnostics, diagnostics...)
@@ -256,6 +275,10 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	if strings.TrimSpace(request.Query) == "" {
 		return ContextResult{}, errors.New("query is required")
 	}
+	temporal, err := validateVersionPolicy(request.VersionPolicy)
+	if err != nil {
+		return ContextResult{}, err
+	}
 	pinnedGeneration := int64(0)
 	if request.Generation != GenerationActive {
 		parsed, parseErr := strconv.ParseInt(string(request.Generation), 10, 64)
@@ -273,9 +296,9 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 		var pkg semantic.ContextPackage
 		var err error
 		if pinnedGeneration > 0 {
-			pkg, err = s.knowledge.CompileKnowledgeContextByID(ctx, baseID, pinnedGeneration, request.Query, request.TokenBudget)
+			pkg, err = s.knowledge.CompileKnowledgeContextByIDWithPolicy(ctx, baseID, pinnedGeneration, request.Query, request.TokenBudget, &temporal)
 		} else {
-			pkg, err = s.knowledge.CompileKnowledgeContext(ctx, baseID, request.Query, request.TokenBudget)
+			pkg, err = s.knowledge.CompileKnowledgeContextWithPolicy(ctx, baseID, request.Query, request.TokenBudget, &temporal)
 		}
 		if errors.Is(err, knowledge.ErrNotFound) {
 			out.Diagnostics = append(out.Diagnostics, Diagnostic{
@@ -396,7 +419,7 @@ func (s *Service) searchEvidence(ctx context.Context, request Request, scope []s
 	return &result, nil
 }
 
-func (s *Service) searchSemantic(ctx context.Context, request Request, scope []string) ([]BaseSemanticResult, []Snapshot, []Diagnostic) {
+func (s *Service) searchSemantic(ctx context.Context, request Request, temporal semantic.TemporalQuery, scope []string) ([]BaseSemanticResult, []Snapshot, []Diagnostic) {
 	results := make([]BaseSemanticResult, 0, len(scope))
 	snapshots := make([]Snapshot, 0, len(scope))
 	diagnostics := make([]Diagnostic, 0)
@@ -410,7 +433,7 @@ func (s *Service) searchSemantic(ctx context.Context, request Request, scope []s
 			continue
 		}
 		response, err := semantic.SearchCompilation(compilation, semantic.SearchOptions{
-			Query: request.Query, TopK: request.TopK,
+			Query: request.Query, TopK: request.TopK, Kinds: request.SemanticKinds, Temporal: &temporal,
 		})
 		if err != nil {
 			diagnostics = append(diagnostics, Diagnostic{
@@ -537,12 +560,65 @@ func normalizeGeneration(generation Generation) Generation {
 	return generation
 }
 
-func normalizeVersionPolicy(policy DocumentVersionPolicy) DocumentVersionPolicy {
-	switch policy {
-	case VersionCurrent, VersionAsOf, VersionRange, VersionAll:
-		return policy
+func validateVersionPolicy(policy VersionPolicy) (semantic.TemporalQuery, error) {
+	normalized := policy
+	if normalized.Type == "" {
+		normalized.Type = VersionCurrent
+	}
+	switch normalized.Type {
+	case VersionCurrent:
+		if normalized.AsOf != "" || normalized.FromVersion != "" || normalized.ToVersion != "" {
+			return semantic.TemporalQuery{}, errors.New("current version policy accepts no version bounds")
+		}
+		return semantic.TemporalQuery{Intent: semantic.TemporalCurrent, Confidence: 1}, nil
+	case VersionAll:
+		if normalized.AsOf != "" || normalized.FromVersion != "" || normalized.ToVersion != "" {
+			return semantic.TemporalQuery{}, errors.New("all version policy accepts no version bounds")
+		}
+		return semantic.TemporalQuery{Intent: semantic.TemporalEvolution, Confidence: 1}, nil
+	case VersionAsOf:
+		if strings.TrimSpace(normalized.AsOf) == "" {
+			return semantic.TemporalQuery{}, errors.New("as_of version policy requires asOf")
+		}
+		if normalized.FromVersion != "" || normalized.ToVersion != "" {
+			return semantic.TemporalQuery{}, errors.New("as_of version policy does not accept range bounds")
+		}
+		identity, ok := semantic.NormalizeVersionIdentity(normalized.AsOf)
+		if !ok {
+			return semantic.TemporalQuery{}, fmt.Errorf("invalid asOf version %q", normalized.AsOf)
+		}
+		return semantic.TemporalQuery{Intent: semantic.TemporalExplicitVersion, Versions: []string{identity}, Confidence: 1}, nil
+	case VersionRange:
+		from := strings.TrimSpace(normalized.FromVersion)
+		to := strings.TrimSpace(normalized.ToVersion)
+		if from == "" || to == "" {
+			return semantic.TemporalQuery{}, errors.New("range version policy requires fromVersion and toVersion")
+		}
+		if normalized.AsOf != "" {
+			return semantic.TemporalQuery{}, errors.New("range version policy does not accept asOf")
+		}
+		fromIdentity, ok := semantic.NormalizeVersionIdentity(from)
+		if !ok {
+			return semantic.TemporalQuery{}, fmt.Errorf("invalid fromVersion %q", from)
+		}
+		toIdentity, toOK := semantic.NormalizeVersionIdentity(to)
+		if !toOK {
+			return semantic.TemporalQuery{}, fmt.Errorf("invalid toVersion %q", to)
+		}
+		if order, comparable := semantic.CompareVersionIdentity(fromIdentity, toIdentity); !comparable || order > 0 {
+			return semantic.TemporalQuery{}, fmt.Errorf("version range %q..%q is unordered or incomparable", from, to)
+		}
+		inclusive := true
+		return semantic.TemporalQuery{
+			Intent: semantic.TemporalRangeHistory, Confidence: 1,
+			Range: &semantic.TemporalRange{
+				Kind: semantic.RangeVersion, Confidence: 1,
+				Start: &semantic.RangeBoundary{Value: fromIdentity, Inclusive: inclusive},
+				End:   &semantic.RangeBoundary{Value: toIdentity, Inclusive: inclusive},
+			},
+		}, nil
 	default:
-		return VersionCurrent
+		return semantic.TemporalQuery{}, fmt.Errorf("unsupported version policy %q", normalized.Type)
 	}
 }
 

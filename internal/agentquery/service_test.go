@@ -8,7 +8,9 @@ import (
 
 	"github.com/shutu-ai/shutu-knowledge/internal/config"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 	"github.com/shutu-ai/shutu-knowledge/internal/storage"
+	"strings"
 )
 
 func newQueryFixture(t *testing.T) (*Service, knowledge.Base) {
@@ -28,10 +30,17 @@ func newQueryFixture(t *testing.T) (*Service, knowledge.Base) {
 	if err != nil {
 		t.Fatalf("create base: %v", err)
 	}
-	_, err = service.AddTextDocument(context.Background(), base.ID, "KPI overview",
-		"# KPI overview\n\nThe KPI is calculated from the SDR counter and refreshed every fifteen minutes.")
-	if err != nil {
+	if _, err := service.AddTextDocument(context.Background(), base.ID, "KPI overview",
+		"# KPI overview\n\nThe KPI is calculated from the SDR counter and refreshed every fifteen minutes."); err != nil {
 		t.Fatalf("add text: %v", err)
+	}
+	if _, err := service.AddTextDocument(context.Background(), base.ID, "Release v0.2",
+		"# Release v0.2\n\nVersion 0.2 supports the 128k context window."); err != nil {
+		t.Fatalf("add old release: %v", err)
+	}
+	if _, err := service.AddTextDocument(context.Background(), base.ID, "Release v0.3",
+		"# Release v0.3\n\nVersion 0.3 supports the 1M context window."); err != nil {
+		t.Fatalf("add new release: %v", err)
 	}
 	return New(service), base
 }
@@ -143,6 +152,96 @@ func TestAgentQuerySemanticHybridGenerationAndContext(t *testing.T) {
 		t.Fatalf("pinned snapshot: %+v", pinned.Snapshots)
 	}
 
+}
+
+func TestAgentQueryVersionPolicyFiltersSemanticFacts(t *testing.T) {
+	ctx := context.Background()
+	service, base := newQueryFixture(t)
+	if _, err := service.knowledge.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatalf("compile semantic memory: %v", err)
+	}
+	factKinds := []semantic.UnitKind{semantic.UnitFact}
+
+	current, err := service.Search(ctx, Request{
+		Query: "context window", BaseIDs: []string{base.ID}, Mode: ModeSemantic,
+		SemanticKinds: factKinds, TopK: 10,
+	})
+	if err != nil {
+		t.Fatalf("current semantic search: %v", err)
+	}
+	if containsFactText(current, "128k") || !containsFactText(current, "1M") {
+		t.Fatalf("current policy facts: %+v", current.Semantic)
+	}
+
+	old, err := service.Search(ctx, Request{
+		Query: "context window", BaseIDs: []string{base.ID}, Mode: ModeSemantic,
+		SemanticKinds: factKinds, TopK: 10,
+		VersionPolicy: VersionPolicy{Type: VersionAsOf, AsOf: "0.2"},
+	})
+	if err != nil {
+		t.Fatalf("as-of semantic search: %v", err)
+	}
+	if !containsFactText(old, "128k") || containsFactText(old, "1M") {
+		t.Fatalf("as-of policy facts: %+v", old.Semantic)
+	}
+
+	all, err := service.Search(ctx, Request{
+		Query: "context window", BaseIDs: []string{base.ID}, Mode: ModeSemantic,
+		SemanticKinds: factKinds, TopK: 10,
+		VersionPolicy: VersionPolicy{Type: VersionAll},
+	})
+	if err != nil {
+		t.Fatalf("all semantic search: %v", err)
+	}
+	if !containsFactText(all, "128k") || !containsFactText(all, "1M") {
+		t.Fatalf("all policy facts: %+v", all.Semantic)
+	}
+
+	ranged, err := service.Search(ctx, Request{
+		Query: "context window", BaseIDs: []string{base.ID}, Mode: ModeSemantic,
+		SemanticKinds: factKinds, TopK: 10,
+		VersionPolicy: VersionPolicy{Type: VersionRange, FromVersion: "0.2", ToVersion: "0.3"},
+	})
+	if err != nil {
+		t.Fatalf("range semantic search: %v", err)
+	}
+	if !containsFactText(ranged, "128k") || !containsFactText(ranged, "1M") {
+		t.Fatalf("range policy facts: %+v", ranged.Semantic)
+	}
+}
+
+func TestAgentQueryContextHonorsVersionPolicy(t *testing.T) {
+	ctx := context.Background()
+	service, base := newQueryFixture(t)
+	if _, err := service.knowledge.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatalf("compile semantic memory: %v", err)
+	}
+	result, err := service.Context(ctx, ContextRequest{
+		Query: "What did the context window support?", BaseIDs: []string{base.ID},
+		TokenBudget:   2048,
+		VersionPolicy: VersionPolicy{Type: VersionAsOf, AsOf: "0.2"},
+	})
+	if err != nil {
+		t.Fatalf("as-of context: %v", err)
+	}
+	if len(result.Packages) != 1 || result.Packages[0].Package.TemporalIntent != string(semantic.TemporalExplicitVersion) {
+		t.Fatalf("as-of context result: %+v", result)
+	}
+	joined := strings.Join(result.Packages[0].Package.Facts, "\n")
+	if !strings.Contains(joined, "128k") || strings.Contains(joined, "1M") {
+		t.Fatalf("as-of context facts: %+v", result.Packages[0].Package.Facts)
+	}
+}
+
+func containsFactText(result Result, needle string) bool {
+	for _, base := range result.Semantic {
+		for _, hit := range base.Response.Hits {
+			if strings.Contains(strings.ToLower(hit.Unit.Content), strings.ToLower(needle)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestAgentQueryContextMissingSemanticReportsDegradation(t *testing.T) {

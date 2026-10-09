@@ -20,6 +20,9 @@ type SearchOptions struct {
 	TopK   int
 	Kinds  []UnitKind
 	Intent QueryIntent
+	// Temporal, when non-nil, supplies an explicit scope and overrides lexical
+	// temporal routing. Callers must not use this to invent a chronology.
+	Temporal *TemporalQuery
 }
 
 // SearchHit is one activated semantic unit and its exact evidence closure.
@@ -52,6 +55,9 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 		return SearchResponse{}, fmt.Errorf("semantic search requires a compilation scope")
 	}
 	routing := RouteQuery(options.Query)
+	if options.Temporal != nil {
+		routing.Temporal = *options.Temporal
+	}
 	intent := options.Intent
 	if intent == "" {
 		intent = routing.Intent
@@ -107,7 +113,9 @@ func SearchCompilation(compilation Compilation, options SearchOptions) (SearchRe
 		}
 		if temporal.Intent != TemporalNone {
 			score += temporalVersionBoost(unit, temporal, resolved)
-			if score <= 0 { continue }
+			if score <= 0 {
+				continue
+			}
 		}
 		candidates = append(candidates, candidate{hit: SearchHit{
 			Unit: unit, Score: score, Coverage: coverage, MatchedTerms: matched,

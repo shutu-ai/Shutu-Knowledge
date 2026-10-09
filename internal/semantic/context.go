@@ -20,6 +20,7 @@ type ContextCompileOptions struct {
 	TokenBudget int
 	TopK        int
 	FactTopK    int
+	Temporal    *TemporalQuery
 }
 
 // ContextEvidence is the caller-owned exact evidence candidate. It is normally
@@ -86,6 +87,9 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 		return ContextPackage{}, fmt.Errorf("context compilation requires a semantic generation")
 	}
 	routing := RouteQuery(query)
+	if options.Temporal != nil {
+		routing.Temporal = *options.Temporal
+	}
 	intent := strings.TrimSpace(options.Intent)
 	if intent == "" {
 		intent = string(routing.Intent)
@@ -104,11 +108,11 @@ func CompileContext(compilation Compilation, evidence []ContextEvidence, options
 		budget = 32768
 	}
 
-	orientation, err := SearchCompilation(compilation, SearchOptions{Query: query, TopK: topK})
+	orientation, err := SearchCompilation(compilation, SearchOptions{Query: query, TopK: topK, Temporal: options.Temporal})
 	if err != nil {
 		return ContextPackage{}, err
 	}
-	facts, err := SearchCompilation(compilation, SearchOptions{Query: query, TopK: factTopK, Kinds: []UnitKind{UnitFact}})
+	facts, err := SearchCompilation(compilation, SearchOptions{Query: query, TopK: factTopK, Kinds: []UnitKind{UnitFact}, Temporal: options.Temporal})
 	if err != nil {
 		return ContextPackage{}, err
 	}

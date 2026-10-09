@@ -1,0 +1,316 @@
+{
+  "label": "hybrid",
+  "mode": "hybrid",
+  "top_k": 10,
+  "version": "0.7.0",
+  "gold_questions": 12,
+  "timestamp": "2026-10-09T23:21:27Z",
+  "per_question": [
+    {
+      "question_id": "tiny-001",
+      "category": "exact_fact",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 5.816666666666666
+    },
+    {
+      "question_id": "tiny-002",
+      "category": "exact_fact",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 3.483333333333333
+    },
+    {
+      "question_id": "tiny-003",
+      "category": "exact_fact",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 2.8166666666666664
+    },
+    {
+      "question_id": "tiny-004",
+      "category": "cross_document",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 2,
+      "total_locators": 2,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 0.8225195728491924
+    },
+    {
+      "question_id": "tiny-005",
+      "category": "cross_document",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 2,
+      "total_locators": 2,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 0.8878737738732302
+    },
+    {
+      "question_id": "tiny-006",
+      "category": "multi_hop",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 2,
+      "total_locators": 2,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 3.3375
+    },
+    {
+      "question_id": "tiny-007",
+      "category": "multi_hop",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 1.9681818181818183
+    },
+    {
+      "question_id": "tiny-008",
+      "category": "temporal",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0"
+      ],
+      "matched_locators": 3,
+      "total_locators": 3,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 0.8333333333333333
+    },
+    {
+      "question_id": "tiny-009",
+      "category": "temporal",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 0.8571428571428572
+    },
+    {
+      "question_id": "tiny-010",
+      "category": "conflict_exception",
+      "mode": "hybrid",
+      "expected_abstain": false,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 1,
+      "total_locators": 1,
+      "recall": 1,
+      "full_coverage": true,
+      "abstained": false,
+      "correct": true,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 2
+    },
+    {
+      "question_id": "tiny-011",
+      "category": "no_answer",
+      "mode": "hybrid",
+      "expected_abstain": true,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 0,
+      "total_locators": 0,
+      "recall": 0,
+      "full_coverage": false,
+      "abstained": false,
+      "correct": false,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 2.8166666666666664
+    },
+    {
+      "question_id": "tiny-012",
+      "category": "no_answer",
+      "mode": "hybrid",
+      "expected_abstain": true,
+      "hit_documents": [
+        "4efdb776a4b57b5b755c152535ff00cb",
+        "a84073bcf4bc28ece39787050be478d8",
+        "c60548b30af413dfd04beec42135dba0",
+        "d1eeef4c9b516dcb08277f0f343f0b0e"
+      ],
+      "matched_locators": 0,
+      "total_locators": 0,
+      "recall": 0,
+      "full_coverage": false,
+      "abstained": false,
+      "correct": false,
+      "degraded": false,
+      "elapsed_ms": 0,
+      "semantic_generation": 1,
+      "top_score": 5.483333333333333
+    }
+  ],
+  "summary": {
+    "evidence_recall": 0.8333333333333334,
+    "full_coverage_rate": 0.8333333333333334,
+    "abstain_accuracy": 0.8333333333333334,
+    "answer_accuracy": 0.8333333333333334,
+    "mean_latency_ms": 0,
+    "p95_latency_ms": 0,
+    "degraded_runs": 0,
+    "by_category": [
+      {
+        "category": "conflict_exception",
+        "questions": 1,
+        "evidence_recall": 1,
+        "correct_rate": 1
+      },
+      {
+        "category": "cross_document",
+        "questions": 2,
+        "evidence_recall": 1,
+        "correct_rate": 1
+      },
+      {
+        "category": "exact_fact",
+        "questions": 3,
+        "evidence_recall": 1,
+        "correct_rate": 1
+      },
+      {
+        "category": "multi_hop",
+        "questions": 2,
+        "evidence_recall": 1,
+        "correct_rate": 1
+      },
+      {
+        "category": "no_answer",
+        "questions": 2,
+        "evidence_recall": 0,
+        "correct_rate": 0
+      },
+      {
+        "category": "temporal",
+        "questions": 2,
+        "evidence_recall": 1,
+        "correct_rate": 1
+      }
+    ]
+  }
+}

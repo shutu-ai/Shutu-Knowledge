@@ -1,0 +1,186 @@
+[
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "evidence_recall",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0,
+    "delta": -0.8333333333333334,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "full_coverage_rate",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0,
+    "delta": -0.8333333333333334,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "abstain_accuracy",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0.8333333333333334,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "answer_accuracy",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0,
+    "delta": -0.8333333333333334,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "p95_latency_ms",
+    "base_value": 0,
+    "arm_value": 0,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[conflict_exception]",
+    "base_value": 1,
+    "arm_value": 0,
+    "delta": -1,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[cross_document]",
+    "base_value": 1,
+    "arm_value": 0,
+    "delta": -1,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[exact_fact]",
+    "base_value": 1,
+    "arm_value": 0,
+    "delta": -1,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[multi_hop]",
+    "base_value": 1,
+    "arm_value": 0,
+    "delta": -1,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[no_answer]",
+    "base_value": 0,
+    "arm_value": 0,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "semantic",
+    "metric": "recall[temporal]",
+    "base_value": 1,
+    "arm_value": 0,
+    "delta": -1,
+    "relative": -1
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "evidence_recall",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0.8333333333333334,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "full_coverage_rate",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0.8333333333333334,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "abstain_accuracy",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0.8333333333333334,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "answer_accuracy",
+    "base_value": 0.8333333333333334,
+    "arm_value": 0.8333333333333334,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "p95_latency_ms",
+    "base_value": 0,
+    "arm_value": 0,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[conflict_exception]",
+    "base_value": 1,
+    "arm_value": 1,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[cross_document]",
+    "base_value": 1,
+    "arm_value": 1,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[exact_fact]",
+    "base_value": 1,
+    "arm_value": 1,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[multi_hop]",
+    "base_value": 1,
+    "arm_value": 1,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[no_answer]",
+    "base_value": 0,
+    "arm_value": 0,
+    "delta": 0
+  },
+  {
+    "base": "evidence",
+    "arm": "hybrid",
+    "metric": "recall[temporal]",
+    "base_value": 1,
+    "arm_value": 1,
+    "delta": 0
+  }
+]

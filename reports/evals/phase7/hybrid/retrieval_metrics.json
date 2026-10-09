@@ -1,0 +1,47 @@
+{
+  "evidence_recall": 0.8333333333333334,
+  "full_coverage_rate": 0.8333333333333334,
+  "abstain_accuracy": 0.8333333333333334,
+  "answer_accuracy": 0.8333333333333334,
+  "mean_latency_ms": 0,
+  "p95_latency_ms": 0,
+  "degraded_runs": 0,
+  "by_category": [
+    {
+      "category": "conflict_exception",
+      "questions": 1,
+      "evidence_recall": 1,
+      "correct_rate": 1
+    },
+    {
+      "category": "cross_document",
+      "questions": 2,
+      "evidence_recall": 1,
+      "correct_rate": 1
+    },
+    {
+      "category": "exact_fact",
+      "questions": 3,
+      "evidence_recall": 1,
+      "correct_rate": 1
+    },
+    {
+      "category": "multi_hop",
+      "questions": 2,
+      "evidence_recall": 1,
+      "correct_rate": 1
+    },
+    {
+      "category": "no_answer",
+      "questions": 2,
+      "evidence_recall": 0,
+      "correct_rate": 0
+    },
+    {
+      "category": "temporal",
+      "questions": 2,
+      "evidence_recall": 1,
+      "correct_rate": 1
+    }
+  ]
+}

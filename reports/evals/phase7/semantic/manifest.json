@@ -1,0 +1,9 @@
+{
+  "git_commit": "",
+  "gold_questions": 12,
+  "label": "semantic",
+  "mode": "semantic",
+  "timestamp": "2026-10-09T23:21:27Z",
+  "top_k": 10,
+  "version": "0.7.0"
+}

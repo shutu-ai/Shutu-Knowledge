@@ -13,13 +13,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shutu-ai/shutu-knowledge/internal/agentquery"
 	"github.com/shutu-ai/shutu-knowledge/internal/app"
 	"github.com/shutu-ai/shutu-knowledge/internal/knowledge"
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
 	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 	"os"
 	"path/filepath"
+	"reflect"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -1283,4 +1286,77 @@ func TestRuntimeStatusExposesOnlyConfiguredHelpers(t *testing.T) {
 
 func base64Of(text string) string {
 	return base64.StdEncoding.EncodeToString([]byte(text))
+}
+
+func TestRESTSearchAndContextMatchSharedQueryApplication(t *testing.T) {
+	s := newTestServer(t)
+	code, payload := call(t, s, "POST", "/api/bases", map[string]any{"name": "Shared REST"})
+	if code != http.StatusOK {
+		t.Fatalf("create base: %d %v", code, payload)
+	}
+	baseID := valueMap(t, payload)["id"].(string)
+	createTextDocument(t, s, baseID, "Shared REST source", "The shared KPI contract keeps REST citations aligned with tools.")
+
+	request := knowledge.SearchRequest{
+		Query: "KPI", BaseIDs: []string{baseID}, TopK: 10, Mode: "lexical",
+	}
+	shared, err := s.app.AgentQuery.Search(context.Background(), agentquery.Request{
+		Query: request.Query, BaseIDs: request.BaseIDs, Mode: agentquery.ModeEvidence,
+		EvidenceMode: request.Mode, TopK: request.TopK,
+	})
+	if err != nil {
+		t.Fatalf("shared search: %v", err)
+	}
+	code, payload = call(t, s, "POST", "/api/search", request)
+	if code != http.StatusOK || valueMap(t, payload)["total"].(float64) != 1 {
+		t.Fatalf("REST search: %d %v", code, payload)
+	}
+	restJSON, err := json.Marshal(valueMap(t, payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restResult knowledge.SearchResult
+	if err := json.Unmarshal(restJSON, &restResult); err != nil {
+		t.Fatal(err)
+	}
+	sharedEvidence := *shared.Evidence
+	restResult.ElapsedMS = 0
+	sharedEvidence.ElapsedMS = 0
+	if !reflect.DeepEqual(restResult, sharedEvidence) {
+		t.Fatalf("REST and shared search diverged:\nREST=%#v\nshared=%#v", restResult, sharedEvidence)
+	}
+
+	if _, err := s.app.Knowledge.CompileSemanticMemory(context.Background(), baseID); err != nil {
+		t.Fatal(err)
+	}
+	query := "How is the shared KPI contract used?"
+	sharedContext, err := s.app.AgentQuery.ContextForBase(context.Background(), baseID, query, 2048)
+	if err != nil {
+		t.Fatalf("shared context: %v", err)
+	}
+	code, payload = call(t, s, "POST", "/api/bases/"+baseID+"/semantic/context", map[string]any{
+		"query": query, "tokenBudget": 2048,
+	})
+	if code != http.StatusOK {
+		t.Fatalf("REST context: %d %v", code, payload)
+	}
+	contextJSON, err := json.Marshal(valueMap(t, payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restContext semantic.ContextPackage
+	if err := json.Unmarshal(contextJSON, &restContext); err != nil {
+		t.Fatal(err)
+	}
+	sharedJSON, err := json.Marshal(sharedContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restContextJSON, err := json.Marshal(restContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sharedJSON, restContextJSON) {
+		t.Fatalf("REST and shared context diverged:\nshared=%s\nrest=%s", sharedJSON, restContextJSON)
+	}
 }

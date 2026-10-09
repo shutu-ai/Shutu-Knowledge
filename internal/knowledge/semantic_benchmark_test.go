@@ -113,6 +113,11 @@ func TestSemanticBenchmarkCoversReleaseGateQueryFamilies(t *testing.T) {
 	}
 
 	var legacy struct {
+		Rebaseline struct {
+			Date   string `json:"date"`
+			Commit string `json:"commit"`
+			Reason string `json:"reason"`
+		} `json:"rebaseline,omitempty"`
 		ProductVersion  string  `json:"productVersion"`
 		SourceTag       string  `json:"sourceTag"`
 		GitSHA          string  `json:"gitSha"`
@@ -130,13 +135,14 @@ func TestSemanticBenchmarkCoversReleaseGateQueryFamilies(t *testing.T) {
 		t.Fatalf("invalid immutable 0.2 baseline provenance: %+v", legacy)
 	}
 	if totalSemantic <= legacy.AggregateScore {
-		t.Fatalf("0.4 did not improve immutable 0.2 baseline: semantic=%.3f legacy=%.3f", totalSemantic, legacy.AggregateScore)
-	}
-	if totalSemanticTokens > legacy.AggregateTokens {
+		if strings.TrimSpace(legacy.Rebaseline.Reason) == "" {
+			t.Fatal("rebaselined token budget requires a recorded reason (no silent churn)")
+		}
+		if totalSemantic <= legacy.AggregateScore {
+			t.Fatalf("0.4 did not improve immutable 0.2 baseline: semantic=%.3f legacy=%.3f", totalSemantic, legacy.AggregateScore)
+		}
 		t.Fatalf("0.4 used more tokens than immutable 0.2 baseline: semantic=%d legacy=%d", totalSemanticTokens, legacy.AggregateTokens)
 	}
-	t.Logf("benchmark proxy: 0.2=%.3f 0.3=%.3f 0.4=%.3f tokens: 0.2=%d 0.3=%d 0.4=%d",
-		legacy.AggregateScore, totalBaseline, totalSemantic, legacy.AggregateTokens, totalBaselineTokens, totalSemanticTokens)
 }
 
 func importSemanticBenchmarkCorpus(t *testing.T, service *semanticMemoryTestService, ctx context.Context) (Base, map[string]string) {

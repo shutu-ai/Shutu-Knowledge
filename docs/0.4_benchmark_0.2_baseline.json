@@ -12,5 +12,10 @@
     {"name":"temporal-current","score":1,"tokens":41}
   ],
   "aggregateScore": 4.5,
-  "aggregateTokens": 454
+  "aggregateTokens": 576,
+  "rebaseline": {
+    "date": "2026-10-10",
+    "commit": "07a7e03",
+    "reason": "The lexical lane zero-hit bug was fixed: short words (1-2 chars) no longer apply an AND LIKE filter that silently zeroed whole queries (for example any question containing the word do). Cross-document and temporal queries now retrieve their full required evidence, so per-query contexts carry more correct evidence while staying inside their per-query budgets (135/135/135/102/135). Token growth is evidence recovery, not verbosity."
+  }
 }

@@ -64,14 +64,29 @@ func ftsTerms(query string) (matchTerms, likeTerms []string) {
 	if len(all) > maxMatchTerms {
 		all = all[:maxMatchTerms]
 	}
+	// Single- and double-character pure-letter words carry almost no lexical
+	// weight and used to zero out whole queries through the AND LIKE filter
+	// (for example a question ending in the word do, which appears nowhere
+	// verbatim in the corpus). Drop those. Numeric short tokens (page 12,
+	// error E-2) stay: they are precise locators, and dropping them broke
+	// exact page/number provenance retrieval.
 	for _, token := range unicodeWord.FindAllString(query, -1) {
-		if len([]rune(token)) < 3 {
+		runes := []rune(token)
+		if len(runes) < 3 && containsDigit(runes) {
 			likeTerms = append(likeTerms, token)
 		}
 	}
 	return all, likeTerms
 }
 
+func containsDigit(runes []rune) bool {
+	for _, r := range runes {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	return false
+}
 func isUnsegmentedScript(r rune) bool {
 	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r)
 }

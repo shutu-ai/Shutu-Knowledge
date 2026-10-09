@@ -24,7 +24,7 @@ Rules:
 5. Evidence is authoritative. Semantic and structured lanes are separately labeled.
 6. Semantic failures do not silently become evidence results.
 7. Capability discovery reports structured readiness only when active structured models exist.
-7. All cross-base requests pass through one scope resolution routine.
+8. All cross-base requests pass through one scope resolution routine.
 
 ## Current Phase 1 wiring
 
@@ -60,6 +60,7 @@ Current supported policy:
 - `hybrid` still returns evidence and records semantic unavailability as a warning plus `degraded=true`.
 - `auto` plans intent, includes evidence, and includes semantic only when available.
 - A missing semantic compilation never silently rewrites a semantic request into evidence.
+- Shared errors carry stable codes (`INVALID_ARGUMENT`, `PERMISSION_DENIED`, `BASE_NOT_FOUND`, `SEMANTIC_NOT_READY`, `GENERATION_NOT_FOUND`, `VERSION_UNSUPPORTED`) while adapters retain their existing transport shapes.
 
 ## Snapshot strategy
 

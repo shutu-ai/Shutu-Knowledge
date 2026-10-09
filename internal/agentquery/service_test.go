@@ -2,6 +2,7 @@ package agentquery
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -152,6 +153,32 @@ func TestAgentQuerySemanticHybridGenerationAndContext(t *testing.T) {
 		t.Fatalf("pinned snapshot: %+v", pinned.Snapshots)
 	}
 
+}
+
+func TestAgentQueryStableErrorCodes(t *testing.T) {
+	ctx := context.Background()
+	service, base := newQueryFixture(t)
+
+	_, err := service.Search(ctx, Request{Query: "", BaseIDs: []string{base.ID}})
+	var invalid *Error
+	if !errors.As(err, &invalid) || invalid.Code != ErrInvalidArgument {
+		t.Fatalf("empty query error = %v", err)
+	}
+
+	_, err = service.Search(ctx, Request{Query: "KPI", BaseIDs: []string{"missing"}})
+	var missing *Error
+	if !errors.As(err, &missing) || missing.Code != ErrBaseNotFound || missing.BaseID != "missing" {
+		t.Fatalf("unknown base error = %v", err)
+	}
+
+	_, err = service.Search(ctx, Request{
+		Query: "KPI", BaseIDs: []string{base.ID},
+		VersionPolicy: VersionPolicy{Type: VersionAsOf},
+	})
+	var version *Error
+	if !errors.As(err, &version) || version.Code != ErrInvalidArgument {
+		t.Fatalf("version policy error = %v", err)
+	}
 }
 
 func TestAgentQueryVersionPolicyFiltersSemanticFacts(t *testing.T) {

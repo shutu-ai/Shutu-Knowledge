@@ -56,6 +56,52 @@ type VersionPolicy struct {
 	ToVersion   string                `json:"toVersion,omitempty"`
 }
 
+// ErrorCode is the stable machine-readable application error taxonomy used by
+// all transport adapters. Transport adapters may add protocol details, but must
+// preserve these codes.
+type ErrorCode string
+
+const (
+	ErrInvalidArgument    ErrorCode = "INVALID_ARGUMENT"
+	ErrPermissionDenied   ErrorCode = "PERMISSION_DENIED"
+	ErrBaseNotFound       ErrorCode = "BASE_NOT_FOUND"
+	ErrSemanticNotReady   ErrorCode = "SEMANTIC_NOT_READY"
+	ErrGenerationNotFound ErrorCode = "GENERATION_NOT_FOUND"
+	ErrVersionUnsupported ErrorCode = "VERSION_UNSUPPORTED"
+)
+
+// Error is a stable shared-contract error. BaseID is populated only when the
+// error is scoped to one known request base.
+type Error struct {
+	Code    ErrorCode `json:"code"`
+	BaseID  string    `json:"baseId,omitempty"`
+	Message string    `json:"message"`
+	Cause   error     `json:"-"`
+}
+
+func (e *Error) Error() string {
+	message := e.Message
+	if e.Cause != nil {
+		message = fmt.Sprintf("%s: %v", message, e.Cause)
+	}
+	if e.BaseID == "" {
+		return string(e.Code) + ": " + message
+	}
+	return string(e.Code) + " (" + e.BaseID + "): " + message
+}
+
+func (e *Error) Unwrap() error {
+	return e.Cause
+}
+
+func invalidArgument(format string, args ...any) error {
+	return &Error{Code: ErrInvalidArgument, Message: fmt.Sprintf(format, args...)}
+}
+
+func scopedError(code ErrorCode, baseID, message string, cause error) error {
+	return &Error{Code: code, BaseID: baseID, Message: message, Cause: cause}
+}
+
 // Diagnostic is a bounded, stable application-layer diagnostic. It is not a
 // substitute for a transport error when the requested mode cannot run.
 type Diagnostic struct {
@@ -197,11 +243,11 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 	request.Mode = normalizeMode(request.Mode)
 	request.Generation = normalizeGeneration(request.Generation)
 	if strings.TrimSpace(request.Query) == "" {
-		return Result{}, errors.New("query is required")
+		return Result{}, invalidArgument("query is required")
 	}
 	if request.Generation != GenerationActive && request.Generation != "" {
 		if _, err := strconv.ParseInt(string(request.Generation), 10, 64); err != nil {
-			return Result{}, fmt.Errorf("generation must be %q or a positive integer: %w", GenerationActive, err)
+			return Result{}, &Error{Code: ErrInvalidArgument, Message: fmt.Sprintf("generation must be %q or a positive integer", GenerationActive), Cause: err}
 		}
 	}
 	temporal, err := validateVersionPolicy(request.VersionPolicy)
@@ -247,7 +293,7 @@ func (s *Service) Search(ctx context.Context, request Request) (Result, error) {
 		result.Diagnostics = append(result.Diagnostics, diagnostics...)
 		result.Degraded = request.Mode == ModeHybrid && len(semanticResults) == 0
 		if request.Mode == ModeSemantic && len(semanticResults) == 0 {
-			return result, errors.New("SEMANTIC_NOT_READY: no requested base has an active or pinned semantic generation")
+			return result, &Error{Code: ErrSemanticNotReady, Message: "no requested base has an active or pinned semantic generation"}
 		}
 	}
 
@@ -274,7 +320,7 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	}
 	request.Generation = normalizeGeneration(request.Generation)
 	if strings.TrimSpace(request.Query) == "" {
-		return ContextResult{}, errors.New("query is required")
+		return ContextResult{}, invalidArgument("query is required")
 	}
 	temporal, err := validateVersionPolicy(request.VersionPolicy)
 	if err != nil {
@@ -284,7 +330,7 @@ func (s *Service) Context(ctx context.Context, request ContextRequest) (ContextR
 	if request.Generation != GenerationActive {
 		parsed, parseErr := strconv.ParseInt(string(request.Generation), 10, 64)
 		if parseErr != nil || parsed <= 0 {
-			return ContextResult{}, fmt.Errorf("generation must be %q or a positive integer: %w", GenerationActive, parseErr)
+			return ContextResult{}, &Error{Code: ErrInvalidArgument, Message: fmt.Sprintf("generation must be %q or a positive integer", GenerationActive), Cause: parseErr}
 		}
 		pinnedGeneration = parsed
 	}
@@ -464,17 +510,17 @@ func (s *Service) semanticSnapshot(ctx context.Context, baseID string, generatio
 	if generation == GenerationActive || generation == "" {
 		compilation, err := s.knowledge.GetSemanticCompilation(ctx, baseID)
 		if err != nil {
-			return semantic.Compilation{}, "", errors.New("no active semantic compilation")
+			return semantic.Compilation{}, "", scopedError(ErrSemanticNotReady, baseID, "no active semantic compilation", nil)
 		}
 		return compilation, "active", nil
 	}
 	number, err := strconv.ParseInt(string(generation), 10, 64)
 	if err != nil || number <= 0 {
-		return semantic.Compilation{}, "", fmt.Errorf("invalid semantic generation %q", generation)
+		return semantic.Compilation{}, "", &Error{Code: ErrGenerationNotFound, BaseID: baseID, Message: fmt.Sprintf("invalid semantic generation %q", generation)}
 	}
 	compilation, err := s.knowledge.GetSemanticCompilationByID(ctx, baseID, number)
 	if err != nil {
-		return semantic.Compilation{}, "", fmt.Errorf("semantic generation %d is unavailable", number)
+		return semantic.Compilation{}, "", scopedError(ErrGenerationNotFound, baseID, fmt.Sprintf("semantic generation %d is unavailable", number), nil)
 	}
 	return compilation, "pinned", nil
 }
@@ -530,10 +576,10 @@ func (s *Service) resolveScope(ctx context.Context, requested []string) ([]strin
 			continue
 		}
 		if !existing[id] {
-			return nil, fmt.Errorf("knowledge base %s is not available", id)
+			return nil, scopedError(ErrBaseNotFound, id, "knowledge base is not available", nil)
 		}
 		if explicitAllowed && !allowed[id] {
-			return nil, fmt.Errorf("knowledge base %s is not enabled", id)
+			return nil, scopedError(ErrPermissionDenied, id, "knowledge base is not enabled", nil)
 		}
 		seen[id] = true
 		selected = append(selected, id)
@@ -575,45 +621,45 @@ func validateVersionPolicy(policy VersionPolicy) (semantic.TemporalQuery, error)
 	switch normalized.Type {
 	case VersionCurrent:
 		if normalized.AsOf != "" || normalized.FromVersion != "" || normalized.ToVersion != "" {
-			return semantic.TemporalQuery{}, errors.New("current version policy accepts no version bounds")
+			return semantic.TemporalQuery{}, invalidArgument("current version policy accepts no version bounds")
 		}
 		return semantic.TemporalQuery{Intent: semantic.TemporalCurrent, Confidence: 1}, nil
 	case VersionAll:
 		if normalized.AsOf != "" || normalized.FromVersion != "" || normalized.ToVersion != "" {
-			return semantic.TemporalQuery{}, errors.New("all version policy accepts no version bounds")
+			return semantic.TemporalQuery{}, invalidArgument("all version policy accepts no version bounds")
 		}
 		return semantic.TemporalQuery{Intent: semantic.TemporalEvolution, Confidence: 1}, nil
 	case VersionAsOf:
 		if strings.TrimSpace(normalized.AsOf) == "" {
-			return semantic.TemporalQuery{}, errors.New("as_of version policy requires asOf")
+			return semantic.TemporalQuery{}, invalidArgument("as_of version policy requires asOf")
 		}
 		if normalized.FromVersion != "" || normalized.ToVersion != "" {
-			return semantic.TemporalQuery{}, errors.New("as_of version policy does not accept range bounds")
+			return semantic.TemporalQuery{}, invalidArgument("as_of version policy does not accept range bounds")
 		}
 		identity, ok := semantic.NormalizeVersionIdentity(normalized.AsOf)
 		if !ok {
-			return semantic.TemporalQuery{}, fmt.Errorf("invalid asOf version %q", normalized.AsOf)
+			return semantic.TemporalQuery{}, &Error{Code: ErrVersionUnsupported, Message: fmt.Sprintf("invalid asOf version %q", normalized.AsOf)}
 		}
 		return semantic.TemporalQuery{Intent: semantic.TemporalExplicitVersion, Versions: []string{identity}, Confidence: 1}, nil
 	case VersionRange:
 		from := strings.TrimSpace(normalized.FromVersion)
 		to := strings.TrimSpace(normalized.ToVersion)
 		if from == "" || to == "" {
-			return semantic.TemporalQuery{}, errors.New("range version policy requires fromVersion and toVersion")
+			return semantic.TemporalQuery{}, invalidArgument("range version policy requires fromVersion and toVersion")
 		}
 		if normalized.AsOf != "" {
-			return semantic.TemporalQuery{}, errors.New("range version policy does not accept asOf")
+			return semantic.TemporalQuery{}, invalidArgument("range version policy does not accept asOf")
 		}
 		fromIdentity, ok := semantic.NormalizeVersionIdentity(from)
 		if !ok {
-			return semantic.TemporalQuery{}, fmt.Errorf("invalid fromVersion %q", from)
+			return semantic.TemporalQuery{}, &Error{Code: ErrVersionUnsupported, Message: fmt.Sprintf("invalid fromVersion %q", from)}
 		}
 		toIdentity, toOK := semantic.NormalizeVersionIdentity(to)
 		if !toOK {
-			return semantic.TemporalQuery{}, fmt.Errorf("invalid toVersion %q", to)
+			return semantic.TemporalQuery{}, &Error{Code: ErrVersionUnsupported, Message: fmt.Sprintf("invalid toVersion %q", to)}
 		}
 		if order, comparable := semantic.CompareVersionIdentity(fromIdentity, toIdentity); !comparable || order > 0 {
-			return semantic.TemporalQuery{}, fmt.Errorf("version range %q..%q is unordered or incomparable", from, to)
+			return semantic.TemporalQuery{}, &Error{Code: ErrVersionUnsupported, Message: fmt.Sprintf("version range %q..%q is unordered or incomparable", from, to)}
 		}
 		inclusive := true
 		return semantic.TemporalQuery{
@@ -625,7 +671,7 @@ func validateVersionPolicy(policy VersionPolicy) (semantic.TemporalQuery, error)
 			},
 		}, nil
 	default:
-		return semantic.TemporalQuery{}, fmt.Errorf("unsupported version policy %q", normalized.Type)
+		return semantic.TemporalQuery{}, &Error{Code: ErrVersionUnsupported, Message: fmt.Sprintf("unsupported version policy %q", normalized.Type)}
 	}
 }
 

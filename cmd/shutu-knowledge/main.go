@@ -43,6 +43,8 @@ func main() {
 		err = cmdExtension(ctx)
 	case "doctor":
 		err = cmdDoctor(ctx)
+	case "eval":
+		err = cmdEval(ctx, os.Args[2:])
 	case "version":
 		err = cmdVersion()
 	case "mcp":
@@ -72,6 +74,7 @@ func usage() {
 commands:
   serve       run the standalone HTTP server
   mcp         run the MCP server (stdio by default, --http for streamable HTTP)
+  eval        run the offline retrieval evaluation harness over a gold set
   extension   run the Extension Protocol v1 stdio loop (Agent-managed)
   doctor      check storage, migrations, and dependencies
   version     print version`)

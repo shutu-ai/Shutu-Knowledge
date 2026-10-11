@@ -84,3 +84,57 @@ func TestSemanticAPICompileSearchContextWikiAndProvenance(t *testing.T) {
 		t.Fatalf("semantic evidence = %v", payload["value"])
 	}
 }
+
+func TestSemanticCompileOperationIsDurableAndProgressObserved(t *testing.T) {
+	server := newTestServer(t)
+	base, err := server.app.Knowledge.CreateBase("Semantic Durable Compile", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.app.Knowledge.AddTextDocument(context.Background(), base.ID, "Durable Semantic",
+		"# Durable Semantic\n\nThe durable compiler uses 1024-dimensional vectors."); err != nil {
+		t.Fatal(err)
+	}
+
+	code, payload := call(t, server, "POST", "/api/bases/"+base.ID+"/semantic/compile-operation", map[string]any{})
+	if code != http.StatusAccepted {
+		t.Fatalf("compile operation status = %d body=%v", code, payload)
+	}
+	operationID := valueMap(t, payload)["operationId"].(string)
+	waitForDirectoryOperation(t, server, operationID)
+	operation, err := server.app.Operations.Get(operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Type != "semantic_compile" || operation.State != "succeeded" {
+		t.Fatalf("compile operation = %+v", operation)
+	}
+	if operation.TotalUnits == nil || *operation.TotalUnits != 1 || operation.Phase != "ready" {
+		t.Fatalf("compile progress = total %d phase %q", *operation.TotalUnits, operation.Phase)
+	}
+
+	code, payload = call(t, server, "GET", "/api/bases/"+base.ID+"/semantic", nil)
+	if code != http.StatusOK {
+		t.Fatalf("semantic after operation = %d body=%v", code, payload)
+	}
+	if valueMap(t, payload)["state"] != "active" {
+		t.Fatalf("semantic after operation = %v", payload["value"])
+	}
+}
+
+func TestSemanticCompileOperationRejectsBaseWithoutReadyIR(t *testing.T) {
+	server := newTestServer(t)
+	base, err := server.app.Knowledge.CreateBase("Semantic Empty", "", "", knowledge.BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, payload := call(t, server, "POST", "/api/bases/"+base.ID+"/semantic/compile-operation", map[string]any{})
+	if code != http.StatusBadRequest {
+		t.Fatalf("empty compile status = %d body=%v", code, payload)
+	}
+	errorValue, _ := payload["error"].(map[string]any)
+	if errorValue["message"] != "no ready documents with Document IR in this knowledge base" {
+		t.Fatalf("empty compile error = %v", payload["error"])
+	}
+}

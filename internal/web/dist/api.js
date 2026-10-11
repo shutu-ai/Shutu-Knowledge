@@ -166,6 +166,7 @@ export const api = {
   search: (body) => post("/api/search", body),
   semanticCompilation: (baseID, options = {}) => request(`/api/bases/${baseID}/semantic`, options),
   compileSemanticMemory: (baseID) => post(`/api/bases/${baseID}/semantic/compile`, {}, { timeoutMs: 600000 }),
+  compileSemanticMemoryOperation: (baseID) => post(`/api/bases/${baseID}/semantic/compile-operation`, {}),
   searchSemanticMemory: (baseID, body) => post(`/api/bases/${baseID}/semantic/search`, body),
   compileKnowledgeContext: (baseID, body) => post(`/api/bases/${baseID}/semantic/context`, body),
   semanticWiki: (baseID) => request(`/api/bases/${baseID}/semantic/wiki`),

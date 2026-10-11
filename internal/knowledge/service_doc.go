@@ -716,6 +716,7 @@ func (s *Service) deleteDocumentTree(ctx context.Context, rootID string, onDelet
 			if retireErr := s.semanticStore.RetireActiveCompilation(propagationCtx, root.BaseID); retireErr != nil && !errors.Is(retireErr, semantic.ErrNotFound) {
 				return removed, retireErr
 			}
+			s.invalidateSemanticCompilation(root.BaseID)
 		}
 	}
 	return removed, nil

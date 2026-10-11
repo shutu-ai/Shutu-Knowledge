@@ -213,3 +213,82 @@ func TestTemporalSearchCanRecallSupersededHistory(t *testing.T) {
 		t.Fatalf("historical superseded fact missing: %+v", response.Hits)
 	}
 }
+
+func TestCompilerCleansProjectionReplacementRunes(t *testing.T) {
+	document := sourceDocumentForCompile("doc-clean", "接口�配置",
+		"# 目录\n\n# API�服务\n\n系统使用�API服务来处理认证请求。", 1, 1)
+	compilation, err := Compile("base-clean", 1, []SourceDocument{document}, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenAPIConcept := false
+	for _, unit := range compilation.Units {
+		if strings.Contains(unit.Title, "\\ufffd") || strings.Contains(unit.Content, "\\ufffd") {
+			t.Fatalf("replacement rune leaked into projection: %+v", unit)
+		}
+		if unit.Type == UnitConcept && unit.Title == "API 服务" {
+			seenAPIConcept = true
+		}
+		if unit.Type == UnitConcept && (unit.Title == "目录" || unit.Title == "问题现象" || unit.Title == "..." || strings.HasPrefix(unit.Title, "1.")) {
+			t.Fatalf("boilerplate/procedural concept escaped filter: %+v", unit)
+		}
+	}
+	if !seenAPIConcept {
+		t.Fatalf("cleaned API concept missing: %+v", compilation.Units)
+	}
+	foundFact := false
+	for _, unit := range compilation.Units {
+		if unit.Type == UnitFact && unit.Content == "系统使用 API服务来处理认证请求" {
+			foundFact = true
+		}
+	}
+	if !foundFact {
+		t.Fatalf("cleaned fact missing: %+v", compilation.Units)
+	}
+}
+
+func TestSummaryEvidenceStaysDocumentScoped(t *testing.T) {
+	documents := []SourceDocument{
+		sourceDocumentForCompile("doc-alpha", "Alpha Release", "# Shared Service\n\nThe alpha service uses alpha telemetry.", 1, 1),
+		sourceDocumentForCompile("doc-beta", "Beta Release", "# Shared Service\n\nThe beta service uses beta telemetry.", 1, 1),
+	}
+	compilation, err := Compile("base-scoped-summary", 1, documents, 1_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alphaSummary, betaSummary Unit
+	for _, unit := range compilation.Units {
+		if unit.Type != UnitSummary {
+			continue
+		}
+		if unit.Title == "Alpha Release" {
+			alphaSummary = unit
+		}
+		if unit.Title == "Beta Release" {
+			betaSummary = unit
+		}
+	}
+	if alphaSummary.ID == "" || betaSummary.ID == "" {
+		t.Fatalf("summaries missing: %+v", compilation.Units)
+	}
+	for _, testCase := range []struct {
+		summary    Unit
+		documentID string
+	}{
+		{alphaSummary, "doc-alpha"},
+		{betaSummary, "doc-beta"},
+	} {
+		sources, err := ResolveEvidence(compilation.Units, testCase.summary.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(sources) == 0 {
+			t.Fatalf("summary %s has no evidence", testCase.summary.Title)
+		}
+		for _, source := range sources {
+			if source.DocumentID != testCase.documentID {
+				t.Fatalf("summary %s leaked evidence from %s", testCase.summary.Title, source.DocumentID)
+			}
+		}
+	}
+}

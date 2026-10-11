@@ -20,6 +20,7 @@ import (
 	"github.com/shutu-ai/shutu-knowledge/internal/models"
 	"github.com/shutu-ai/shutu-knowledge/internal/operations"
 	"github.com/shutu-ai/shutu-knowledge/internal/runtime"
+	"github.com/shutu-ai/shutu-knowledge/internal/semantic"
 )
 
 type importTextCommand struct {
@@ -108,6 +109,16 @@ type restoreBaseCommand struct {
 	Name         string                `json:"name"`
 	Config       *knowledge.BaseConfig `json:"config"`
 	TargetBaseID string                `json:"targetBaseId"`
+}
+
+type semanticCompileOperationResult struct {
+	BaseID     string `json:"baseId"`
+	Generation int64  `json:"generation"`
+	Facts      int    `json:"facts"`
+	Concepts   int    `json:"concepts"`
+	Topics     int    `json:"topics"`
+	Summaries  int    `json:"summaries"`
+	Relations  int    `json:"relations"`
 }
 
 // testImportPublished is installed only by a real process-kill child after
@@ -654,6 +665,35 @@ func (a *App) newOperationService() (*operations.Service, error) {
 			return nil, fmt.Errorf("reindex_base requires baseId")
 		}
 		return a.runReindexBaseForOperation(ctx, op.ID, op.Attempt, op.BaseID, report)
+	})
+	service.Register("semantic_compile", func(ctx context.Context, op operations.Operation, _ json.RawMessage, report func(operations.Progress)) (any, error) {
+		if op.BaseID == "" {
+			return nil, fmt.Errorf("semantic_compile requires baseId")
+		}
+		compilation, err := a.Knowledge.CompileSemanticMemoryWithProgress(ctx, op.BaseID, func(phase string, completed, total int) {
+			report(operations.Progress{Phase: phase, Completed: completed, Total: total})
+		})
+		if err != nil {
+			return nil, err
+		}
+		result := semanticCompileOperationResult{
+			BaseID: compilation.BaseID, Generation: compilation.Generation,
+			Relations: len(compilation.Relations),
+		}
+		for _, unit := range compilation.Units {
+			switch unit.Type {
+			case semantic.UnitFact:
+				result.Facts++
+			case semantic.UnitConcept:
+				result.Concepts++
+			case semantic.UnitTopic:
+				result.Topics++
+			case semantic.UnitSummary:
+				result.Summaries++
+			}
+		}
+		report(operations.Progress{Phase: "ready", Completed: result.Summaries, Total: result.Summaries})
+		return result, nil
 	})
 	service.Register("restore_base", func(ctx context.Context, op operations.Operation, payload json.RawMessage, report func(operations.Progress)) (any, error) {
 		var command restoreBaseCommand

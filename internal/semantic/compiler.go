@@ -16,7 +16,7 @@ import (
 
 const (
 	BuiltinCompiler           = "shutu-builtin"
-	BuiltinCompilerVersion    = "0.6.0-range-history"
+	BuiltinCompilerVersion    = "0.7.2-heading-stoplist"
 	BuiltinModel              = "deterministic"
 	BuiltinModelVersion       = "v1"
 	BuiltinPromptVersion      = "none"
@@ -260,7 +260,7 @@ func reconcileTemporalUnits(units []Unit, baseID string, generation int64, now i
 func newTemporalRelation(baseID string, generation int64, relationType RelationType,
 	subject, object *Unit, canonicalKey, statement string, now int64) Relation {
 	relation := Relation{
-		ID: RelationID(baseID, generation, relationType, subject.ID, object.ID, canonicalKey),
+		ID:     RelationID(baseID, generation, relationType, subject.ID, object.ID, canonicalKey),
 		BaseID: baseID, Generation: generation, Type: relationType,
 		SubjectUnitID: subject.ID, ObjectUnitID: object.ID,
 		Predicate: string(relationType), Statement: statement,
@@ -375,21 +375,23 @@ func collectConcepts(documents []SourceDocument) map[string]*conceptCandidate {
 	out := map[string]*conceptCandidate{}
 	for _, doc := range documents {
 		count := 0
-		title := normalizeConceptKey(doc.Title)
+		rawTitle := projectionText(doc.Title)
+		title := normalizeConceptKey(rawTitle)
 		if isUsefulConceptKey(title) && count < maxCompiledConceptsPerDoc {
-			addConceptCandidate(out, doc.Title, title, doc, "")
+			addConceptCandidate(out, rawTitle, title, doc, "")
 			count++
 		}
 		for _, node := range doc.IR.Nodes {
 			if node.Type != documentir.TypeHeading && node.Type != documentir.TypeSection {
 				continue
 			}
-			key := normalizeConceptKey(node.Text)
-			if !isUsefulConceptKey(key) || count >= maxCompiledConceptsPerDoc {
+			rawText := projectionText(node.Text)
+			key := normalizeConceptKey(rawText)
+			if !isUsefulHeadingConcept(rawText, key) || count >= maxCompiledConceptsPerDoc {
 				continue
 			}
-			heading := strings.Join(node.HeadingPath, " / ")
-			addConceptCandidate(out, node.Text, key, doc, heading)
+			heading := projectionHeadingPath(node)
+			addConceptCandidate(out, rawText, key, doc, heading)
 			count++
 		}
 	}
@@ -430,7 +432,7 @@ func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandid
 			if count >= maxCompiledFactsPerDoc {
 				break
 			}
-			text := strings.TrimSpace(node.Text)
+			text := strings.TrimSpace(projectionText(node.Text))
 			if text == "" || node.Type == documentir.TypeDocument || node.Type == documentir.TypeHeading ||
 				node.Type == documentir.TypeSection || node.Type == documentir.TypeHeader ||
 				node.Type == documentir.TypeFooter || node.Type == documentir.TypeFootnote ||
@@ -461,7 +463,7 @@ func collectFacts(documents []SourceDocument, concepts map[string]*conceptCandid
 				if !ok {
 					candidate = &factCandidate{
 						canonicalKey: key, content: content,
-						heading:  strings.Join(node.HeadingPath, " / "),
+						heading:  projectionHeadingPath(node),
 						nodeType: string(node.Type), confidence: confidence,
 						conceptKeys:    map[string]bool{},
 						predecessorKey: lastFactByNode[doc.DocumentID+"\x00"+node.ID],
@@ -497,9 +499,10 @@ func deleteEmptyConceptKeys(facts map[string]*factCandidate) {
 func collectTopics(documents []SourceDocument, concepts map[string]*conceptCandidate) map[string]*topicCandidate {
 	out := map[string]*topicCandidate{}
 	for _, doc := range documents {
-		titleKey := normalizeConceptKey(doc.Title)
+		rawTitle := projectionText(doc.Title)
+		titleKey := normalizeConceptKey(rawTitle)
 		if isUsefulConceptKey(titleKey) && len(out) < maxCompiledTopicsPerBase {
-			addTopicCandidate(out, doc.Title, titleKey)
+			addTopicCandidate(out, rawTitle, titleKey)
 		}
 		for _, node := range doc.IR.Nodes {
 			if len(out) >= maxCompiledTopicsPerBase {
@@ -508,11 +511,12 @@ func collectTopics(documents []SourceDocument, concepts map[string]*conceptCandi
 			if node.Type != documentir.TypeHeading || len(node.HeadingPath) == 0 {
 				continue
 			}
-			key := normalizeConceptKey(node.HeadingPath[0])
-			if !isUsefulConceptKey(key) {
+			rawHeading := projectionText(node.HeadingPath[0])
+			key := normalizeConceptKey(rawHeading)
+			if !isUsefulHeadingConcept(rawHeading, key) {
 				continue
 			}
-			addTopicCandidate(out, node.HeadingPath[0], key)
+			addTopicCandidate(out, rawHeading, key)
 		}
 	}
 	return out
@@ -666,13 +670,16 @@ func buildSummaryUnits(baseID string, generation int64, documents []SourceDocume
 	concepts map[string]*conceptCandidate, facts map[string]*factCandidate, factIDs map[string]string, now int64) []Unit {
 	out := make([]Unit, 0, len(documents))
 	for _, doc := range documents {
+		// A Summary is document-scoped. Shared Concept IDs cannot be derived
+		// dependencies because their evidence closure includes every document
+		// observing the same heading; retain local Fact IDs and use concepts
+		// only to build the human-readable summary.
 		derived := map[string]bool{}
 		docConcepts := make([]string, 0, 8)
-		for key, concept := range concepts {
+		for _, concept := range concepts {
 			if !concept.documents[doc.DocumentID] {
 				continue
 			}
-			derived[UnitID(baseID, generation, UnitConcept, key)] = true
 			docConcepts = append(docConcepts, concept.title)
 			for factKey := range concept.factKeys {
 				if fact, ok := facts[factKey]; ok && containsDocument(fact.sources, doc.DocumentID) {
@@ -681,10 +688,11 @@ func buildSummaryUnits(baseID string, generation int64, documents []SourceDocume
 			}
 		}
 		sort.Strings(docConcepts)
+		rawTitle := projectionText(doc.Title)
 		unit := Unit{
 			ID:     UnitID(baseID, generation, UnitSummary, fmt.Sprintf("summary:doc:%s:source:%d", doc.DocumentID, doc.SourceVersion)),
 			BaseID: baseID, Generation: generation, Type: UnitSummary,
-			Title: doc.Title, CanonicalKey: fmt.Sprintf("summary:doc:%s:source:%d", doc.DocumentID, doc.SourceVersion),
+			Title: rawTitle, CanonicalKey: fmt.Sprintf("summary:doc:%s:source:%d", doc.DocumentID, doc.SourceVersion),
 			Content: summaryContent(doc, docConcepts), Confidence: 0.7,
 			Status: UnitActive, DerivedFrom: sortedSetKeys(derived),
 			CreatedAt: now, UpdatedAt: now,
@@ -727,7 +735,7 @@ func topicContent(topic *topicCandidate) string {
 func summaryContent(doc SourceDocument, concepts []string) string {
 	var builder strings.Builder
 	builder.WriteString("# ")
-	builder.WriteString(doc.Title)
+	builder.WriteString(projectionText(doc.Title))
 	builder.WriteString("\n\nDeterministic summary compiled from the document outline and explicit facts.")
 	if len(concepts) > 0 {
 		builder.WriteString("\n\nKey concepts: ")
@@ -744,7 +752,7 @@ func summaryContent(doc SourceDocument, concepts []string) string {
 			break
 		}
 		builder.WriteString("- ")
-		builder.WriteString(strings.TrimSpace(node.Text))
+		builder.WriteString(strings.TrimSpace(projectionText(node.Text)))
 		builder.WriteString("\n")
 		outlineCount++
 	}
@@ -768,7 +776,7 @@ func matchConceptKey(content string, node documentir.Node, concepts map[string]*
 		return best
 	}
 	for _, heading := range node.HeadingPath {
-		key := normalizeConceptKey(heading)
+		key := normalizeConceptKey(projectionText(heading))
 		if _, ok := concepts[key]; ok {
 			return key
 		}
@@ -867,9 +875,109 @@ func normalizeFactKey(value string) string {
 	return strings.Join(strings.Fields(builder.String()), " ")
 }
 
+var boilerplateConcepts = map[string]bool{
+	"目录": true, "前言": true, "概述": true, "简介": true, "背景": true, "背景信息": true,
+	"前提条件": true, "操作步骤": true, "操作场景": true, "注意事项": true, "相关任务": true,
+	"约束条件": true, "业务影响": true, "参考标准": true, "异常处理": true, "结果验证": true,
+	"界面入口": true, "说明": true, "注意": true, "版权所有": true, "商标声明": true,
+	"发布日期": true, "华为技术有限公司": true, "操作须知": true, "实施时长": true,
+	"告警属性": true, "功能描述": true, "可能原因": true, "告警解释": true, "告警清除": true,
+	"问题现象": true, "操作影响": true, "限制约束": true, "告警参数": true, "产生背景": true,
+	"背景介绍": true, "概念介绍": true, "命令功能": true, "可获得性": true, "使用示例": true,
+	"约束限制": true, "适用场景与约束": true, "系统自处理过程": true, "现象描述": true, "后续操作": true,
+	"必备事项": true, "使用场景": true, "对系统的影响": true, "影响说明": true, "应用场景": true,
+	"实现原理":              true,
+	"table of contents": true, "contents": true, "preface": true, "overview": true,
+	"introduction": true, "background": true, "prerequisites": true, "procedure": true,
+	"steps": true, "notes": true, "precautions": true, "copyright": true, "trademarks": true,
+}
+
+var versionOnlyConceptKey = regexp.MustCompile(`(?i)^v?[0-9]+(?:[.-][0-9a-z]+)*$`)
+
 func isUsefulConceptKey(value string) bool {
+	value = strings.TrimSpace(value)
 	length := len([]rune(value))
-	return length >= 2 && length <= 96 && !strings.HasPrefix(value, "http")
+	if length < 2 || length > 96 || strings.HasPrefix(value, "http") {
+		return false
+	}
+	hasAlphanumeric := false
+	for _, r := range value {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			hasAlphanumeric = true
+			break
+		}
+	}
+	if !hasAlphanumeric || boilerplateConcepts[strings.ToLower(value)] || versionOnlyConceptKey.MatchString(value) {
+		return false
+	}
+	return true
+}
+
+var proceduralHeadingConcept = regexp.MustCompile(`(?i)^(?:[0-9]+[.)..、]|[a-z][.)]|步骤\s*[:：0-9]+)`)
+
+func isUsefulHeadingConcept(raw, key string) bool {
+	if !isUsefulConceptKey(key) {
+		return false
+	}
+	trimmed := strings.TrimSpace(raw)
+	if proceduralHeadingConcept.MatchString(trimmed) || strings.HasPrefix(trimmed, "./") || strings.HasPrefix(trimmed, "../") {
+		return false
+	}
+	return true
+}
+
+// projectionText removes parser replacement runes and non-text control bytes
+// without changing the underlying Document IR or exact evidence. A replacement
+// between CJK and Latin/digits becomes a boundary space; replacement adjacent
+// to punctuation is dropped.
+func projectionText(value string) string {
+	var builder strings.Builder
+	runes := []rune(value)
+	for i, r := range runes {
+		if r == '\ufffd' {
+			builder.WriteString(replacementBoundary(runes, i))
+			continue
+		}
+		if r == '\t' || r == '\n' || r == '\r' || !unicode.IsControl(r) {
+			builder.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func replacementBoundary(runse []rune, index int) string {
+	prev := rune(0)
+	if index > 0 {
+		prev = runse[index-1]
+	}
+	next := rune(0)
+	if index+1 < len(runse) {
+		next = runse[index+1]
+	}
+	if prev == 0 || next == 0 || unicode.IsPunct(prev) || unicode.IsPunct(next) {
+		return ""
+	}
+	cjkBoundary := (isCJKRune(prev) && (unicode.IsLetter(next) || unicode.IsDigit(next))) ||
+		((unicode.IsLetter(prev) || unicode.IsDigit(prev)) && isCJKRune(next))
+	letterBoundary := unicode.IsLetter(prev) && unicode.IsLetter(next)
+	if (cjkBoundary || letterBoundary) && unicode.IsSpace(next) == false {
+		return " "
+	}
+	return ""
+}
+
+func isCJKRune(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hangul, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r)
+}
+
+func projectionHeadingPath(node documentir.Node) string {
+	parts := make([]string, 0, len(node.HeadingPath))
+	for _, heading := range node.HeadingPath {
+		if value := projectionText(heading); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	return strings.Join(parts, " / ")
 }
 
 func stableKey(value string) string {

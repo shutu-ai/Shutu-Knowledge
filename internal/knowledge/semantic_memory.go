@@ -20,6 +20,16 @@ type semanticSourceState struct {
 	ids       []string
 }
 
+// SemanticCompileProgress observes bounded compile phases. It is intentionally
+// read-only: progress reporting must never change compiler semantics.
+type SemanticCompileProgress func(phase string, completed, total int)
+
+func reportSemanticProgress(progress SemanticCompileProgress, phase string, completed, total int) {
+	if progress != nil {
+		progress(phase, completed, total)
+	}
+}
+
 // GetSemanticCompilation returns the active optional semantic-memory generation.
 // A 0.3 KB that has never compiled semantic memory returns ErrNotFound while
 // all existing RAG behavior remains available.
@@ -30,11 +40,73 @@ func (s *Service) GetSemanticCompilation(ctx context.Context, baseID string) (se
 	if _, err := s.store.getBaseContext(ctx, baseID); err != nil {
 		return semantic.Compilation{}, err
 	}
+	return s.activeSemanticCompilation(ctx, baseID)
+}
+
+// activeSemanticCompilation caches the immutable active graph in memory. Large
+// product corpora otherwise reload tens of thousands of units and evidence
+// links for every semantic search/context/wiki request.
+func (s *Service) activeSemanticCompilation(ctx context.Context, baseID string) (semantic.Compilation, error) {
+	s.semanticCacheMu.RLock()
+	cached, ok := s.semanticActiveCache[baseID]
+	s.semanticCacheMu.RUnlock()
+	if ok {
+		return cached, nil
+	}
 	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.Compilation{}, ErrNotFound
 	}
-	return compilation, err
+	if err != nil {
+		return semantic.Compilation{}, err
+	}
+	s.cacheSemanticCompilation(compilation)
+	return compilation, nil
+}
+
+func (s *Service) semanticCompilationByID(ctx context.Context, baseID string, generation int64) (semantic.Compilation, error) {
+	key := semanticCacheKey(baseID, generation)
+	s.semanticCacheMu.RLock()
+	cached, ok := s.semanticIDCache[key]
+	s.semanticCacheMu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	if errors.Is(err, semantic.ErrNotFound) {
+		return semantic.Compilation{}, ErrNotFound
+	}
+	if err != nil {
+		return semantic.Compilation{}, err
+	}
+	s.cacheSemanticCompilation(compilation)
+	return compilation, nil
+}
+
+func semanticCacheKey(baseID string, generation int64) string {
+	return fmt.Sprintf("%s:%d", baseID, generation)
+}
+
+func (s *Service) cacheSemanticCompilation(compilation semantic.Compilation) {
+	s.semanticCacheMu.Lock()
+	defer s.semanticCacheMu.Unlock()
+	key := semanticCacheKey(compilation.BaseID, compilation.Generation)
+	s.semanticIDCache[key] = compilation
+	if compilation.State == semantic.CompilationActive {
+		s.semanticActiveCache[compilation.BaseID] = compilation
+	}
+}
+
+func (s *Service) invalidateSemanticCompilation(baseID string) {
+	s.semanticCacheMu.Lock()
+	defer s.semanticCacheMu.Unlock()
+	delete(s.semanticActiveCache, baseID)
+	prefix := baseID + ":"
+	for key := range s.semanticIDCache {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.semanticIDCache, key)
+		}
+	}
 }
 
 // CompileSemanticMemory consumes the durable dirty set and performs an
@@ -42,9 +114,32 @@ func (s *Service) GetSemanticCompilation(ctx context.Context, baseID string) (se
 // carried into a new immutable generation; only dirty/deleted document evidence
 // is removed and rebuilt. The Evidence Index is never rebuilt.
 func (s *Service) CompileSemanticMemory(ctx context.Context, baseID string) (semantic.Compilation, error) {
+	return s.CompileSemanticMemoryWithProgress(ctx, baseID, nil)
+}
+
+// CountSemanticCompileDocumentsContext returns ready documents that can
+// contribute Document IR to semantic compilation. It is the bounded progress
+// denominator used when admitting a durable compile operation.
+func (s *Service) CountSemanticCompileDocumentsContext(ctx context.Context, baseID string) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if _, err := s.store.getBaseContext(ctx, baseID); err != nil {
+		return 0, err
+	}
+	return s.store.countSemanticCompileDocumentsContext(ctx, baseID)
+}
+
+// CompileSemanticMemoryWithProgress is the durable-operation entry point. It
+// serializes compilers for one service instance, avoids loading unchanged IR
+// after a modern compilation, and reports load/compile/merge/publish phases.
+func (s *Service) CompileSemanticMemoryWithProgress(ctx context.Context, baseID string, progress SemanticCompileProgress) (semantic.Compilation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.semanticCompileMu.Lock()
+	defer s.semanticCompileMu.Unlock()
+
 	base, err := s.store.getBaseContext(ctx, baseID)
 	if err != nil {
 		return semantic.Compilation{}, err
@@ -53,42 +148,174 @@ func (s *Service) CompileSemanticMemory(ctx context.Context, baseID string) (sem
 		return semantic.Compilation{}, ErrConflict
 	}
 
-	state, err := s.loadSemanticSourceState(ctx, baseID)
+	reportSemanticProgress(progress, "loading_semantic_metadata", 0, 0)
+	documents, err := s.store.listDocumentMetadataContext(ctx, baseID)
 	if err != nil {
 		return semantic.Compilation{}, err
 	}
+	ready := make([]Document, 0, len(documents))
+	documentByID := make(map[string]Document, len(documents))
+	metadataSignatures := make(map[string]string, len(documents))
+	for _, document := range documents {
+		if document.Status != StatusReady {
+			continue
+		}
+		ready = append(ready, document)
+		documentByID[document.ID] = document
+		// Directory roots are ready metadata rows but have no Document IR and
+		// are intentionally outside SourceDocumentIDs. Do not treat their
+		// always-missing signature as a dirty source on every no-op compile.
+		if document.SourceType != "directory" {
+			metadataSignatures[document.ID] = semanticSourceMetadataSignature(document)
+		}
+	}
+	reportSemanticProgress(progress, "loading_semantic_metadata", len(ready), len(ready))
+
 	previous, previousErr := s.semanticStore.GetActiveCompilation(ctx, baseID)
 	if previousErr != nil && !errors.Is(previousErr, semantic.ErrNotFound) {
 		return semantic.Compilation{}, previousErr
 	}
 	hasPrevious := previousErr == nil
-
-	dirty, deleted, err := s.semanticDirtyDocuments(ctx, baseID, state, previous, hasPrevious)
+	compilerChanged := hasPrevious && previous.CompilerVersion != semantic.BuiltinCompilerVersion
+	pending, err := s.semanticStore.PendingDocumentChanges(ctx, baseID)
 	if err != nil {
 		return semantic.Compilation{}, err
 	}
+
+	priorMetadata := map[string]string{}
+	if raw := previous.Metadata["source_metadata_signatures"]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &priorMetadata); err != nil {
+			return semantic.Compilation{}, fmt.Errorf("decode semantic source metadata signatures: %w", err)
+		}
+	}
+	priorFingerprints := map[string]string{}
+	if raw := previous.Metadata["source_fingerprints"]; raw != "" {
+		if err := json.Unmarshal([]byte(raw), &priorFingerprints); err != nil {
+			return semantic.Compilation{}, fmt.Errorf("decode semantic source fingerprints: %w", err)
+		}
+	}
+	priorSource := make(map[string]bool, len(previous.SourceDocumentIDs))
+	for _, documentID := range previous.SourceDocumentIDs {
+		priorSource[documentID] = true
+	}
+
+	dirty := map[string]bool{}
+	deleted := map[string]bool{}
+	var loaded []semantic.SourceDocument
+	loadedByID := map[string]semantic.SourceDocument{}
+	currentIDs := make([]string, 0, len(ready))
+	fingerprints := map[string]string{}
+	useMetadataFastPath := hasPrevious && len(priorMetadata) > 0
+
+	if useMetadataFastPath {
+		for _, change := range pending {
+			if _, exists := metadataSignatures[change.DocumentID]; exists {
+				dirty[change.DocumentID] = true
+			} else {
+				deleted[change.DocumentID] = true
+			}
+		}
+		for documentID, signature := range metadataSignatures {
+			if priorMetadata[documentID] != signature {
+				dirty[documentID] = true
+			}
+		}
+		for documentID := range priorMetadata {
+			if _, exists := metadataSignatures[documentID]; !exists {
+				deleted[documentID] = true
+			}
+		}
+		if compilerChanged {
+			for documentID := range metadataSignatures {
+				dirty[documentID] = true
+			}
+		}
+		if len(dirty)+len(deleted) == 0 {
+			if err := s.semanticStore.ResolveDocumentChanges(ctx, baseID, previous.Generation, now()); err != nil {
+				return semantic.Compilation{}, err
+			}
+			reportSemanticProgress(progress, "ready", len(ready), len(ready))
+			s.cacheSemanticCompilation(previous)
+			return previous, nil
+		}
+
+		dirtyDocuments := make([]Document, 0, len(dirty))
+		for _, document := range ready {
+			if dirty[document.ID] {
+				dirtyDocuments = append(dirtyDocuments, document)
+			}
+		}
+		loaded, err = s.loadSemanticSourceDocuments(ctx, baseID, dirtyDocuments, progress)
+		if err != nil {
+			return semantic.Compilation{}, err
+		}
+		for _, source := range loaded {
+			loadedByID[source.DocumentID] = source
+		}
+		for documentID := range metadataSignatures {
+			_, wasSource := priorSource[documentID]
+			_, isDirty := dirty[documentID]
+			if wasSource && !isDirty || loadedByID[documentID].DocumentID != "" {
+				currentIDs = append(currentIDs, documentID)
+			}
+		}
+		for _, documentID := range currentIDs {
+			if source, ok := loadedByID[documentID]; ok {
+				fingerprints[documentID] = semantic.SourceFingerprint(source)
+				continue
+			}
+			fingerprint, ok := priorFingerprints[documentID]
+			if !ok {
+				return semantic.Compilation{}, fmt.Errorf("semantic source %s lacks a reusable fingerprint", documentID)
+			}
+			fingerprints[documentID] = fingerprint
+		}
+	} else {
+		var state *semanticSourceState
+		state, err = s.loadSemanticSourceState(ctx, baseID, progress)
+		if err != nil {
+			return semantic.Compilation{}, err
+		}
+		loaded = state.documents
+		for _, source := range loaded {
+			loadedByID[source.DocumentID] = source
+		}
+		currentIDs = state.ids
+		fingerprints = state.current
+		dirty, deleted, err = s.semanticDirtyDocuments(ctx, baseID, state, previous, hasPrevious)
+		if err != nil {
+			return semantic.Compilation{}, err
+		}
+	}
+
+	if !hasPrevious && len(loaded) == 0 {
+		return semantic.Compilation{}, fmt.Errorf("no ready documents with Document IR in base %s", baseID)
+	}
+	if hasPrevious && !compilerChanged && len(dirty)+len(deleted) == 0 {
+		if err := s.semanticStore.ResolveDocumentChanges(ctx, baseID, previous.Generation, now()); err != nil {
+			return semantic.Compilation{}, err
+		}
+		reportSemanticProgress(progress, "ready", len(currentIDs), len(currentIDs))
+		return previous, nil
+	}
+
 	generation, err := s.semanticStore.NextGeneration(ctx, baseID)
 	if err != nil {
 		return semantic.Compilation{}, err
 	}
 	timestamp := now()
+	reportSemanticProgress(progress, "compiling_documents", 0, len(loaded))
 
 	var compiled semantic.Compilation
-	if !hasPrevious {
-		if len(state.documents) == 0 {
-			return semantic.Compilation{}, fmt.Errorf("no ready documents with Document IR in base %s", baseID)
-		}
-		compiled, err = semantic.Compile(baseID, generation, state.documents, timestamp)
-	} else if len(dirty)+len(deleted) == 0 {
-		if err := s.semanticStore.ResolveDocumentChanges(ctx, baseID, previous.Generation, timestamp); err != nil {
-			return semantic.Compilation{}, err
-		}
-		return previous, nil
+	if !hasPrevious || compilerChanged {
+		compiled, err = semantic.Compile(baseID, generation, loaded, timestamp)
 	} else {
-		dirtyDocuments := make([]semantic.SourceDocument, 0, len(dirty))
-		for documentID := range dirty {
-			if document, ok := state.byID[documentID]; ok {
-				dirtyDocuments = append(dirtyDocuments, document)
+		dirtyDocuments := make([]semantic.SourceDocument, 0, len(loaded))
+		for _, documentID := range currentIDs {
+			if dirty[documentID] {
+				if source, ok := loadedByID[documentID]; ok {
+					dirtyDocuments = append(dirtyDocuments, source)
+				}
 			}
 		}
 		var delta semantic.Compilation
@@ -98,22 +325,54 @@ func (s *Service) CompileSemanticMemory(ctx context.Context, baseID string) (sem
 			delta = emptySemanticDelta(baseID, generation, timestamp)
 		}
 		if err == nil {
-			compiled, err = semantic.MergeIncremental(previous, delta, dirty, deleted, state.ids, timestamp)
+			reportSemanticProgress(progress, "merging_semantic_memory", len(dirtyDocuments), len(dirtyDocuments))
+			compiled, err = semantic.MergeIncremental(previous, delta, dirty, deleted, currentIDs, timestamp)
 		}
 	}
 	if err != nil {
 		return semantic.Compilation{}, err
 	}
+	reportSemanticProgress(progress, "compiling_documents", len(loaded), len(loaded))
+
+	// MergeIncremental combines metadata maps, but a dirty delta legitimately
+	// contains only dirty fingerprints. Rebuild both complete maps here so an
+	// unchanged document remains reusable on the next no-op/incremental run.
+	encodedFingerprints, err := json.Marshal(fingerprints)
+	if err != nil {
+		return semantic.Compilation{}, fmt.Errorf("marshal semantic fingerprints: %w", err)
+	}
+	currentMetadata := make(map[string]string, len(currentIDs))
+	for _, documentID := range currentIDs {
+		if document, ok := documentByID[documentID]; ok {
+			currentMetadata[documentID] = semanticSourceMetadataSignature(document)
+		}
+	}
+	encodedMetadata, err := json.Marshal(currentMetadata)
+	if err != nil {
+		return semantic.Compilation{}, fmt.Errorf("marshal semantic metadata signatures: %w", err)
+	}
+	compiled.Metadata["source_fingerprints"] = string(encodedFingerprints)
+	compiled.Metadata["source_metadata_signatures"] = string(encodedMetadata)
+
+	reportSemanticProgress(progress, "validating_semantic_memory", len(loaded), len(loaded))
 	if err := s.semanticStore.CreateCompilation(ctx, compiled); err != nil {
 		return semantic.Compilation{}, err
 	}
+	reportSemanticProgress(progress, "publishing_semantic_memory", len(loaded), len(loaded))
 	if err := s.semanticStore.ActivateCompilation(ctx, baseID, generation); err != nil {
 		return semantic.Compilation{}, err
 	}
+	s.invalidateSemanticCompilation(baseID)
 	if err := s.semanticStore.ResolveDocumentChanges(ctx, baseID, generation, timestamp); err != nil {
 		return semantic.Compilation{}, err
 	}
-	return s.semanticStore.GetActiveCompilation(ctx, baseID)
+	reportSemanticProgress(progress, "ready", len(currentIDs), len(currentIDs))
+	active, err := s.activeSemanticCompilation(ctx, baseID)
+	if err != nil {
+		return semantic.Compilation{}, err
+	}
+	s.cacheSemanticCompilation(active)
+	return active, nil
 }
 
 // GetSemanticCompilationByID returns one immutable compilation generation for
@@ -133,7 +392,7 @@ func (s *Service) GetSemanticCompilationByID(ctx context.Context, baseID string,
 	if generation <= 0 {
 		return semantic.Compilation{}, ErrNotFound
 	}
-	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	compilation, err := s.semanticCompilationByID(ctx, baseID, generation)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.Compilation{}, ErrNotFound
 	}
@@ -153,44 +412,65 @@ func (s *Service) ResolveSemanticUnitEvidence(ctx context.Context, unitID string
 	return sources, err
 }
 
-func (s *Service) loadSemanticSourceState(ctx context.Context, baseID string) (*semanticSourceState, error) {
+func semanticSourceMetadataSignature(document Document) string {
+	return fmt.Sprintf("%d:%d:%s", document.ActiveIndexGen, document.SourceVersion, document.Title)
+}
+
+func (s *Service) loadSemanticSourceState(ctx context.Context, baseID string, progress SemanticCompileProgress) (*semanticSourceState, error) {
 	documents, err := s.store.listDocumentMetadataContext(ctx, baseID)
 	if err != nil {
 		return nil, err
 	}
-	state := &semanticSourceState{
-		byID:    map[string]semantic.SourceDocument{},
-		current: map[string]string{},
-	}
+	ready := make([]Document, 0, len(documents))
 	for _, document := range documents {
-		if document.Status != StatusReady {
-			continue
+		if document.Status == StatusReady {
+			ready = append(ready, document)
 		}
-		ir, err := s.store.listDocumentIR(ctx, document.ID)
-		if err != nil {
-			return nil, fmt.Errorf("load document IR %s: %w", document.ID, err)
-		}
-		if len(ir.Nodes) == 0 {
-			// Legacy 0.2-era rows remain searchable but cannot be compiled
-			// without fabricating Document IR provenance.
-			continue
-		}
-		chunks, err := s.store.chunkIDsByNode(ctx, document.ID, document.ActiveIndexGen)
-		if err != nil {
-			return nil, fmt.Errorf("load evidence links %s: %w", document.ID, err)
-		}
-		source := semantic.SourceDocument{
-			BaseID: baseID, DocumentID: document.ID, Title: document.Title,
-			IndexGeneration: document.ActiveIndexGen, SourceVersion: document.SourceVersion,
-			UpdatedAt: document.UpdatedAt, TemporalMetadata: sourceTemporalMetadata(&ir),
-			IR: &ir, ChunkIDsByNode: chunks,
-		}
-		state.documents = append(state.documents, source)
+	}
+	sources, err := s.loadSemanticSourceDocuments(ctx, baseID, ready, progress)
+	if err != nil {
+		return nil, err
+	}
+	state := &semanticSourceState{
+		documents: sources,
+		byID:      make(map[string]semantic.SourceDocument, len(sources)),
+		current:   make(map[string]string, len(sources)),
+	}
+	for _, source := range sources {
 		state.byID[source.DocumentID] = source
 		state.current[source.DocumentID] = semantic.SourceFingerprint(source)
 		state.ids = append(state.ids, source.DocumentID)
 	}
 	return state, nil
+}
+
+func (s *Service) loadSemanticSourceDocuments(ctx context.Context, baseID string, documents []Document, progress SemanticCompileProgress) ([]semantic.SourceDocument, error) {
+	irs, err := s.store.listDocumentIRsContext(ctx, documents)
+	if err != nil {
+		return nil, fmt.Errorf("load document IR batch: %w", err)
+	}
+	links, err := s.store.chunkIDsByNodes(ctx, documents)
+	if err != nil {
+		return nil, fmt.Errorf("load evidence link batch: %w", err)
+	}
+	out := make([]semantic.SourceDocument, 0, len(documents))
+	for _, document := range documents {
+		ir := irs[document.ID]
+		if len(ir.Nodes) == 0 {
+			// Legacy 0.2-era rows remain searchable but cannot be compiled
+			// without fabricating Document IR provenance.
+			continue
+		}
+		source := semantic.SourceDocument{
+			BaseID: baseID, DocumentID: document.ID, Title: document.Title,
+			IndexGeneration: document.ActiveIndexGen, SourceVersion: document.SourceVersion,
+			UpdatedAt: document.UpdatedAt, TemporalMetadata: sourceTemporalMetadata(&ir),
+			IR: &ir, ChunkIDsByNode: links[document.ID],
+		}
+		out = append(out, source)
+		reportSemanticProgress(progress, "loading_document_ir", len(out), len(documents))
+	}
+	return out, nil
 }
 
 func (s *Service) semanticDirtyDocuments(ctx context.Context, baseID string, state *semanticSourceState,
@@ -288,7 +568,7 @@ func (s *Service) SearchSemanticMemory(ctx context.Context, baseID string, optio
 		return semantic.SearchResponse{}, ErrConflict
 	}
 	options.Query = strings.TrimSpace(options.Query)
-	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	compilation, err := s.activeSemanticCompilation(ctx, baseID)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.SearchResponse{}, ErrNotFound
 	}
@@ -316,7 +596,7 @@ func (s *Service) CompileKnowledgeContext(ctx context.Context, baseID, query str
 	if query == "" {
 		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
 	}
-	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	compilation, err := s.activeSemanticCompilation(ctx, baseID)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
@@ -347,7 +627,7 @@ func (s *Service) CompileKnowledgeContextByID(ctx context.Context, baseID string
 	if generation <= 0 {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
-	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	compilation, err := s.semanticCompilationByID(ctx, baseID, generation)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
@@ -363,36 +643,24 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 		return semantic.ContextPackage{}, err
 	}
 	queries := []string{query}
-	// Temporal evidence tokens can be absent from the natural-language query
-	// (especially “current”). Add the resolved scope as an additional bounded
-	// retrieval query, then let semantic.CompileContext re-rank and filter.
 	plan := semantic.RouteQuery(query)
 	if temporal != nil {
 		plan.Temporal = *temporal
 	}
-	resolvedVersion := plan.Temporal.FromVersion
-	if len(plan.Temporal.Versions) > 0 {
-		resolvedVersion = plan.Temporal.Versions[0]
-	}
-	if plan.Temporal.Intent == semantic.TemporalCurrent || plan.Temporal.Intent == semantic.TemporalValidity {
-		if version, resolvable := semantic.ResolveCurrentVersion(compilation); resolvable {
-			resolvedVersion = version
-		}
-	}
+	// An implicit CURRENT policy must not turn the corpus-wide latest version
+	// into an extra evidence query. In a product corpus most documents share
+	// that version, so the old fallback preferred an arbitrary same-version
+	// document over the exact hybrid hit. Version projection is reserved for
+	// an explicitly requested/comparable version scope.
 	targetVersions := make([]string, 0, 2)
-	switch plan.Temporal.Intent {
-	case semantic.TemporalEvolution, semantic.TemporalCompareVersions:
+	explicitVersionScope := len(plan.Temporal.Versions) > 0
+	if explicitVersionScope {
 		targetVersions = append(targetVersions, plan.Temporal.Versions...)
 		for _, version := range plan.Temporal.Versions {
 			if len(queries) >= 6 {
 				break
 			}
 			queries = append(queries, version+" release")
-		}
-	default:
-		if resolvedVersion != "" {
-			targetVersions = append(targetVersions, resolvedVersion)
-			queries = append(queries, resolvedVersion+" release")
 		}
 	}
 	for _, hit := range memory.Hits {
@@ -407,10 +675,21 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 		}
 	}
 	search, err := s.Search(ctx, SearchRequest{
-		BaseID: baseID, Query: query, Queries: queries, TopK: 8, Mode: "hybrid",
+		BaseID: baseID, Query: query, TopK: 8, Mode: "hybrid",
 	})
 	if err != nil {
 		return semantic.ContextPackage{}, err
+	}
+	// Title expansion is a fallback for abstract/global queries. Running it in
+	// addition to an exact hit lets a shared-version title outscore the exact
+	// requested chunk, so preserve the primary retrieval result when it exists.
+	if len(search.Hits) == 0 && len(queries) > 1 {
+		search, err = s.Search(ctx, SearchRequest{
+			BaseID: baseID, Query: query, Queries: queries, TopK: 8, Mode: "hybrid",
+		})
+		if err != nil {
+			return semantic.ContextPackage{}, err
+		}
 	}
 	// Multi-query retrieval can dilute an exact version token. Run a small
 	// targeted query for each requested scope and place those hits first so
@@ -459,11 +738,14 @@ func (s *Service) compileKnowledgeContextWithCompilation(ctx context.Context, ba
 			Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4, Temporal: temporal,
 		})
 	}
-	targetedEvidence, err := s.versionEvidence(ctx, compilation, query, targetVersions)
-	if err != nil {
-		return semantic.ContextPackage{}, err
+	var targetedEvidence []semantic.ContextEvidence
+	if explicitVersionScope {
+		targetedEvidence, err = s.versionEvidence(ctx, compilation, query, targetVersions)
+		if err != nil {
+			return semantic.ContextPackage{}, err
+		}
+		evidenceItems = append(targetedEvidence, evidenceItems...)
 	}
-	evidenceItems = append(targetedEvidence, evidenceItems...)
 	return semantic.CompileContext(compilation, evidenceItems, semantic.ContextCompileOptions{
 		Query: query, TokenBudget: tokenBudget, TopK: 8, FactTopK: 4, Temporal: temporal,
 	})
@@ -486,7 +768,7 @@ func (s *Service) CompileKnowledgeContextWithPolicy(ctx context.Context, baseID,
 	if query == "" {
 		return semantic.ContextPackage{}, fmt.Errorf("knowledge context query is empty")
 	}
-	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	compilation, err := s.activeSemanticCompilation(ctx, baseID)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
@@ -516,7 +798,7 @@ func (s *Service) CompileKnowledgeContextByIDWithPolicy(ctx context.Context, bas
 	if generation <= 0 {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
-	compilation, err := s.semanticStore.GetCompilation(ctx, baseID, generation)
+	compilation, err := s.semanticCompilationByID(ctx, baseID, generation)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.ContextPackage{}, ErrNotFound
 	}
@@ -722,7 +1004,7 @@ func (s *Service) GetSemanticWiki(ctx context.Context, baseID string) (semantic.
 	if base.LifecycleState != LifecycleActive {
 		return semantic.WikiView{}, ErrConflict
 	}
-	compilation, err := s.semanticStore.GetActiveCompilation(ctx, baseID)
+	compilation, err := s.activeSemanticCompilation(ctx, baseID)
 	if errors.Is(err, semantic.ErrNotFound) {
 		return semantic.WikiView{}, ErrNotFound
 	}

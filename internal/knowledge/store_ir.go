@@ -181,6 +181,212 @@ func (s *store) listDocumentIR(ctx context.Context, docID string) (documentir.Do
 	return ir, nil
 }
 
+// listDocumentIRsContext loads active IR for a bounded metadata page in three
+// bulk queries instead of making three queries per document. Semantic first
+// compilation is document-heavy; this keeps the database round trips bounded
+// by batch count rather than corpus size.
+func (s *store) listDocumentIRsContext(ctx context.Context, documents []Document) (map[string]documentir.Document, error) {
+	out := make(map[string]documentir.Document, len(documents))
+	byID := make(map[string]Document, len(documents))
+	for _, document := range documents {
+		byID[document.ID] = document
+		out[document.ID] = documentir.Document{
+			IRVersion: documentir.Version, DocumentID: document.ID, Title: document.Title,
+		}
+	}
+	const batchSize = 100
+	for start := 0; start < len(documents); start += batchSize {
+		end := minInt(start+batchSize, len(documents))
+		ids := make([]string, 0, end-start)
+		for _, document := range documents[start:end] {
+			ids = append(ids, document.ID)
+		}
+		placeholders := strings.Repeat("?,", len(ids))
+		placeholders = strings.TrimSuffix(placeholders, ",")
+		args := make([]any, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+		}
+
+		rows, err := s.db.QueryContext(ctx, `SELECT n.doc_id, n.node_id, COALESCE(n.parent_node_id, ''), n.node_type,
+			n.node_order, n.text, n.heading_path, n.source_anchor, COALESCE(n.page_number, 0),
+			COALESCE(n.slide_number, 0), COALESCE(n.sheet_name, ''), COALESCE(n.bbox, '{}'),
+			COALESCE(n.metadata, '{}'), n.parser, n.parser_version, n.confidence
+			FROM document_nodes n
+			JOIN documents d ON d.id = n.doc_id AND n.index_generation = d.active_index_generation
+			WHERE n.doc_id IN (`+placeholders+`)
+			ORDER BY n.doc_id, n.node_order, n.node_id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var documentID string
+			var n documentir.Node
+			var parent, headingRaw, anchorRaw, bboxRaw, metadataRaw string
+			if err := rows.Scan(&documentID, &n.ID, &parent, &n.Type, &n.Order, &n.Text,
+				&headingRaw, &anchorRaw, &n.PageNumber, &n.SlideNumber, &n.SheetName,
+				&bboxRaw, &metadataRaw, &n.Parser, &n.ParserVersion, &n.Confidence); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			n.DocumentID, n.ParentID = documentID, parent
+			_ = json.Unmarshal([]byte(headingRaw), &n.HeadingPath)
+			_ = json.Unmarshal([]byte(anchorRaw), &n.SourceAnchor)
+			if strings.TrimSpace(bboxRaw) != "" && bboxRaw != "null" && bboxRaw != "{}" {
+				var bbox documentir.BBox
+				if err := json.Unmarshal([]byte(bboxRaw), &bbox); err == nil {
+					n.BBox = &bbox
+				}
+			}
+			if strings.TrimSpace(metadataRaw) != "" && metadataRaw != "null" && metadataRaw != "{}" {
+				_ = json.Unmarshal([]byte(metadataRaw), &n.Metadata)
+			}
+			ir := out[documentID]
+			ir.Nodes = append(ir.Nodes, n)
+			out[documentID] = ir
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+
+		metaRows, err := s.db.QueryContext(ctx, `SELECT m.doc_id, m.ir_version, m.parser, m.parser_version, m.parse_config
+			FROM document_parse_metadata m
+			JOIN documents d ON d.id = m.doc_id AND m.index_generation = d.active_index_generation
+			WHERE m.doc_id IN (`+placeholders+`) ORDER BY m.doc_id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for metaRows.Next() {
+			var documentID, parseConfig string
+			ir := documentir.Document{}
+			if err := metaRows.Scan(&documentID, &ir.IRVersion, &ir.Parser, &ir.ParserVersion, &parseConfig); err != nil {
+				_ = metaRows.Close()
+				return nil, err
+			}
+			if _, exists := byID[documentID]; !exists {
+				continue
+			}
+			if parseConfig != "" {
+				_ = json.Unmarshal([]byte(parseConfig), &ir.ParseConfig)
+			}
+			base := out[documentID]
+			base.IRVersion, base.Parser, base.ParserVersion, base.ParseConfig =
+				ir.IRVersion, ir.Parser, ir.ParserVersion, ir.ParseConfig
+			out[documentID] = base
+		}
+		if err := metaRows.Err(); err != nil {
+			_ = metaRows.Close()
+			return nil, err
+		}
+		_ = metaRows.Close()
+
+		relRows, err := s.db.QueryContext(ctx, `SELECT r.doc_id, r.relationship_id, r.from_node_id, r.to_node_id,
+			r.relationship_type, r.relationship_order
+			FROM document_relationships r
+			JOIN documents d ON d.id = r.doc_id AND r.index_generation = d.active_index_generation
+			WHERE r.doc_id IN (`+placeholders+`)
+			ORDER BY r.doc_id, r.relationship_order, r.relationship_id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for relRows.Next() {
+			var documentID string
+			var relation documentir.Relationship
+			if err := relRows.Scan(&documentID, &relation.ID, &relation.FromNodeID,
+				&relation.ToNodeID, &relation.Type, &relation.Order); err != nil {
+				_ = relRows.Close()
+				return nil, err
+			}
+			if _, exists := byID[documentID]; !exists {
+				continue
+			}
+			ir := out[documentID]
+			ir.Relationships = append(ir.Relationships, relation)
+			out[documentID] = ir
+		}
+		if err := relRows.Err(); err != nil {
+			_ = relRows.Close()
+			return nil, err
+		}
+		_ = relRows.Close()
+	}
+
+	for documentID, ir := range out {
+		index := make(map[string]int, len(ir.Nodes))
+		for i := range ir.Nodes {
+			index[ir.Nodes[i].ID] = i
+		}
+		for i := range ir.Nodes {
+			if parent := ir.Nodes[i].ParentID; parent != "" {
+				if j, ok := index[parent]; ok {
+					ir.Nodes[j].ChildrenIDs = append(ir.Nodes[j].ChildrenIDs, ir.Nodes[i].ID)
+				}
+			}
+		}
+		out[documentID] = ir
+	}
+	return out, nil
+}
+
+// chunkIDsByNodes bulk-loads exact chunk-node mappings for a metadata page.
+func (s *store) chunkIDsByNodes(ctx context.Context, documents []Document) (map[string]map[string][]string, error) {
+	out := make(map[string]map[string][]string, len(documents))
+	const batchSize = 100
+	for start := 0; start < len(documents); start += batchSize {
+		end := minInt(start+batchSize, len(documents))
+		ids := make([]string, 0, end-start)
+		for _, document := range documents[start:end] {
+			ids = append(ids, document.ID)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args := make([]any, 0, len(ids))
+		for _, id := range ids {
+			args = append(args, id)
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT l.doc_id, l.node_id, l.chunk_id
+			FROM chunk_node_links l
+			JOIN documents d ON d.id = l.doc_id AND l.index_generation = d.active_index_generation
+			WHERE l.doc_id IN (`+placeholders+`)
+			ORDER BY l.doc_id, l.node_id, l.link_order, l.chunk_id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var documentID, nodeID, chunkID string
+			if err := rows.Scan(&documentID, &nodeID, &chunkID); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if out[documentID] == nil {
+				out[documentID] = map[string][]string{}
+			}
+			out[documentID][nodeID] = append(out[documentID][nodeID], chunkID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	return out, nil
+}
+
+// countSemanticCompileDocumentsContext returns the bounded admission unit
+// count used by the durable semantic-compilation operation.
+func (s *store) countSemanticCompileDocumentsContext(ctx context.Context, baseID string) (int, error) {
+	var total int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT d.id)
+		FROM documents d
+		WHERE d.base_id = ? AND d.lifecycle_state = ? AND d.status = ?
+		  AND EXISTS (
+			SELECT 1 FROM document_nodes n
+			WHERE n.doc_id = d.id AND n.index_generation = d.active_index_generation
+		  )`, baseID, LifecycleActive, StatusReady).Scan(&total)
+	return total, err
+}
+
 // chunkIDsByNode returns the active generation's exact chunk-node mapping for
 // semantic compilation. A missing mapping is not fabricated; the compiler can
 // still cite the IR node directly.

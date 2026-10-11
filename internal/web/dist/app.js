@@ -286,6 +286,12 @@ function documentJobSection() {
 }
 
 function operationPhaseText(operation) {
+  if (operation.phase === "loading_semantic_metadata") return localized("Loading semantic metadata");
+  if (operation.phase === "loading_document_ir") return localized("Loading document structure");
+  if (operation.phase === "compiling_documents") return localized("Compiling semantic documents");
+  if (operation.phase === "merging_semantic_memory") return localized("Merging semantic memory");
+  if (operation.phase === "validating_semantic_memory") return localized("Validating semantic memory");
+  if (operation.phase === "publishing_semantic_memory") return localized("Publishing semantic memory");
   if (operation.state === "queued") return localized("Queued for disk");
   if (operation.phase === "fetching") return localized("Loading file");
   if (operation.phase === "scanning") return localized("Scanning directory");
@@ -328,6 +334,35 @@ function operationJobView(operation) {
     status: operation.state, progress: operation.completedUnits || 0,
     total: operation.totalUnits || 0, phase: operation.phase || operationPhaseText(operation),
   };
+}
++function semanticCompilationButtonText(operation = null) {
+  const prefix = localized("Compiling semantic memory...");
+  if (!operation?.phase) return prefix;
+  const total = operation.totalUnits || 0;
+  const completed = operation.completedUnits || 0;
+  return `${prefix} · ${operationPhaseText(operation)}${total ? ` · ${completed}/${total}` : ""}`;
+}
+
+async function activeSemanticCompileOperation(baseId) {
+  const { operations } = await api.operations({
+    states: ["queued", "running", "cancelling"], baseId, limit: 20,
+  });
+  return (operations ?? []).find((operation) => operation.type === "semantic_compile") ?? null;
+}
+
+function monitorSemanticCompilation(operation, button) {
+  semanticCompilationBusy = true;
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.replaceChildren(icon(icons.refresh), semanticCompilationButtonText(operation));
+  const progressTimer = setInterval(() => {
+    const current = operationStore.get(operation.operationId)?.operation ?? operation;
+    button.replaceChildren(icon(icons.refresh), semanticCompilationButtonText(current));
+  }, 300);
+  return trackOperation(operation, "compile semantic memory").finally(() => {
+    clearInterval(progressTimer);
+    semanticCompilationBusy = false;
+  });
 }
 
 async function trackOperation(operation, label) {
@@ -1261,22 +1296,42 @@ async function renderKnowledge() {
     ]));
     return;
   }
+  const selectedBaseSnapshot = selectedBase();
+  const canCompileSemanticMemory = Number(selectedBaseSnapshot?.documentCount ?? 0) > 0;
+  const runningSemanticCompile = await activeSemanticCompileOperation(state.selectedBaseId);
+  const semanticCompileDisabled = semanticCompilationBusy || Boolean(runningSemanticCompile) || !canCompileSemanticMemory;
   screen.append(h("section", { class: "section toolbar" }, [
     basePicker(async (value) => { syncBasePicker(value); await render(); }),
     h("button", {
-      class: "button primary", disabled: semanticCompilationBusy,
+      class: "button primary", disabled: semanticCompileDisabled,
+      title: canCompileSemanticMemory ? "Compile semantic memory" : "Import at least one document before compiling semantic memory",
       onclick: async (event) => {
         if (semanticCompilationBusy) return;
         const button = event.currentTarget;
+        if (!selectedBase()) {
+          syncBasePicker("");
+          await loadBases();
+          await render();
+          showToast("Selected knowledge base is no longer available. Choose a knowledge base again.", true);
+          return;
+        }
         const baseId = state.selectedBaseId;
         semanticCompilationBusy = true;
         button.disabled = true;
         button.setAttribute("aria-busy", "true");
         button.replaceChildren(icon(icons.refresh), localized("Compiling semantic memory..."));
         try {
-          await api.compileSemanticMemory(baseId);
+          const operation = await api.compileSemanticMemoryOperation(baseId);
+          await monitorSemanticCompilation(operation, button);
           showToast("Semantic memory compiled");
         } catch (error) {
+          if (error.status === 404) {
+            syncBasePicker("");
+            await loadBases();
+            await render();
+            showToast("Selected knowledge base is no longer available. Choose a knowledge base again.", true);
+            return;
+          }
           showToast(error.message, true);
           semanticCompilationBusy = false;
           return;
@@ -1284,8 +1339,23 @@ async function renderKnowledge() {
         semanticCompilationBusy = false;
         await render();
       },
-    }, [icon(icons.refresh), semanticCompilationBusy ? localized("Compiling semantic memory...") : "Compile semantic memory"]),
+    }, [icon(icons.refresh), semanticCompilationBusy || runningSemanticCompile
+      ? semanticCompilationButtonText(runningSemanticCompile)
+      : "Compile semantic memory"]),
   ]));
+  if (runningSemanticCompile) {
+    const compileButton = screen.querySelector(".button.primary");
+    monitorSemanticCompilation(runningSemanticCompile, compileButton).then(async () => {
+      if (state.route === "knowledge" && state.selectedBaseId === runningSemanticCompile.baseId) await render();
+    }).catch(async (error) => {
+      showToast(error.message, true);
+      if (state.route === "knowledge" && state.selectedBaseId === runningSemanticCompile.baseId) await render();
+    });
+  }
+  if (!canCompileSemanticMemory) {
+    screen.append(h("section", { class: "section" }, h("div", { class: "empty panel" },
+      "Import at least one ready document before compiling semantic memory.")));
+  }
 
   let compilation = null;
   try { compilation = await api.semanticCompilation(state.selectedBaseId); }

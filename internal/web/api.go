@@ -102,6 +102,7 @@ func registerKnowledgeAPI(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("DELETE /api/search-history/{id}", s.deleteSearchHistory)
 	mux.HandleFunc("GET /api/documents/{id}/context", s.documentContext)
 	mux.HandleFunc("POST /api/bases/{id}/semantic/compile", s.compileSemanticMemory)
+	mux.HandleFunc("POST /api/bases/{id}/semantic/compile-operation", s.compileSemanticMemoryOperation)
 	mux.HandleFunc("GET /api/bases/{id}/semantic", s.getSemanticCompilation)
 	mux.HandleFunc("POST /api/bases/{id}/semantic/search", s.searchSemanticMemory)
 	mux.HandleFunc("POST /api/bases/{id}/semantic/context", s.compileKnowledgeContext)

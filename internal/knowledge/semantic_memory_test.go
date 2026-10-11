@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -81,6 +82,16 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 		t.Fatalf("semantic memory kinds = %+v", memoryKinds)
 	}
 
+	if _, err := service.CreateDirectoryWithContext(ctx, base.ID, "Directory Root", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	directoryNoop, err := service.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatalf("directory no-op compile: %v", err)
+	}
+	if directoryNoop.Generation != compiled.Generation {
+		t.Fatalf("ready directory root advanced no-op generation: %d then %d", compiled.Generation, directoryNoop.Generation)
+	}
 	contextPackage, err := service.CompileKnowledgeContext(ctx, base.ID, "vector retrieval", 2048)
 	if err != nil {
 		t.Fatalf("CompileKnowledgeContext: %v", err)
@@ -143,6 +154,14 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 	if summaryCount != 3 {
 		t.Fatalf("incremental summaries = %d, want 3", summaryCount)
 	}
+	var incrementalFingerprints map[string]string
+	if err := json.Unmarshal([]byte(incremental.Metadata["source_fingerprints"]), &incrementalFingerprints); err != nil || len(incrementalFingerprints) != 3 {
+		t.Fatalf("incremental fingerprints = %d err=%v", len(incrementalFingerprints), err)
+	}
+	var incrementalMetadata map[string]string
+	if err := json.Unmarshal([]byte(incremental.Metadata["source_metadata_signatures"]), &incrementalMetadata); err != nil || len(incrementalMetadata) != 3 {
+		t.Fatalf("incremental metadata signatures = %d err=%v", len(incrementalMetadata), err)
+	}
 
 	if err := service.DeleteDocument(third.ID); err != nil {
 		t.Fatal(err)
@@ -186,6 +205,7 @@ func TestCompileSemanticMemoryIsOptionalAndPreservesSearch(t *testing.T) {
 
 type semanticMemoryTestService struct {
 	*Service
+	db    *storage.DB
 	close func()
 }
 
@@ -208,6 +228,7 @@ func newSemanticMemoryTestServiceAt(t *testing.T, home string) *semanticMemoryTe
 	cfg.Embedding.Provider = "none"
 	return &semanticMemoryTestService{
 		Service: NewService(db, raw, cfg),
+		db:      db,
 		close:   func() { _ = db.Close() },
 	}
 }
@@ -429,6 +450,91 @@ func TestHistoryContextSurvivesIncrementalDelete(t *testing.T) {
 	for _, evidence := range after.Evidence {
 		if evidence.DocumentID == documents[0].ID {
 			t.Fatalf("deleted history evidence survived: %+v", evidence)
+		}
+	}
+}
+
+func TestKnowledgeContextDoesNotLetSharedCurrentVersionPolluteExactEvidence(t *testing.T) {
+	service := newSemanticMemoryTestService(t)
+	defer service.close()
+	ctx := context.Background()
+
+	base, err := service.CreateBase("Shared Version Context", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddTextDocument(ctx, base.ID, "Release 1.0 Alpha Service",
+		"# Alpha Service\n\nThe alpha service uses ALPHA_UNIQUE_FLAG."); err != nil {
+		t.Fatal(err)
+	}
+	beta, err := service.AddTextDocument(ctx, base.ID, "Release 1.0 Beta Service",
+		"# Beta Service\n\nThe beta service uses BETA_UNIQUE_FLAG.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CompileSemanticMemory(ctx, base.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	pkg, err := service.CompileKnowledgeContext(ctx, base.ID, "BETA_UNIQUE_FLAG", 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkg.Evidence) == 0 {
+		t.Fatal("context has no exact evidence")
+	}
+	for _, evidence := range pkg.Evidence {
+		if evidence.DocumentID == beta.ID && evidence.DocumentTitle == beta.Title {
+			continue
+		}
+		t.Fatalf("exact beta query selected unrelated evidence: %+v", evidence)
+	}
+}
+
+func TestCompilerVersionChangeForcesSemanticRecompile(t *testing.T) {
+	service := newSemanticMemoryTestService(t)
+	defer service.close()
+	ctx := context.Background()
+
+	base, err := service.CreateBase("Compiler Upgrade", "", "", BaseConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddTextDocument(ctx, base.ID, "Compiler Guide",
+		"# Compiler Guide\n\nThe compiler uses deterministic projection."); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := service.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.CompilerVersion != semantic.BuiltinCompilerVersion {
+		t.Fatalf("initial compiler version = %q", initial.CompilerVersion)
+	}
+	if _, err := service.db.Exec(`UPDATE knowledge_compilations SET compiler_version = 'legacy', metadata = '{}' WHERE base_id = ?`, base.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := service.CompileSemanticMemory(ctx, base.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.Generation <= initial.Generation {
+		t.Fatalf("compiler upgrade did not advance generation: %d then %d", initial.Generation, upgraded.Generation)
+	}
+	if upgraded.CompilerVersion != semantic.BuiltinCompilerVersion {
+		t.Fatalf("upgraded compiler version = %q", upgraded.CompilerVersion)
+	}
+	for _, unit := range upgraded.Units {
+		if unit.Title == "Compiler Guide" && unit.Type == semantic.UnitSummary {
+			sources, err := service.ResolveSemanticUnitEvidence(ctx, unit.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(sources) == 0 {
+				t.Fatalf("upgraded summary lacks evidence: %+v", unit)
+			}
+			break
 		}
 	}
 }

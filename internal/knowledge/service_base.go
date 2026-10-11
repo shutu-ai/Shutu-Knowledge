@@ -72,11 +72,15 @@ type Service struct {
 	// batchMu serializes batch planning so title/hash decisions see one
 	// consistent snapshot before bounded ingestion workers start.
 	batchMu              sync.Mutex
+	semanticCompileMu    sync.Mutex
 	ingestSlots          chan struct{}
 	searchModelSlots     chan struct{}
 	sharedModelAdmission scheduler.Admission
 	metricsMu            sync.Mutex
 	metrics              MetricsSnapshot
+	semanticCacheMu      sync.RWMutex
+	semanticActiveCache  map[string]semantic.Compilation
+	semanticIDCache      map[string]semantic.Compilation
 	schemaCacheMu        sync.RWMutex
 	schemaCacheBaseID    string
 	schemaCacheModels    []schemamodel.Model
@@ -103,13 +107,15 @@ func NewService(db *storage.DB, raw *storage.RawFileStore, global config.Config)
 		ingestWorkers = 2
 	}
 	service := &Service{
-		store:            newStore(db),
-		semanticStore:    semantic.NewStore(db),
-		raw:              raw,
-		parsers:          parser.NewRegistry(registryOptions...),
-		global:           global,
-		ingestSlots:      make(chan struct{}, ingestWorkers),
-		searchModelSlots: make(chan struct{}, global.Scheduler.Model),
+		store:               newStore(db),
+		semanticStore:       semantic.NewStore(db),
+		raw:                 raw,
+		parsers:             parser.NewRegistry(registryOptions...),
+		global:              global,
+		ingestSlots:         make(chan struct{}, ingestWorkers),
+		searchModelSlots:    make(chan struct{}, global.Scheduler.Model),
+		semanticActiveCache: make(map[string]semantic.Compilation),
+		semanticIDCache:     make(map[string]semantic.Compilation),
 	}
 	if strings.TrimSpace(global.Helpers.ContentConverter) != "" {
 		service.content = parser.ExecHelper{
@@ -935,6 +941,7 @@ func (s *Service) DeleteBaseWithContext(ctx context.Context, id string) error {
 	if err := s.semanticStore.DeleteBase(ctx, id); err != nil {
 		return err
 	}
+	s.invalidateSemanticCompilation(id)
 	if err := s.raw.DeleteBase(id); err != nil {
 		return err
 	}
